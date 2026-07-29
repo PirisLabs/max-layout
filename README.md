@@ -9,7 +9,7 @@ Version 1 (V1) · **Built by Ali Khalatpour — Piris Labs** · MIT licensed
 
 ## Quick start
 
-**1. Download** [`Max Layout.pyz`](https://github.com/ali-pirislabs/max-layout/raw/main/Max%20Layout.pyz)
+**1. Download** [`Max Layout.pyz`](https://github.com/PirisLabs/max-layout/raw/main/Max%20Layout.pyz)
 — that one file is the whole application.
 
 **2. Run it** from the folder where you saved it:
