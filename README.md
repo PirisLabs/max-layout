@@ -143,11 +143,10 @@ Raise the thread count at **Layout → Performance / CPU Threads…**, or set
 - Parameterized test blocks and selectable parameter sweeps.
 - Test-block sweep tables let users select the major parameters and enter an
   inclusive start, stop, and step for each selected sweep before generation.
-- Smart Sketch converts rough multi-stroke drawings into editable standard
-  components. Lines favor straight waveguides, curved strokes favor Euler
-  bends, circular loops favor rings, triangular loops favor grating couplers,
-  and branched multi-stroke paths favor an MZI. Generated sections remain
-  clickable so recognition results can be corrected numerically.
+- Smart Sketch removes hand shake and fits each stroke to a clean standard
+  component: Straight, S-bend, Euler bend, circular ring, elliptical ring, or
+  triangle-to-grating-coupler. Multi-stroke drawings create multiple editable
+  standard components rather than exporting noisy freehand paths.
 - Persistent User modules created from right-clicked geometry.
 - Port snapping, arrays, grouping, rotation, mirroring, ruler, layers, and labels.
 - E-beam write-field creation and GDS, project JSON, FTEXT, and field export.

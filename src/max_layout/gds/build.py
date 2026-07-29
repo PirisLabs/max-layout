@@ -650,6 +650,15 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             if mirrored:array[:,1]*=-1
             world=np.asarray(start)+np.asarray([rot(point,orientation) for point in array]);top.add(gdstk.Polygon(world,layer=layer,datatype=datatype))
         return
+    if kind == "Elliptical ring":
+        rx=float(p.get("radius_x",200));ry=float(p.get("radius_y",100));width=float(p.get("width",1.2))
+        if min(rx,ry)<=width/2 or width<=0:raise ValueError("Elliptical-ring radii must exceed half the waveguide width.")
+        outer=gdstk.ellipse((0,0),(rx+width/2,ry+width/2),tolerance=.001);inner=gdstk.ellipse((0,0),(rx-width/2,ry-width/2),tolerance=.001);rings=gdstk.boolean([outer],[inner],"not",layer=layer,datatype=datatype)
+        for ring in rings:
+            points=np.asarray(ring.points,float)
+            if mirrored:points[:,1]*=-1
+            top.add(gdstk.Polygon(np.asarray(start)+np.asarray([rot(point,orientation) for point in points]),layer=layer,datatype=datatype))
+        return
     if kind == "Racetrack":
         add_racetrack_to_gds(top, (0.0, 0.0), float(p["radius"]), float(p["coupling_length"]), float(p["width"]), int(p.get("points", 128)), start, orientation, layer, datatype); return
     if kind == "Double-ring test block":

@@ -829,14 +829,16 @@ class NativeLayoutWindow(QMainWindow):
             "Vertical-GC MZI + segmented electrode test block":[("mmi_length","MMI length",27.,31.,1.)],
         }.get(kind,[])
         if not options:return True
-        dialog=QDialog(self);dialog.setWindowTitle(f"Configure parameter sweeps — {kind}");layout=QVBoxLayout(dialog);label=QLabel("Select each major parameter to sweep, then enter its inclusive start, stop, and step. Unchecked parameters remain nominal.");label.setWordWrap(True);layout.addWidget(label)
-        table=QTableWidget(len(options),5);table.setHorizontalHeaderLabels(["Sweep","Parameter","Start","Stop","Step"]);table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch);editors=[]
+        dialog=QDialog(self);dialog.setWindowTitle(f"Configure parameter sweeps — {kind}");dialog.resize(1040,max(330,210+70*len(options)));dialog.setMinimumWidth(920);layout=QVBoxLayout(dialog);layout.setContentsMargins(18,18,18,18);layout.setSpacing(12);label=QLabel("Select each major parameter to sweep, then enter its inclusive start, stop, and step. Unchecked parameters remain nominal.");label.setWordWrap(True);label.setMinimumHeight(42);layout.addWidget(label)
+        table=QTableWidget(len(options),5);table.setHorizontalHeaderLabels(["Sweep","Parameter","Start","Stop","Step"]);header=table.horizontalHeader();header.setSectionResizeMode(0,QHeaderView.ResizeMode.ResizeToContents);header.setSectionResizeMode(1,QHeaderView.ResizeMode.Stretch)
+        for column in (2,3,4):header.setSectionResizeMode(column,QHeaderView.ResizeMode.Fixed);table.setColumnWidth(column,205)
+        table.verticalHeader().setDefaultSectionSize(54);table.setMinimumWidth(880);editors=[]
         for row,(key,title,start,stop,step) in enumerate(options):
-            check=QCheckBox();check.setChecked(True);table.setCellWidget(row,0,check);table.setItem(row,1,QTableWidgetItem(title));spins=[]
+            check=QCheckBox();check.setChecked(True);check.setMinimumSize(44,38);table.setCellWidget(row,0,check);parameter_item=QTableWidgetItem(title);parameter_item.setToolTip(title);table.setItem(row,1,parameter_item);spins=[]
             for col,value in zip((2,3,4),(start,stop,step)):
-                spin=QDoubleSpinBox();spin.setRange(-1e9,1e9);spin.setDecimals(6);spin.setValue(value);table.setCellWidget(row,col,spin);spins.append(spin)
+                spin=QDoubleSpinBox();spin.setRange(-1e9,1e9);spin.setDecimals(6);spin.setMinimumWidth(190);spin.setMinimumHeight(40);spin.setAlignment(Qt.AlignmentFlag.AlignRight);spin.setKeyboardTracking(False);spin.setValue(value);spin.setToolTip(f"{title} — {table.horizontalHeaderItem(col).text()}");table.setCellWidget(row,col,spin);spins.append(spin)
             editors.append((key,check,*spins))
-        table.setMinimumHeight(90+42*len(options));layout.addWidget(table);buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);buttons.accepted.connect(dialog.accept);buttons.rejected.connect(dialog.reject);layout.addWidget(buttons)
+        table.setMinimumHeight(105+58*len(options));layout.addWidget(table);buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);buttons.setMinimumHeight(44);buttons.accepted.connect(dialog.accept);buttons.rejected.connect(dialog.reject);layout.addWidget(buttons)
         if dialog.exec()!=QDialog.DialogCode.Accepted:return False
         active=[]
         for key,check,start_box,stop_box,step_box in editors:
@@ -1682,28 +1684,41 @@ class NativeLayoutWindow(QMainWindow):
         if not strokes:return
         arrays=[np.array([[point.x(),-point.y()] for point in stroke],float) for stroke in strokes if len(stroke)>=2]
         if not arrays:return
-        all_points=np.vstack(arrays);xmin,ymin=all_points.min(axis=0);xmax,ymax=all_points.max(axis=0);width=max(xmax-xmin,1e-6);height=max(ymax-ymin,1e-6);center=((xmin+xmax)/2,(ymin+ymax)/2)
-        closed=[]
-        for points in arrays:
-            path_len=float(np.linalg.norm(np.diff(points,axis=0),axis=1).sum());closed.append(np.linalg.norm(points[-1]-points[0])<.15*max(path_len,1e-9))
-        kind="Straight";params=None;origin=tuple(arrays[0][0]);orientation=math.degrees(math.atan2(arrays[0][-1,1]-arrays[0][0,1],arrays[0][-1,0]-arrays[0][0,0]))
-        if len(arrays)>=3:
-            kind="MZI";origin=(xmin,center[1]);orientation=0.0 if width>=height else 90.0
-        elif any(closed):
-            loop=arrays[closed.index(True)];x,y=loop[:,0],loop[:,1];area=abs(float(np.dot(x,np.roll(y,1))-np.dot(y,np.roll(x,1))))/2;per=float(np.linalg.norm(np.diff(np.vstack((loop,loop[:1])),axis=0),axis=1).sum());circularity=4*math.pi*area/max(per*per,1e-12)
-            if circularity>.62:
-                kind="Ring";origin=center;orientation=0.;params={"radius":max(width,height)/4,"width":1.2,"points":256,"layer":1,"datatype":0}
+        def rdp(points:np.ndarray,epsilon:float)->np.ndarray:
+            if len(points)<3:return points
+            start,end=points[0],points[-1];line=end-start;den=float(np.linalg.norm(line))
+            distances=np.linalg.norm(points-start,axis=1) if den<1e-12 else np.abs(line[0]*(start[1]-points[:,1])-(start[0]-points[:,0])*line[1])/den
+            index=int(np.argmax(distances));maximum=float(distances[index])
+            if maximum<=epsilon:return np.vstack((start,end))
+            return np.vstack((rdp(points[:index+1],epsilon)[:-1],rdp(points[index:],epsilon)))
+        snapshot=self.snapshot();created=[];descriptions=[]
+        for raw in arrays:
+            extent=max(float(np.ptp(raw[:,0])),float(np.ptp(raw[:,1])),1e-6);points=raw
+            if len(points)>5:
+                padded=np.pad(points,((2,2),(0,0)),mode="edge");points=np.vstack([padded[i:i+5].mean(axis=0) for i in range(len(points))]);points[0]=raw[0];points[-1]=raw[-1]
+            path_len=float(np.linalg.norm(np.diff(points,axis=0),axis=1).sum());closed=np.linalg.norm(points[-1]-points[0])<.07*max(path_len,1e-9)
+            simplified=rdp(points,extent*.018)
+            if closed:
+                simplified[-1]=simplified[0];split=int(np.argmax(np.linalg.norm(points-points[0],axis=1)));simplified=np.vstack((rdp(points[:split+1],extent*.018)[:-1],rdp(points[split:],extent*.018)));simplified[-1]=simplified[0]
+                unique=max(0,len(simplified)-1);xmin,ymin=points.min(axis=0);xmax,ymax=points.max(axis=0);rx=max((xmax-xmin)/2,.001);ry=max((ymax-ymin)/2,.001);center=((xmin+xmax)/2,(ymin+ymax)/2)
+                if unique<=4:
+                    component=self.make_component("Grating coupler",xmin,center[1]);component["orientation_deg"]=0.;description="triangle → grating coupler"
+                elif max(rx,ry)/min(rx,ry)>1.18:
+                    component=self.make_component("Elliptical ring",*center);component["params"].update({"radius_x":rx,"radius_y":ry});description="elliptical ring"
+                else:
+                    component=self.make_component("Ring",*center);component["params"]["radius"]=(rx+ry)/2;description="circular ring"
             else:
-                kind="Grating coupler";origin=(xmin,center[1]);orientation=0.
-        else:
-            points=arrays[0];path_len=float(np.linalg.norm(np.diff(points,axis=0),axis=1).sum());chord=float(np.linalg.norm(points[-1]-points[0]))
-            if chord/max(path_len,1e-9)>.92:
-                kind="Straight";params=dict(DEFAULT_COMPONENT_VALUES[kind]);params["length"]=chord
-            else:
-                kind="Euler bend";params=dict(DEFAULT_COMPONENT_VALUES[kind]);params["radius"]=max(5.,min(width,height));v0=points[min(3,len(points)-1)]-points[0];v1=points[-1]-points[max(0,len(points)-4)];delta=(math.degrees(math.atan2(v1[1],v1[0])-math.atan2(v0[1],v0[0]))+180)%360-180;params["bend_angle_deg"]=max(-180.,min(180.,delta));orientation=math.degrees(math.atan2(v0[1],v0[0]))
-        snapshot=self.snapshot();component=self.make_component(kind,*origin)
-        if params is not None:component["params"].update(params)
-        component["orientation_deg"]=orientation;self.components.append(component);self.commit_interaction_snapshot(snapshot);self.rebuild_scene(select_uids=[int(component["uid"])]);self.statusBar().showMessage(f"Smart Sketch recognized {kind}. Click the generated section to correct its parameters.",8000)
+                chord_vec=points[-1]-points[0];chord=float(np.linalg.norm(chord_vec));ratio=chord/max(path_len,1e-9);sample=max(1,min(5,len(points)//4));v0=points[sample]-points[0];v1=points[-1]-points[-sample-1];a0=math.atan2(v0[1],v0[0]);a1=math.atan2(v1[1],v1[0]);delta=(math.degrees(a1-a0)+180)%360-180;orientation=math.degrees(a0);forward=np.array([math.cos(a0),math.sin(a0)]);normal=np.array([-forward[1],forward[0]]);longitudinal=float(np.dot(chord_vec,forward));offset=float(np.dot(chord_vec,normal))
+                if ratio>.975:
+                    component=self.make_component("Straight",*points[0]);component["params"]["length"]=chord;component["orientation_deg"]=math.degrees(math.atan2(chord_vec[1],chord_vec[0]));description="straight"
+                elif abs(delta)<28 and abs(offset)>.04*max(abs(longitudinal),1e-9):
+                    component=self.make_component("S-bend",*points[0]);component["params"].update({"length":max(abs(longitudinal),chord*.5),"offset":offset});component["orientation_deg"]=orientation;description="S-bend"
+                else:
+                    if abs(delta)<12:
+                        cross=np.cross(chord_vec,points[len(points)//2]-points[0]);delta=90 if cross>0 else -90
+                    component=self.make_component("Euler bend",*points[0]);component["params"].update({"radius":max(1.,min(1e5,max(float(np.ptp(points[:,0])),float(np.ptp(points[:,1]))))),"bend_angle_deg":max(-180.,min(180.,delta))});component["orientation_deg"]=orientation;description="Euler bend"
+            self.components.append(component);created.append(int(component["uid"]));descriptions.append(description)
+        self.commit_interaction_snapshot(snapshot);self.rebuild_scene(select_uids=created);self.statusBar().showMessage("Smart Sketch created clean standard components: "+", ".join(descriptions)+". Click any component to correct its parameters.",10000)
 
     def update_cursor_status(self, x: float, y: float) -> None:
         if hasattr(self, "cursor_status_label"):

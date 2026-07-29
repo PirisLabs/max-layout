@@ -347,7 +347,7 @@ def component_local_ports(component: dict[str, Any]) -> dict[str, dict[str, Any]
         length=float(p.get("length",50.0));add("left",(-length/2,0.0),180.0);add("right",(length/2,0.0),0.0)
     elif kind.startswith("Photonic crystal ") or kind == "Boolean geometry":
         add("center",(0.0,0.0),0.0,"alignment")
-    elif kind in {"Ring", "Racetrack", "Text / Number", "Square mark", "Cross mark", "Pointy cross mark", "Cross + squares mark", "Vernier mark"}:
+    elif kind in {"Ring", "Elliptical ring", "Racetrack", "Text / Number", "Square mark", "Cross mark", "Pointy cross mark", "Cross + squares mark", "Vernier mark"}:
         add("center",(0,0),0,"alignment")
     elif kind in {"Chip outline", "E-beam multipass"}:
         add("center",(0.0,0.0),0.0,"alignment")

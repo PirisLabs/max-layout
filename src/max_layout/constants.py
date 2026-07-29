@@ -404,6 +404,7 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                            'hole_layer': 3,
                            'hole_datatype': 0},
  'Boolean geometry': {'polygons': [], 'operation': 'union', 'layer': 1, 'datatype': 0},
+ 'Elliptical ring': {'radius_x': 200.0, 'radius_y': 100.0, 'width': 1.2, 'points': 256, 'layer': 1, 'datatype': 0},
  'Racetrack': {'radius': 30.0, 'coupling_length': 100.0, 'width': 1.2, 'points': 128, 'layer': 1, 'datatype': 0},
  'Ring + two feedlines': {'pitch': 0.75,
                           'fill_factor': 0.57,
