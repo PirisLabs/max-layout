@@ -42,10 +42,16 @@ python3 --version
 python3 -m pip install --user PySide6 numpy gdstk
 ```
 
-4. Run Max Layout:
+4. Run Max Layout from the folder containing the file:
 
 ```bash
-python3 "/Users/alimac/Desktop/Latest Codes/Max Layout.pyz"
+python3 "Max Layout.pyz"
+```
+
+Or give the full path, for example:
+
+```bash
+python3 "$HOME/Downloads/Max Layout.pyz"
 ```
 
 If the file is stored elsewhere, drag `Max Layout.pyz` from Finder into the
