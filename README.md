@@ -20,6 +20,9 @@ The `.pyz` contains all Max Layout program source files, component generators,
 menus, defaults, Boolean tools, lattice tools, and GDS/project export code. You
 do not need to download separate Max Layout Python source files.
 
+The readable source for that archive lives in `src/`; see
+[Source layout](#source-layout) below if you want to modify the program.
+
 The computer still needs Python and three platform-installed packages:
 `PySide6`, `numpy`, and `gdstk`. These include operating-system-specific binary
 code and therefore are not embedded in the same cross-platform `.pyz`.
@@ -107,6 +110,42 @@ py "C:\Users\YOUR_NAME\Desktop\Max Layout\Max Layout.pyz"
 - CPU thread control and optional OpenGL canvas acceleration.
 - Cached component geometry and layer-batched rendering for fast generation of
   repeated arrays and large photonic-crystal structures.
+
+## Source layout
+
+`Max Layout.pyz` is built from the package in `src/`. Rebuild it with:
+
+```bash
+python3 build.py
+```
+
+That byte-compiles every module, then writes `Max Layout.pyz` as a zipapp with
+`src/__main__.py` as the entry point. To run straight from source without
+building, use `python3 src`.
+
+```text
+src/
+├── __main__.py                  launcher and headless worker modes
+└── max_layout/
+    ├── acceleration.py          CPU thread and GPU backend selection
+    ├── bootstrap.py             runtime dependency installation
+    ├── constants.py             layers, component kinds, default parameters
+    ├── runtime.py               locating the running app for subprocesses
+    ├── utils.py                 sweep and parsing helpers
+    ├── modules_db.py            persistent user modules
+    ├── params.py                parameter resizing rules
+    ├── ports.py                 port positions and attachment solving
+    ├── backend/                 gdstk component library (GC, MMI, bends)
+    ├── geometry/                transforms, shapes, Euler bends, RF tapers,
+    │                            landmark point sets
+    ├── gds/                     primitives, couplers, e-beam fields,
+    │                            geometry construction, export
+    └── ui/                      theme, graphics items, dialogs, main window
+```
+
+Modules are layered so imports only ever point downward — `constants` and
+`backend` at the bottom, then `geometry`, `ports`, `gds`, and `ui` on top. There
+are no import cycles.
 
 ## License
 
