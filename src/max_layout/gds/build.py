@@ -16,7 +16,7 @@ from ..gds.ebeam import add_ebeam_field_outline, add_ebeam_parameter_text, add_w
 from ..gds.primitives import add_rect, copy_cell_polygons_to_top
 from ..geometry.euler import grating_route_bend_angle, mmi_gc_fanout_local_points
 from ..geometry.landmarks import cpw_bend_landmarks, feedline_landmarks, loopback_landmarks, resonator_x_positions, ring_two_feedline_landmarks, segmented_electrode_landmarks
-from ..geometry.rf_taper import _gap_transition_values, gap_profile, symmetric_cpw_taper_profile
+from ..geometry.rf_taper import _gap_transition_values, gap_profile, rf_taper_point_count, symmetric_cpw_taper_profile
 from ..geometry.shapes import _capsule_polygons, cpw_annular_sector_points, mmi_total_length
 from ..geometry.transforms import _transform_polygon, add_local_polygon, rot, transform_points
 from ..ports import component_global_ports, component_local_ports, normalize_port_name, solve_attachment
@@ -465,36 +465,42 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
                 f"MMI_REFERENCE_{uid}_REFERENCE_OUTPUT_GC",
             )
         return
-    if kind in {"Vertical-GC MZI test block","Vertical-GC MZI + CPW test block","Vertical-GC MZI + segmented electrode test block"}:
-        active=set(p.get("sweep_parameters",["mmi_length"]));count=max(1,int(p.get("mzi_count",5))) if "mmi_length" in active else 1;row_spacing=float(p.get("vertical_spacing",1800));field=float(p.get("ebeam_field_size",520));clearance=float(p.get("ebeam_edge_clearance",10));sub=safe_json_copy(DEFAULT_COMPONENT_VALUES["MZI vertical GC"])
+    if kind in {"Vertical-GC MZI test block","Vertical-GC MZI + CPW test block","Vertical-GC MZI + segmented electrode test block","Straight-GC MZI + segmented RF bends test block","Straight-GC MZI + CPW RF bends test block"}:
+        straight_gc_rf_bends=kind in {"Straight-GC MZI + segmented RF bends test block","Straight-GC MZI + CPW RF bends test block"};straight_cpw_rf_bends=kind=="Straight-GC MZI + CPW RF bends test block";optical_kind="MZI" if straight_gc_rf_bends else "MZI vertical GC";active=set(p.get("sweep_parameters",["mmi_length"]));count=max(1,int(p.get("mzi_count",5))) if "mmi_length" in active else 1;row_spacing=float(p.get("vertical_spacing",1800));field=float(p.get("ebeam_field_size",520));clearance=float(p.get("ebeam_edge_clearance",10));sub=safe_json_copy(DEFAULT_COMPONENT_VALUES[optical_kind])
         for key,value in p.items():
             if key in sub:sub[key]=value
         # Never allow the requested pitch to be smaller than the actual optical
         # device height.  This is especially important for vertical GC routes.
         probe_total=float(p.get("mzi_total_length",10000));sub["mmi_length"]=float(p.get("mmi_length_start",27));sub["arm_length"]=probe_total-2*mmi_total_length(sub)-2*float(sub["s_bend_length"])
-        probe_library=gdstk.Library(unit=1e-6,precision=1e-9);probe_cell=probe_library.new_cell(f"VERTICAL_MZI_SPACING_{uid}");_add_component_geometry_to_cell({"uid":uid*1000,"kind":"MZI vertical GC","x":0.0,"y":0.0,"orientation_deg":0.0,"mirrored":mirrored,"params":sub},probe_cell);probe_bbox=probe_cell.bounding_box()
+        probe_library=gdstk.Library(unit=1e-6,precision=1e-9);probe_cell=probe_library.new_cell(f"MZI_BLOCK_SPACING_{uid}");_add_component_geometry_to_cell({"uid":uid*1000,"kind":optical_kind,"x":0.0,"y":0.0,"orientation_deg":0.0,"mirrored":mirrored,"params":sub},probe_cell);probe_bbox=probe_cell.bounding_box()
         if probe_bbox is not None:row_spacing=max(row_spacing,float(probe_bbox[1][1]-probe_bbox[0][1])+20.0)
         field_order=0;block_min=np.array([np.inf,np.inf]);block_max=np.array([-np.inf,-np.inf])
         for index in range(count):
             total=float(p.get("mzi_total_length",10000));sub["mmi_length"]=(float(p.get("mmi_length_start",27))+index*float(p.get("mmi_length_step",1))) if "mmi_length" in active else float(p.get("mmi_length",29));sub["arm_length"]=total-2*mmi_total_length(sub)-2*float(sub["s_bend_length"])
             if sub["arm_length"]<=0:raise ValueError("MMI sweep leaves no positive MZI arm length.")
-            local_y=(index-(count-1)/2)*row_spacing;row_start=tuple(np.asarray(start)+rot((0,local_y),orientation));library=gdstk.Library(unit=1e-6,precision=1e-9);cell=library.new_cell(f"VERTICAL_MZI_TMP_{uid}_{index}");_add_component_geometry_to_cell({"uid":uid*1000+index+1,"kind":"MZI vertical GC","x":0.0,"y":0.0,"orientation_deg":0.0,"mirrored":mirrored,"params":sub},cell);device_polygons=cell.get_polygons(apply_repetitions=True,include_paths=True);bbox=cell.bounding_box()
+            local_y=(index-(count-1)/2)*row_spacing;row_start=tuple(np.asarray(start)+rot((0,local_y),orientation));library=gdstk.Library(unit=1e-6,precision=1e-9);cell=library.new_cell(f"MZI_BLOCK_TMP_{uid}_{index}");_add_component_geometry_to_cell({"uid":uid*1000+index+1,"kind":optical_kind,"x":0.0,"y":0.0,"orientation_deg":0.0,"mirrored":mirrored,"params":sub},cell);device_polygons=cell.get_polygons(apply_repetitions=True,include_paths=True);bbox=cell.bounding_box()
             if bbox is None:continue
             block_min=np.minimum(block_min,np.asarray(bbox[0],float)+np.array([0,local_y]));block_max=np.maximum(block_max,np.asarray(bbox[1],float)+np.array([0,local_y]))
             for polygon in device_polygons:top.add(gdstk.Polygon(transform_points(np.asarray(polygon.points,float),row_start,orientation),layer=int(polygon.layer),datatype=int(polygon.datatype)))
-            if kind=="Vertical-GC MZI + CPW test block" or bool(p.get("include_symmetric_cpw",False)):
-                taper_length=float(p.get("cpw_taper_length",500));end_length=.05*total;clear=10.0;cpw_length=float(sub["arm_length"])-2*clear;middle_length=cpw_length-2*taper_length-2*end_length
-                if min(cpw_length,middle_length,taper_length,end_length)<=0:raise ValueError("CPW middle-flat, taper, and outer-flat lengths must be positive.")
+            if kind in {"Vertical-GC MZI + CPW test block","Straight-GC MZI + CPW RF bends test block"} or bool(p.get("include_symmetric_cpw",False)):
+                taper_length=float(p.get("cpw_taper_length",500));end_length=float(p.get("cpw_end_straight_length",0)) if straight_cpw_rf_bends else .05*total;clear=0.0 if straight_cpw_rf_bends else 10.0;cpw_length=float(sub["arm_length"])-2*clear;middle_length=cpw_length-2*taper_length-2*end_length
+                if min(cpw_length,middle_length,taper_length)<=0 or end_length<0:raise ValueError("CPW middle-flat and taper lengths must be positive; the outer-flat length cannot be negative.")
                 cpw_params=safe_json_copy(DEFAULT_COMPONENT_VALUES["Symmetric CPW taper"]);cpw_params.update({"signal_width":float(p.get("cpw_signal_width",130)),"ground_width":float(p.get("cpw_ground_width",130)),"initial_gap":float(p.get("cpw_end_gap",14.5)),"middle_gap":float(p.get("cpw_middle_gap",3)),"end_straight_length":end_length,"taper_length":taper_length,"middle_straight_length":middle_length,"profile":str(p.get("cpw_profile","klopfenstein")),"target_s11_db":float(p.get("cpw_target_s11_db",20)),"exponential_factor":float(p.get("cpw_exponential_factor",1)),"points":int(p.get("cpw_points",161)),"layer":RF_LAYER,"datatype":0});cpw_start=tuple(np.asarray(row_start)+rot((mmi_total_length(sub)+float(sub["s_bend_length"])+clear,0),orientation));_add_component_geometry_to_cell({"uid":uid*100000+index,"kind":"Symmetric CPW taper","x":cpw_start[0],"y":cpw_start[1],"orientation_deg":orientation,"mirrored":False,"params":cpw_params},top)
-            if kind=="Vertical-GC MZI + segmented electrode test block" or bool(p.get("include_segmented_electrode",False)):
-                clear=float(p.get("seg_s_bend_clearance",10));transition=float(p.get("seg_taper_length",500));end_flat=float(p.get("seg_end_flat_length",50));inner_flat=float(p.get("seg_inner_flat_length",50));top_length=float(p.get("seg_t_top_length",45));segment_spacing=float(p.get("seg_segment_spacing",3));target_length=float(sub["arm_length"])-2*clear
-                if min(target_length,transition,end_flat,inner_flat,top_length)<=0 or segment_spacing<0:raise ValueError("Segmented-electrode length, tapers, flats, finger length, and spacing must fit between the MZI S-bends.")
+                if straight_cpw_rf_bends and bool(p.get("include_rf_edge_bends",True)):
+                    bend_params=safe_json_copy(DEFAULT_COMPONENT_VALUES["CPW bend"]);bend_params.update({"R_eff":float(p.get("rf_edge_bend_radius",500)),"bend_angle_deg":float(p.get("rf_edge_bend_angle_deg",90)),"signal_width":cpw_params["signal_width"],"gap":cpw_params["initial_gap"],"ground_width":cpw_params["ground_width"],"points":int(p.get("rf_edge_bend_points",321)),"layer":RF_LAYER,"datatype":0});cpw_end=tuple(np.asarray(cpw_start)+rot((cpw_length,0),orientation));_add_component_geometry_to_cell({"uid":uid*150000+index*2,"kind":"CPW bend","x":cpw_start[0],"y":cpw_start[1],"orientation_deg":(orientation+180)%360,"mirrored":False,"params":bend_params},top);_add_component_geometry_to_cell({"uid":uid*150000+index*2+1,"kind":"CPW bend","x":cpw_end[0],"y":cpw_end[1],"orientation_deg":orientation,"mirrored":False,"params":bend_params},top)
+            if kind in {"Vertical-GC MZI + segmented electrode test block","Straight-GC MZI + segmented RF bends test block"} or bool(p.get("include_segmented_electrode",False)):
+                clear=float(p.get("seg_s_bend_clearance",10));transition=float(p.get("seg_taper_length",1));end_flat=float(p.get("seg_end_flat_length",50));inner_flat=float(p.get("seg_inner_flat_length",50));top_length=float(p.get("seg_t_top_length",45));segment_spacing=float(p.get("seg_segment_spacing",3));target_length=float(sub["arm_length"])-2*clear
+                if min(target_length,transition,inner_flat,top_length)<=0 or end_flat<0 or segment_spacing<0:raise ValueError("Segmented-electrode length, tapers, inner flats, and finger length must be positive; outer flats and spacing cannot be negative.")
                 if bool(p.get("seg_auto_segment_count",True)):
                     period=top_length+segment_spacing;available=target_length-2*(transition+end_flat+inner_flat);segments=int(math.floor(available/period))
-                    if segments<1:raise ValueError("The MZI arm is too short for two 500 µm tapers and a segmented-electrode region.")
+                    if segments<1:raise ValueError("The MZI arm is too short for both end transitions and a segmented-electrode region.")
                     inner_flat+=(target_length-(2*(transition+end_flat+inner_flat)+segments*period))/2
                 else:segments=max(1,int(p.get("seg_segment_count",80)))
-                seg_params=safe_json_copy(DEFAULT_COMPONENT_VALUES["Segmented electrode"]);seg_params.update({"signal_width":float(p.get("seg_signal_width",130)),"end_gap":float(p.get("seg_end_gap",14.5)),"gap":float(p.get("seg_gap",3)),"ground_width":float(p.get("seg_ground_width",130)),"transition_length":transition,"end_flat_length":end_flat,"inner_flat_length":inner_flat,"t_top_width":float(p.get("seg_t_top_width",2)),"t_top_length":top_length,"t_neck_width":float(p.get("seg_t_neck_width",4)),"t_neck_length":float(p.get("seg_t_neck_length",18)),"segment_spacing":segment_spacing,"segment_count":segments,"include_oxide_masks":bool(p.get("seg_include_oxide_masks",False)),"layer":RF_LAYER,"datatype":0});seg_start=tuple(np.asarray(row_start)+rot((mmi_total_length(sub)+float(sub["s_bend_length"])+clear,0),orientation));_add_component_geometry_to_cell({"uid":uid*200000+index,"kind":"Segmented electrode","x":seg_start[0],"y":seg_start[1],"orientation_deg":orientation,"mirrored":False,"params":seg_params},top)
+                seg_params=safe_json_copy(DEFAULT_COMPONENT_VALUES["Segmented electrode"]);seg_params.update({"signal_width":float(p.get("seg_signal_width",130)),"end_gap":float(p.get("seg_end_gap",3)),"gap":float(p.get("seg_gap",3)),"ground_width":float(p.get("seg_ground_width",130)),"transition_length":transition,"end_flat_length":end_flat,"inner_flat_length":inner_flat,"t_top_width":float(p.get("seg_t_top_width",2)),"t_top_length":top_length,"t_neck_width":float(p.get("seg_t_neck_width",4)),"t_neck_length":float(p.get("seg_t_neck_length",18)),"segment_spacing":segment_spacing,"segment_count":segments,"include_oxide_masks":bool(p.get("seg_include_oxide_masks",False)),"layer":RF_LAYER,"datatype":0});seg_start=tuple(np.asarray(row_start)+rot((mmi_total_length(sub)+float(sub["s_bend_length"])+clear,0),orientation));_add_component_geometry_to_cell({"uid":uid*200000+index,"kind":"Segmented electrode","x":seg_start[0],"y":seg_start[1],"orientation_deg":orientation,"mirrored":False,"params":seg_params},top)
+                if straight_gc_rf_bends and bool(p.get("include_rf_edge_bends",True)):
+                    seg_length=float(segmented_electrode_landmarks(seg_params)["total_length"]);edge_straight=float(p.get("rf_edge_straight_length",0));bend_params=safe_json_copy(DEFAULT_COMPONENT_VALUES["CPW bend"]);bend_params.update({"R_eff":float(p.get("rf_edge_bend_radius",500)),"bend_angle_deg":float(p.get("rf_edge_bend_angle_deg",90)),"signal_width":seg_params["signal_width"],"gap":seg_params["end_gap"],"ground_width":seg_params["ground_width"],"points":int(p.get("rf_edge_bend_points",321)),"layer":RF_LAYER,"datatype":0});straight_params=safe_json_copy(DEFAULT_COMPONENT_VALUES["CPW"]);straight_params.update({"length":edge_straight,"signal_width":seg_params["signal_width"],"gap":seg_params["end_gap"],"ground_width":seg_params["ground_width"],"layer":RF_LAYER,"datatype":0});seg_end=tuple(np.asarray(seg_start)+rot((seg_length,0),orientation));left_bend_start=tuple(np.asarray(seg_start)+rot((-edge_straight,0),orientation));right_bend_start=tuple(np.asarray(seg_end)+rot((edge_straight,0),orientation))
+                    if edge_straight>0:_add_component_geometry_to_cell({"uid":uid*300000+index*4,"kind":"CPW","x":seg_start[0],"y":seg_start[1],"orientation_deg":(orientation+180)%360,"mirrored":False,"params":straight_params},top);_add_component_geometry_to_cell({"uid":uid*300000+index*4+1,"kind":"CPW","x":seg_end[0],"y":seg_end[1],"orientation_deg":orientation,"mirrored":False,"params":straight_params},top)
+                    _add_component_geometry_to_cell({"uid":uid*300000+index*4+2,"kind":"CPW bend","x":left_bend_start[0],"y":left_bend_start[1],"orientation_deg":(orientation+180)%360,"mirrored":False,"params":bend_params},top);_add_component_geometry_to_cell({"uid":uid*300000+index*4+3,"kind":"CPW bend","x":right_bend_start[0],"y":right_bend_start[1],"orientation_deg":orientation,"mirrored":False,"params":bend_params},top)
             if not bool(p.get("include_ebeam_fields",True)):continue
             minimum=np.asarray(bbox[0],float);maximum=np.asarray(bbox[1],float);extent=maximum-minimum;grid_center=(minimum+maximum)/2;nx=max(1,math.ceil((extent[0]+2*clearance)/field));ny=max(1,math.ceil((extent[1]+2*clearance)/field))
             for iy in range(ny):
@@ -504,8 +510,10 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
                     field_order+=1;field_center=tuple(np.asarray(row_start)+rot(center_local,orientation));add_ebeam_field_outline(top,field_center,orientation,field);add_write_field_number(top,field_order,field_center,orientation,field)
         if np.all(np.isfinite(block_min)):
             first_mmi=float(p.get("mmi_length_start",27));last_mmi=first_mmi+(count-1)*float(p.get("mmi_length_step",1));label=f"VERTICAL MZI BLOCK  MMI={first_mmi:g}-{last_mmi:g}  L={float(p.get('mzi_total_length',10000)):g}"
-            if kind=="Vertical-GC MZI + CPW test block":label+=f"  CPW TAP={float(p.get('cpw_taper_length',500)):g} CLR=10"
-            if kind=="Vertical-GC MZI + segmented electrode test block":label+=f"  T-SEG N={'AUTO' if bool(p.get('seg_auto_segment_count',True)) else int(p.get('seg_segment_count',80))} TAP={float(p.get('seg_taper_length',500)):g} CLR={float(p.get('seg_s_bend_clearance',10)):g}"
+            if kind in {"Vertical-GC MZI + CPW test block","Straight-GC MZI + CPW RF bends test block"}:label+=f"  CPW TAP={float(p.get('cpw_taper_length',500)):g} CLR={0 if straight_cpw_rf_bends else 10}"
+            if kind in {"Vertical-GC MZI + segmented electrode test block","Straight-GC MZI + segmented RF bends test block"}:label+=f"  T-SEG N={'AUTO' if bool(p.get('seg_auto_segment_count',True)) else int(p.get('seg_segment_count',80))} TAP={float(p.get('seg_taper_length',1)):g} CLR={float(p.get('seg_s_bend_clearance',10)):g}"
+            if straight_cpw_rf_bends:label+=f"  GC LEAD={float(p.get('gc_wg_length',3000)):g}  RF BEND R={float(p.get('rf_edge_bend_radius',500)):g}"
+            elif straight_gc_rf_bends:label+=f"  GC LEAD={float(p.get('gc_wg_length',3000)):g}  INNER FLAT={float(p.get('seg_inner_flat_length',200)):g}  RF BEND R={float(p.get('rf_edge_bend_radius',500)):g}"
             label_local=((block_min[0]+block_max[0])/2,block_max[1]+20);label_point=tuple(np.asarray(start)+rot(label_local,orientation));add_ebeam_parameter_text(top,label,label_point,orientation,0,float(p.get("parameter_text_height",10)))
         return
     if kind == "Long MZI test block":
@@ -568,23 +576,20 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             raise ValueError("Integrated MZI + CPW module dimensions must be positive.")
         rf_layer = RF_LAYER; rf_dt = DEFAULT_DATATYPE
         add_rect(top, np.array([[0,-ws/2],[total_rf,-ws/2],[total_rf,ws/2],[0,ws/2]],float), start, orientation, rf_layer, rf_dt)
-        count = max(16, int(p.get("points", 161)))
-        xs = np.linspace(0.0, total_rf, count)
-        gaps = np.empty_like(xs)
-        def taper_value(u: float, a: float, b: float, profile: str) -> float:
-            uu, values = _gap_transition_values(
-                a, b, max(65, count), profile, ws,
-                float(p.get("target_s11_db", 20.0)),
-                float(p.get("exponential_factor", 1.0)),
-            )
-            return float(np.interp(min(1.0, max(0.0, float(u))), uu, values))
-        for i, x in enumerate(xs):
-            if x <= tin:
-                gaps[i] = taper_value(x/tin, g_ext, g_int, str(p.get("rf_input_taper_profile", "linear")).lower())
-            elif x <= tin + active_len:
-                gaps[i] = g_int
-            else:
-                gaps[i] = taper_value((x-tin-active_len)/tout, g_int, g_ext, str(p.get("rf_output_taper_profile", "linear")).lower())
+        input_u, input_gaps = _gap_transition_values(
+            g_ext, g_int, rf_taper_point_count(tin),
+            str(p.get("rf_input_taper_profile", "linear")).lower(), ws,
+            float(p.get("target_s11_db", 20.0)),
+            float(p.get("exponential_factor", 1.0)),
+        )
+        output_u, output_gaps = _gap_transition_values(
+            g_int, g_ext, rf_taper_point_count(tout),
+            str(p.get("rf_output_taper_profile", "linear")).lower(), ws,
+            float(p.get("target_s11_db", 20.0)),
+            float(p.get("exponential_factor", 1.0)),
+        )
+        xs = np.concatenate((tin * input_u, [tin + active_len], tin + active_len + tout * output_u[1:]))
+        gaps = np.concatenate((input_gaps, [g_int], output_gaps[1:]))
         upper_inner = np.column_stack((xs, ws/2.0 + gaps))
         upper_outer = np.column_stack((xs[::-1], (ws/2.0 + gaps + wg)[::-1]))
         lower_outer = np.column_stack((xs, -ws/2.0 - gaps - wg))
@@ -873,7 +878,7 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             local_rect(left,right,q["plain_upper_ground_inner"],q["plain_upper_ground_outer"],layer,datatype)
             local_rect(left,right,q["plain_lower_ground_outer"],q["plain_lower_ground_inner"],layer,datatype)
 
-        # Symmetric linear tapers from the 14.5-µm external gap to a plain CPW
+        # Symmetric linear tapers from the user-defined external gap to a plain CPW
         # whose gap equals the requested finger-tip separation.
         def tapered_strip(xl, xr, left_low, left_high, right_low, right_high):
             if xr <= xl:return

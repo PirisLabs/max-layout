@@ -27,12 +27,13 @@ from ..constants import CHOICE_PARAMETERS, COMPONENT_SPECS, DEFAULT_COMPONENT_VA
 from ..gds.build import _add_component_geometry_to_cell, _canonicalize_component_layers, library_bbox_and_center, resolve_and_build, rotate_components_layout
 from ..gds.ebeam import multipass_field_layout
 from ..geometry.shapes import mmi_total_length
+from ..geometry.rf_taper import synchronize_rf_taper_points
 from ..geometry.transforms import scene_to_world_point, transform_points, transformed_local_points, world_to_scene_point
 from ..modules_db import load_native_modules, save_native_modules
 from ..params import resize_component_parameters
 from ..ports import PORT_ALIASES, component_global_ports, component_local_ports, solve_attachment
 from ..ui.dialogs import ArrayDialog, EbeamDialog, ModuleVariablesDialog
-from ..ui.items import ComponentGraphicsItem, EbeamContainerItem, LayoutView, WriteFieldItem
+from ..ui.items import ComponentGraphicsItem, EbeamContainerItem, LayoutView, WriteFieldItem, clear_preview_caches
 from ..ui.theme import _force_dark_popup, color_for_layer
 from ..utils import inclusive_sweep, parse_sequence, safe_json_copy
 
@@ -82,9 +83,14 @@ class NativeLayoutWindow(QMainWindow):
         self.llm_response_file: Path | None = None
 
         self.scene = QGraphicsScene(self)
-        self.scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.BspTreeIndex)
+        # This is an editor: items are added and moved frequently.  Maintaining
+        # a BSP index for a dense scene makes each mutation unnecessarily
+        # expensive; linear lookup is faster for the typical component count.
+        self.scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
         self.scene.selectionChanged.connect(self.on_scene_selection_changed)
-        self.view = LayoutView(self.scene)
+        saved_opengl = str(self.settings.value("layout/use_opengl", "true")).strip().lower() in {"1","true","yes","on"}
+        self.view = LayoutView(self.scene, use_opengl=saved_opengl)
+        self.view.regionFitRequested.connect(self.fit_drawn_region)
         self.setCentralWidget(self.view)
 
         self.setDockNestingEnabled(True)
@@ -176,6 +182,7 @@ class NativeLayoutWindow(QMainWindow):
             if kind in RF_COMPONENT_KINDS or kind == "MZI + CPW module":
                 lower=kind.lower()
                 if "open" in lower or "short" in lower:group="Calibration structures"
+                elif kind == "Segmented electrode":group="CPW transmission lines"
                 elif "electrode" in lower or "mzi" in lower:group="Electrodes & modulators"
                 elif "taper" in lower:group="RF tapers"
                 elif "bend" in lower:group="RF bends"
@@ -380,8 +387,10 @@ class NativeLayoutWindow(QMainWindow):
         buttons = QHBoxLayout()
         self.llm_send_button = QPushButton("Apply instruction")
         self.llm_send_button.setObjectName("primaryButton")
+        self.llm_test_button = QPushButton("Test API")
         self.llm_clear_button = QPushButton("Clear")
         buttons.addWidget(self.llm_send_button)
+        buttons.addWidget(self.llm_test_button)
         buttons.addWidget(self.llm_clear_button)
         layout.addLayout(buttons)
 
@@ -392,6 +401,7 @@ class NativeLayoutWindow(QMainWindow):
         layout.addWidget(note)
 
         self.llm_send_button.clicked.connect(self.run_llm_assistant)
+        self.llm_test_button.clicked.connect(self.run_llm_api_test)
         self.llm_clear_button.clicked.connect(
             lambda: self.llm_chat_log.setPlainText("Chat cleared. The layout is unchanged.")
         )
@@ -476,6 +486,7 @@ class NativeLayoutWindow(QMainWindow):
         action("open", "Open", self.open_project, "Ctrl+O", file_toolbar, file_menu)
         action("save", "Save", self.save_project, "Ctrl+S", file_toolbar, file_menu)
         action("save_as", "Save As", self.save_project_as, "Ctrl+Shift+S", None, file_menu)
+        action("refresh_json_gui", "↻ Refresh GUI from JSON", self.refresh_gui_from_json, "F5", file_toolbar, file_menu, status_tip="Clear derived previews and rebuild the canvas from the current JSON project data without changing export geometry.")
         file_toolbar.addSeparator()
         file_menu.addSeparator()
         action("export_gds", "Export GDS", self.export_gds, None, file_toolbar, file_menu)
@@ -654,10 +665,10 @@ class NativeLayoutWindow(QMainWindow):
         action("stop_fields", "■ Stop", self.stop_writefields, None, ebeam_toolbar, ebeam_menu)
 
     def open_layout_thread_settings(self) -> None:
-        dialog=QDialog(self);dialog.setWindowTitle("Layout Performance / CPU Threads");layout=QVBoxLayout(dialog);form=QFormLayout();threads=QSpinBox();threads.setRange(1,CPU_COUNT);threads.setValue(self.layout_threads);form.addRow(f"CPU threads (1–{CPU_COUNT})",threads);layout.addLayout(form)
-        note=QLabel("Controls NumPy/BLAS geometry work and is inherited by background GDS/Python export workers. Qt scene updates remain on the GUI thread for stability.");note.setWordWrap(True);layout.addWidget(note);buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);buttons.accepted.connect(dialog.accept);buttons.rejected.connect(dialog.reject);layout.addWidget(buttons)
+        dialog=QDialog(self);dialog.setWindowTitle("Layout Performance / CPU, Cache, and GPU");layout=QVBoxLayout(dialog);form=QFormLayout();threads=QSpinBox();threads.setRange(1,CPU_COUNT);threads.setValue(self.layout_threads);form.addRow(f"CPU threads (1–{CPU_COUNT})",threads);gpu_canvas=QCheckBox("Use GPU-accelerated OpenGL canvas when supported");gpu_canvas.setChecked(self.view.opengl_enabled);form.addRow("Interactive canvas",gpu_canvas);layout.addLayout(form)
+        note=QLabel("Repeated preview geometry is cached automatically. OpenGL accelerates painting and dragging; CPU threads and a separate worker process handle geometry and full-resolution GDS export. Disable OpenGL if a graphics driver shows artifacts.");note.setWordWrap(True);layout.addWidget(note);buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);buttons.accepted.connect(dialog.accept);buttons.rejected.connect(dialog.reject);layout.addWidget(buttons)
         if dialog.exec()!=QDialog.DialogCode.Accepted:return
-        self.layout_threads=threads.value();self.settings.setValue("layout/cpu_threads",self.layout_threads);configure_acceleration(self.layout_threads);self.opengl_status_label.setText(("OpenGL" if self.view.opengl_enabled else "CPU canvas")+f" • {self.layout_threads} threads");self.statusBar().showMessage(f"Layout CPU thread limit set to {self.layout_threads}.",5000)
+        self.layout_threads=threads.value();self.settings.setValue("layout/cpu_threads",self.layout_threads);configure_acceleration(self.layout_threads);opengl_enabled=self.view.set_opengl_enabled(gpu_canvas.isChecked());self.settings.setValue("layout/use_opengl",opengl_enabled);self.opengl_status_label.setText(("OpenGL GPU" if opengl_enabled else "CPU canvas")+f" • {self.layout_threads} threads");self.statusBar().showMessage(f"Performance updated: {self.layout_threads} CPU threads, {'OpenGL GPU canvas' if opengl_enabled else 'CPU canvas'}, preview cache enabled.",5000)
 
     # Project / undo
     # ------------------------------------------------------------------
@@ -785,6 +796,8 @@ class NativeLayoutWindow(QMainWindow):
             components = data.get("components", data)
             if not isinstance(components, list):
                 raise ValueError("The selected file does not contain a component list.")
+            for component in components:
+                synchronize_rf_taper_points(component)
             self.components = components
             self.next_uid = int(data.get("next_uid", max([int(c.get("uid", 0)) for c in components] + [0]) + 1))
             self.next_group_id = int(data.get("next_group_id", 1))
@@ -798,6 +811,26 @@ class NativeLayoutWindow(QMainWindow):
             self.statusBar().showMessage(f"Opened project: {path}")
         except Exception as exc:
             QMessageBox.critical(self, "Open failed", str(exc))
+
+    def refresh_gui_from_json(self) -> None:
+        """Rebuild every visual item from a clean JSON round-trip and empty caches."""
+        selected = [
+            int(item.data(10))
+            for item in self.scene.selectedItems()
+            if item.data(10) is not None
+        ]
+        # The round-trip deliberately removes any GUI-only Python object state
+        # while preserving the exact serializable project used by GDS export.
+        self.components = json.loads(json.dumps(self.components))
+        for component in self.components:
+            synchronize_rf_taper_points(component)
+        clear_preview_caches()
+        self.rebuild_scene(select_uids=selected)
+        self.view.viewport().update()
+        self.statusBar().showMessage(
+            "GUI refreshed from current JSON data; preview caches were rebuilt.",
+            6000,
+        )
 
     # ------------------------------------------------------------------
     # Components / scene
@@ -814,6 +847,7 @@ class NativeLayoutWindow(QMainWindow):
             "params": params,
             "attachment": None,
         }
+        synchronize_rf_taper_points(component)
         self.next_uid += 1
         return component
 
@@ -824,9 +858,11 @@ class NativeLayoutWindow(QMainWindow):
             "Grating angle-taper test block":[("alpha_t","Aperture angle",22.,28.,1.),("taper_L","Taper length",20.,24.,1.)],
             "MMI + Reference test block":[("mmi_length","MMI length",26.,33.,1.),("taper_width","Waveguide taper width",2.5,3.1,.1)],
             "MMI split-combine test block":[("taper_length","MMI taper length",8.,12.,1.),("taper_width","Waveguide taper width",2.5,3.1,.1)],
-            "Vertical-GC MZI test block":[("mmi_length","MMI length",27.,31.,1.)],
-            "Vertical-GC MZI + CPW test block":[("mmi_length","MMI length",27.,31.,1.)],
-            "Vertical-GC MZI + segmented electrode test block":[("mmi_length","MMI length",27.,31.,1.)],
+            "Vertical-GC MZI test block":[("mmi_length","MMI length",25.,33.,2.)],
+            "Vertical-GC MZI + CPW test block":[("mmi_length","MMI length",25.,33.,2.)],
+            "Vertical-GC MZI + segmented electrode test block":[("mmi_length","MMI length",25.,33.,2.)],
+            "Straight-GC MZI + segmented RF bends test block":[("mmi_length","MMI length",25.,33.,2.)],
+            "Straight-GC MZI + CPW RF bends test block":[("mmi_length","MMI length",25.,33.,2.)],
         }.get(kind,[])
         if not options:return True
         dialog=QDialog(self);dialog.setWindowTitle(f"Configure parameter sweeps — {kind}");dialog.resize(1040,max(330,210+70*len(options)));dialog.setMinimumWidth(920);layout=QVBoxLayout(dialog);layout.setContentsMargins(18,18,18,18);layout.setSpacing(12);label=QLabel("Select each major parameter to sweep, then enter its inclusive start, stop, and step. Unchecked parameters remain nominal.");label.setWordWrap(True);label.setMinimumHeight(42);layout.addWidget(label)
@@ -852,7 +888,7 @@ class NativeLayoutWindow(QMainWindow):
             else:
                 names=mapping[key]
                 for name,value in zip(names,(start,stop,step)):p[name]=value
-            if key=="mmi_length" and kind.startswith("Vertical-GC"):p["mzi_count"]=len(values)
+            if key=="mmi_length" and kind in {"Vertical-GC MZI test block","Vertical-GC MZI + CPW test block","Vertical-GC MZI + segmented electrode test block","Straight-GC MZI + segmented RF bends test block","Straight-GC MZI + CPW RF bends test block"}:p["mzi_count"]=len(values)
         p["sweep_parameters"]=active
         return True
 
@@ -1161,7 +1197,7 @@ class NativeLayoutWindow(QMainWindow):
                 else:
                     spec = ["string", value]
             widget = self.make_parameter_widget(key, spec, value)
-            self.properties_form.addRow(key, widget)
+            self.properties_form.addRow("GC straight lead length (µm)" if key=="gc_wg_length" else "CPW taper model" if key=="cpw_profile" else key, widget)
             self.parameter_widgets[f"params.{key}"] = (widget, spec[0])
 
         active = self.active_field
@@ -1203,6 +1239,7 @@ class NativeLayoutWindow(QMainWindow):
                     continue
                 else:
                     component[key] = value
+            synchronize_rf_taper_points(component)
             if (
                 component.get("kind") == "E-beam multipass"
                 and self.active_field
@@ -1617,6 +1654,15 @@ class NativeLayoutWindow(QMainWindow):
             bounds = rect if bounds is None else bounds.united(rect)
         if bounds is not None:
             self.fit_rect(bounds, 50.0)
+
+    def start_fit_drawn_region(self) -> None:
+        self.view.begin_fit_region()
+        self.statusBar().showMessage("Drag a rectangle around the region to fit.",5000)
+
+    def fit_drawn_region(self, bounds: QRectF) -> None:
+        margin=max(bounds.width(),bounds.height())*0.02
+        self.fit_rect(bounds,margin)
+        self.statusBar().showMessage("Fitted the drawn region.",3000)
 
     def zoom_in(self) -> None:
         self.view.zoom_by(1.25)
@@ -2468,7 +2514,7 @@ class NativeLayoutWindow(QMainWindow):
                             "ymax": float(points[:, 1].max()),
                         }
                     )
-            elif kind in {"Double-ring test block", "Grating test block", "Grating angle-taper test block", "MMI + Reference test block", "MMI split-combine test block", "Long MZI test block", "Vertical-GC MZI test block", "Vertical-GC MZI + CPW test block", "Vertical-GC MZI + segmented electrode test block"}:
+            elif kind in {"Double-ring test block", "Grating test block", "Grating angle-taper test block", "MMI + Reference test block", "MMI split-combine test block", "Long MZI test block", "Vertical-GC MZI test block", "Vertical-GC MZI + CPW test block", "Vertical-GC MZI + segmented electrode test block", "Straight-GC MZI + segmented RF bends test block", "Straight-GC MZI + CPW RF bends test block"}:
                 # Compound test blocks draw each field as four thin polygons
                 # on layer 6.  Rebuild the component, retain only those bars,
                 # and union every four consecutive bars into its field box.
@@ -3426,6 +3472,20 @@ ENDFLOW
         process.start()
         self.statusBar().showMessage("LLM assistant working…")
 
+    def run_llm_api_test(self) -> None:
+        """Test cloud authentication/model access without modifying the project."""
+        if self.llm_process is not None:
+            self.append_llm_chat("error", "An LLM request is already running.")
+            return
+        request_fd, request_name = tempfile.mkstemp(prefix="photonic_llm_test_", suffix=".json")
+        response_fd, response_name = tempfile.mkstemp(prefix="photonic_llm_test_response_", suffix=".json")
+        os.close(request_fd);os.close(response_fd)
+        self.llm_request_file=Path(request_name);self.llm_response_file=Path(response_name);self.llm_response_file.write_text("")
+        self.llm_request_file.write_text(json.dumps({"task":"test","model":self.llm_model.text().strip() or "gpt-5.6","api_key":self.llm_api_key.text().strip()}))
+        process=QProcess(self);self.llm_process=process;self.llm_send_button.setEnabled(False);self.llm_test_button.setEnabled(False)
+        process.setProgram(sys.executable);process.setArguments([launcher_path(),"--worker-llm",str(self.llm_request_file),str(self.llm_response_file)])
+        process.finished.connect(self.llm_request_finished);process.start();self.append_llm_chat("assistant","Testing OpenAI API connection…");self.statusBar().showMessage("Testing OpenAI API…")
+
     def llm_request_finished(self, exit_code: int, exit_status) -> None:
         process = self.llm_process
         stderr = (
@@ -3439,7 +3499,9 @@ ENDFLOW
             if self.llm_response_file is None:
                 raise ValueError("The LLM worker produced no response file.")
             response = json.loads(self.llm_response_file.read_text())
-            if "plan" in response:
+            if response.get("test"):
+                self.append_llm_chat("assistant", str(response.get("message") or "OpenAI API connection successful."))
+            elif "plan" in response:
                 plan = response["plan"]
                 self.apply_native_assistant_actions(plan.get("actions", []))
                 self.append_llm_chat(
@@ -3465,6 +3527,8 @@ ENDFLOW
             self.llm_request_file = None
             self.llm_response_file = None
             self.llm_process = None
+            self.llm_send_button.setEnabled(True)
+            self.llm_test_button.setEnabled(True)
             self.llm_send_button.setEnabled(True)
 
     # ------------------------------------------------------------------
@@ -3585,7 +3649,7 @@ ENDFLOW
             if spec is None:
                 spec = ["bool" if isinstance(value, bool) else "int" if isinstance(value, int) else "float" if isinstance(value, float) else "string", value]
             widget = self.make_parameter_widget(key, spec, value)
-            self.properties_form.addRow(key.replace("_", " "), widget)
+            self.properties_form.addRow("GC straight lead length (µm)" if key=="gc_wg_length" else "CPW taper model" if key=="cpw_profile" else key.replace("_", " "), widget)
             self.parameter_widgets[f"params.{key}"] = (widget, spec[0])
         all_button = QPushButton("Show all component parameters…")
         all_button.clicked.connect(lambda: self.show_component_properties(component))
@@ -3637,7 +3701,7 @@ ENDFLOW
             if spec is None:
                 spec = ["bool" if isinstance(value, bool) else "int" if isinstance(value, int) else "float" if isinstance(value, float) else "string", value]
             widget = self.make_parameter_widget(key, spec, value)
-            form.addRow(key.replace("_", " "), widget)
+            form.addRow("GC straight lead length (µm)" if key=="gc_wg_length" else "CPW taper model" if key=="cpw_profile" else key.replace("_", " "), widget)
             widgets[key] = (widget, spec[0])
         outer.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -3702,6 +3766,7 @@ ENDFLOW
         delete_action.setEnabled(bool(self.scene.selectedItems()) or bool(self.active_field))
         menu.addSeparator()
         menu.addAction("Fit Selection", self.fit_selection)
+        menu.addAction("Fit Drawn Region…", self.start_fit_drawn_region)
         menu.addAction("Fit Design", self.fit_design)
         chosen = menu.exec(self.view.viewport().mapToGlobal(viewport_position))
         if chosen in section_actions:

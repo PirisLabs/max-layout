@@ -63,6 +63,8 @@ GC_COMPOSITE_KINDS = {
     "Vertical-GC MZI test block",
     "Vertical-GC MZI + CPW test block",
     "Vertical-GC MZI + segmented electrode test block",
+    "Straight-GC MZI + segmented RF bends test block",
+    "Straight-GC MZI + CPW RF bends test block",
     "Long MZI test block",
     "Ring + two feedlines",
     "Double-ring test block",
@@ -295,7 +297,7 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                  'profile': 'klopfenstein',
                  'target_s11_db': 20.0,
                  'exponential_factor': 1.0,
-                 'points': 5001,
+                 'points': 1001,
                  'layer': 4,
                  'datatype': 0},
  'Symmetric CPW taper': {'end_straight_length': 50.0,
@@ -308,15 +310,15 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                          'profile': 'klopfenstein',
                          'target_s11_db': 20.0,
                          'exponential_factor': 1.0,
-                         'points': 3001,
+                         'points': 601,
                          'layer': 4,
                          'datatype': 0},
  'CPW bend': {'R_eff': 500.0, 'bend_angle_deg': 90.0, 'signal_width': 130.0, 'gap': 3.0, 'ground_width': 130.0, 'points': 161, 'layer': 4, 'datatype': 0},
  'Segmented electrode': {'signal_width': 130.0,
                          'gap': 3.0,
-                         'end_gap': 14.5,
+                         'end_gap': 3.0,
                          'ground_width': 130.0,
-                         'transition_length': 100.0,
+                         'transition_length': 1.0,
                          'end_flat_length': 50.0,
                          'inner_flat_length': 50.0,
                          't_top_width': 2.0,
@@ -632,15 +634,15 @@ BOOL_PARAMETERS = {"add_grating_couplers", "include_oxide_masks", "include_ebeam
 
 DEFAULT_COMPONENT_VALUES["MZI vertical GC"] = dict(DEFAULT_COMPONENT_VALUES["MZI"])
 
-DEFAULT_COMPONENT_VALUES["MZI vertical GC"].update({"add_grating_couplers":True,"gc_three_euler_inward":True,"gc_prebend_straight":10.0,"gc_vertical_side":"up","gc_vertical_run":100.0,"gc_inward_run_fraction":0.45,"gc_align_gc_to_mzi_center":True,"gc_inward_run":300.0,"gc_euler_radius":100.0})
+DEFAULT_COMPONENT_VALUES["MZI vertical GC"].update({"add_grating_couplers":True,"gc_three_euler_inward":True,"gc_prebend_straight":10.0,"gc_vertical_side":"up","gc_vertical_run":100.0,"gc_inward_run_fraction":0.25,"gc_align_gc_to_mzi_center":True,"gc_inward_run":300.0,"gc_euler_radius":100.0})
 
 DEFAULT_COMPONENT_VALUES["Vertical-GC MZI test block"] = dict(DEFAULT_COMPONENT_VALUES["MZI vertical GC"])
 
-DEFAULT_COMPONENT_VALUES["Vertical-GC MZI test block"].update({"mzi_count":5,"mmi_length_start":27.0,"mmi_length_step":1.0,"mzi_total_length":10000.0,"vertical_spacing":1800.0,"include_ebeam_fields":True,"ebeam_field_size":520.0,"ebeam_edge_clearance":10.0,"parameter_text_height":10.0})
+DEFAULT_COMPONENT_VALUES["Vertical-GC MZI test block"].update({"mzi_count":5,"mmi_length_start":25.0,"mmi_length_step":2.0,"mzi_total_length":10000.0,"vertical_spacing":1800.0,"include_ebeam_fields":True,"ebeam_field_size":520.0,"ebeam_edge_clearance":10.0,"parameter_text_height":10.0})
 
 DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + CPW test block"] = dict(DEFAULT_COMPONENT_VALUES["Vertical-GC MZI test block"])
 
-DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + CPW test block"].update({"include_symmetric_cpw":True,"cpw_align_to_mzi_s_bends":True,"cpw_s_bend_clearance":10.0,"cpw_middle_flat_fraction":.95,"cpw_taper_length":500.0,"cpw_outer_flat_length":500.0,"cpw_signal_width":130.0,"cpw_ground_width":130.0,"cpw_end_gap":14.5,"cpw_middle_gap":3.0,"cpw_profile":"klopfenstein","cpw_target_s11_db":20.0,"cpw_exponential_factor":1.0,"cpw_points":5001})
+DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + CPW test block"].update({"include_symmetric_cpw":True,"vertical_spacing":1000.0,"cpw_align_to_mzi_s_bends":True,"cpw_s_bend_clearance":10.0,"cpw_middle_flat_fraction":.95,"cpw_taper_length":500.0,"cpw_outer_flat_length":500.0,"cpw_signal_width":130.0,"cpw_ground_width":130.0,"cpw_end_gap":14.5,"cpw_middle_gap":3.0,"cpw_profile":"klopfenstein","cpw_target_s11_db":20.0,"cpw_exponential_factor":1.0,"cpw_points":1001})
 
 DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + CPW test block"].pop("cpw_middle_flat_fraction",None)
 
@@ -648,11 +650,19 @@ DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + CPW test block"].pop("cpw_outer_flat
 
 DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + segmented electrode test block"] = dict(DEFAULT_COMPONENT_VALUES["Vertical-GC MZI test block"])
 
-DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + segmented electrode test block"].update({"include_segmented_electrode":True,"seg_s_bend_clearance":10.0,"seg_signal_width":130.0,"seg_end_gap":14.5,"seg_gap":3.0,"seg_ground_width":130.0,"seg_transition_length":500.0,"seg_end_flat_length":50.0,"seg_inner_flat_length":50.0,"seg_t_top_width":2.0,"seg_t_top_length":45.0,"seg_t_neck_width":4.0,"seg_t_neck_length":18.0,"seg_segment_spacing":3.0,"seg_segment_count":80,"seg_auto_segment_count":True,"seg_include_oxide_masks":False})
+DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + segmented electrode test block"].update({"include_segmented_electrode":True,"vertical_spacing":1000.0,"seg_s_bend_clearance":10.0,"seg_signal_width":130.0,"seg_end_gap":3.0,"seg_gap":3.0,"seg_ground_width":130.0,"seg_transition_length":1.0,"seg_end_flat_length":50.0,"seg_inner_flat_length":50.0,"seg_t_top_width":2.0,"seg_t_top_length":45.0,"seg_t_neck_width":4.0,"seg_t_neck_length":18.0,"seg_segment_spacing":3.0,"seg_segment_count":80,"seg_auto_segment_count":True,"seg_include_oxide_masks":False})
 
-DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + segmented electrode test block"]["seg_taper_length"]=500.0
+DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + segmented electrode test block"]["seg_taper_length"]=1.0
 
 DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + segmented electrode test block"].pop("seg_transition_length",None)
+
+DEFAULT_COMPONENT_VALUES["Straight-GC MZI + segmented RF bends test block"] = dict(DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + segmented electrode test block"])
+
+DEFAULT_COMPONENT_VALUES["Straight-GC MZI + segmented RF bends test block"].update({"gc_three_euler_inward":False,"gc_input_route":"straight","gc_output_route":"straight","gc_wg_length":3000.0,"mzi_total_length":8000.0,"vertical_spacing":1000.0,"seg_s_bend_clearance":0.0,"seg_end_flat_length":0.0,"seg_inner_flat_length":200.0,"include_rf_edge_bends":True,"rf_edge_straight_length":0.0,"rf_edge_bend_radius":500.0,"rf_edge_bend_angle_deg":90.0,"rf_edge_bend_points":321})
+
+DEFAULT_COMPONENT_VALUES["Straight-GC MZI + CPW RF bends test block"] = dict(DEFAULT_COMPONENT_VALUES["Vertical-GC MZI + CPW test block"])
+
+DEFAULT_COMPONENT_VALUES["Straight-GC MZI + CPW RF bends test block"].update({"gc_three_euler_inward":False,"gc_input_route":"straight","gc_output_route":"straight","gc_wg_length":3000.0,"mzi_total_length":8000.0,"vertical_spacing":1000.0,"cpw_s_bend_clearance":0.0,"cpw_end_straight_length":0.0,"include_rf_edge_bends":True,"rf_edge_bend_radius":500.0,"rf_edge_bend_angle_deg":90.0,"rf_edge_bend_points":321})
 
 DEFAULT_COMPONENT_VALUES["MMI split-combine cascade"] = dict(DEFAULT_COMPONENT_VALUES["1x2 MMI"])
 
@@ -667,6 +677,8 @@ INTEGER_PARAMETERS.add("seg_segment_count")
 INTEGER_PARAMETERS.add("cascade_count")
 
 BOOL_PARAMETERS.add("add_output_grating_coupler")
+
+BOOL_PARAMETERS.add("include_rf_edge_bends")
 
 BOOL_PARAMETERS.update({"add_input_grating_coupler","add_reference_waveguide"})
 
@@ -693,6 +705,8 @@ COMPONENT_DISPLAY_NAMES={
     "MMI split-combine test block":"MMI splitter–combiner sweep block",
     "MZI vertical GC":"MZI with vertical grating couplers",
     "Vertical-GC MZI test block":"Vertical-grating-coupler MZI sweep block",
+    "Straight-GC MZI + segmented RF bends test block":"Straight-grating MZI with segmented RF edge bends",
+    "Straight-GC MZI + CPW RF bends test block":"Straight-grating MZI with continuous CPW edge bends",
     "Double-ring test block":"Dual-ring resonator sweep block",
     "Grating test block":"Grating-coupler pitch/fill sweep block",
     "Grating angle-taper test block":"Grating-coupler angle/taper sweep block",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from functools import lru_cache
 import math
 
 import numpy as np
@@ -63,6 +64,29 @@ def cpw_impedance_factor(signal_width: float, gap: float) -> float:
     return elliptic_k_parameter(1.0 - m) / elliptic_k_parameter(m)
 
 
+def _elliptic_k_parameter_array(m_values: np.ndarray) -> np.ndarray:
+    """Vectorized AGM evaluation matching :func:`elliptic_k_parameter`."""
+    m = np.clip(np.asarray(m_values, dtype=float), 0.0, 1.0 - 1e-15)
+    a = np.ones_like(m)
+    b = np.sqrt(1.0 - m)
+    for _ in range(80):
+        next_a = 0.5 * (a + b)
+        next_b = np.sqrt(a * b)
+        converged = np.abs(next_a - next_b) <= 1e-15 * np.maximum(1.0, next_a)
+        a = next_a
+        b = next_b
+        if bool(np.all(converged)):
+            break
+    return np.pi / (2.0 * a)
+
+
+def _cpw_impedance_factor_array(signal_width: float, gaps: np.ndarray) -> np.ndarray:
+    gaps = np.asarray(gaps, dtype=float)
+    k = float(signal_width) / (float(signal_width) + 2.0 * gaps)
+    m = k * k
+    return _elliptic_k_parameter_array(1.0 - m) / _elliptic_k_parameter_array(m)
+
+
 def klopfenstein_auto_a(
     signal_width: float,
     start_gap: float,
@@ -99,6 +123,29 @@ def _invert_cpw_impedance_factor(
     return 0.5 * (lo + hi)
 
 
+def _invert_cpw_impedance_factors(
+    signal_width: float,
+    target_factors: np.ndarray,
+    gap_a: float,
+    gap_b: float,
+) -> np.ndarray:
+    """Vectorized form of the exact 72-step scalar bisection."""
+    targets = np.asarray(target_factors, dtype=float)
+    lo_value = min(float(gap_a), float(gap_b))
+    hi_value = max(float(gap_a), float(gap_b))
+    lo = np.full(targets.shape, lo_value, dtype=float)
+    hi = np.full(targets.shape, hi_value, dtype=float)
+    f_lo = cpw_impedance_factor(signal_width, lo_value)
+    increasing = cpw_impedance_factor(signal_width, hi_value) >= f_lo
+    for _ in range(72):
+        mid = 0.5 * (lo + hi)
+        values = _cpw_impedance_factor_array(signal_width, mid)
+        move_lo = (values < targets) == increasing
+        lo = np.where(move_lo, mid, lo)
+        hi = np.where(move_lo, hi, mid)
+    return 0.5 * (lo + hi)
+
+
 def _gap_transition_values(
     start_gap: float,
     end_gap: float,
@@ -108,6 +155,26 @@ def _gap_transition_values(
     target_s11_db: float = 20.0,
     exponential_factor: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
+    u, gaps = _cached_gap_transition_values(
+        float(start_gap), float(end_gap), max(2, int(count)),
+        str(profile or "linear").lower(), float(signal_width),
+        float(target_s11_db), float(exponential_factor),
+    )
+    # Callers may modify endpoint arrays while assembling symmetric profiles.
+    return u.copy(), gaps.copy()
+
+
+@lru_cache(maxsize=256)
+def _cached_gap_transition_values(
+    start_gap: float,
+    end_gap: float,
+    count: int,
+    profile: str,
+    signal_width: float,
+    target_s11_db: float,
+    exponential_factor: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cache expensive full-resolution profiles shared by repeated tapers."""
     count = max(2, int(count))
     u = np.linspace(0.0, 1.0, count)
     start_gap = float(start_gap)
@@ -116,30 +183,56 @@ def _gap_transition_values(
     if start_gap <= 0.0 or end_gap <= 0.0:
         raise ValueError("CPW taper gaps must be positive.")
     if profile == "exponential":
-        exponent = max(1e-6, float(exponential_factor))
-        return u, start_gap * (end_gap / start_gap) ** (u**exponent)
+        factor = float(exponential_factor)
+        # A factor of zero is the neutral, smooth exponential interpolation.
+        # Clamping it to a tiny positive power makes u**factor nearly one for
+        # every u > 0, which creates a visible step immediately after the
+        # taper input (and immediately before the symmetric output endpoint).
+        exponent = 1.0 if abs(factor) <= 1e-12 else max(1e-6, factor)
+        gaps = start_gap * (end_gap / start_gap) ** (u**exponent)
+        gaps[0] = start_gap
+        gaps[-1] = end_gap
+        return u, gaps
     if profile == "klopfenstein":
         a, _, _ = klopfenstein_auto_a(signal_width, start_gap, end_gap, target_s11_db)
         shape = u if a <= 1e-12 else klopfenstein_shape(u, a)
         z0 = cpw_impedance_factor(signal_width, start_gap)
         z1 = cpw_impedance_factor(signal_width, end_gap)
         target_z = np.exp(math.log(z0) + (math.log(z1) - math.log(z0)) * shape)
-        gaps = np.asarray(
-            [
-                _invert_cpw_impedance_factor(signal_width, float(z), start_gap, end_gap)
-                for z in target_z
-            ],
-            dtype=float,
-        )
+        gaps = _invert_cpw_impedance_factors(signal_width, target_z, start_gap, end_gap)
         gaps[0] = start_gap
         gaps[-1] = end_gap
         return u, gaps
     return u, start_gap + (end_gap - start_gap) * u
 
 
+def rf_taper_point_count(length_um: float) -> int:
+    """One longitudinal point per 0.5 µm, including both taper endpoints."""
+    length = float(length_um)
+    if length < 0.0:
+        raise ValueError("RF taper length cannot be negative.")
+    return max(2, int(math.ceil(length / 0.5)) + 1)
+
+
+def synchronize_rf_taper_points(component: dict[str, Any]) -> None:
+    """Store the derived 0.5-µm spacing count in editable/project JSON fields."""
+    kind = str(component.get("kind", ""))
+    params = component.setdefault("params", {})
+    if kind == "Tapered CPW":
+        params["points"] = rf_taper_point_count(float(params.get("length", 0.0)))
+    elif kind == "Symmetric CPW taper":
+        params["points"] = rf_taper_point_count(float(params.get("taper_length", 0.0)))
+    elif kind == "MZI + CPW module":
+        params["points"] = max(
+            rf_taper_point_count(float(params.get("rf_input_taper_length", 0.0))),
+            rf_taper_point_count(float(params.get("rf_output_taper_length", 0.0))),
+        )
+    elif kind in {"Vertical-GC MZI + CPW test block", "Straight-GC MZI + CPW RF bends test block"}:
+        params["cpw_points"] = rf_taper_point_count(float(params.get("cpw_taper_length", 0.0)))
+
+
 def gap_profile(p: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-    # At least 10 samples/µm gives a maximum longitudinal chord of 0.1 µm.
-    count = max(2, int(p.get("points", 161)), int(math.ceil(float(p["length"]) * 10.0)) + 1)
+    count = rf_taper_point_count(float(p["length"]))
     return _gap_transition_values(
         start_gap=float(p["initial_gap"]),
         end_gap=float(p["final_gap"]),
@@ -173,9 +266,7 @@ def symmetric_cpw_taper_profile(p: dict[str, Any]) -> tuple[np.ndarray, np.ndarr
     middle_gap = float(p["middle_gap"])
     if initial_gap < 0.0 or middle_gap < 0.0:
         raise ValueError("Symmetric CPW taper gaps cannot be negative.")
-    # ``points`` remains a user-adjustable minimum; fabrication geometry is
-    # never allowed below 10 longitudinal samples per taper micrometre.
-    points = max(2, int(p.get("points", 161)), int(math.ceil(taper_length * 10.0)) + 1)
+    points = rf_taper_point_count(taper_length)
     profile = str(p.get("profile", p.get("input_profile", p.get("output_profile", "linear"))))
     signal_width = float(p["signal_width"])
     target_s11_db = float(p.get("target_s11_db", 20.0))

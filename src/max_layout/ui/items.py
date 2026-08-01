@@ -29,8 +29,75 @@ except Exception:
     QOpenGLWidget = None
 
 _PREVIEW_GEOMETRY_CACHE: OrderedDict[str, list[tuple[np.ndarray, int, int]]] = OrderedDict()
+_PREVIEW_PATH_CACHE: OrderedDict[str, dict[tuple[int, int], QPainterPath]] = OrderedDict()
 
 _PREVIEW_GEOMETRY_CACHE_LIMIT = 2048
+_PREVIEW_PATH_CACHE_LIMIT = 512
+
+_PREVIEW_MAX_VERTICES = max(32, int(os.environ.get("MAX_LAYOUT_PREVIEW_MAX_VERTICES", "256")))
+_PREVIEW_MAX_POLYGONS_PER_LAYER = max(100, int(os.environ.get("MAX_LAYOUT_PREVIEW_MAX_POLYGONS_PER_LAYER", "500")))
+
+
+def clear_preview_caches() -> None:
+    """Discard all derived GUI geometry; project and export data are untouched."""
+    _PREVIEW_GEOMETRY_CACHE.clear()
+    _PREVIEW_PATH_CACHE.clear()
+
+
+def _apply_preview_resolution(component: dict[str, Any]) -> None:
+    """Lower only the interactive-canvas resolution; never mutate project data."""
+    params = component.setdefault("params", {})
+    for key, limit in {"rf_edge_bend_points": 96, "gc_points": 96}.items():
+        value = params.get(key)
+        if isinstance(value, (int, float)):
+            params[key] = min(int(value), limit)
+
+
+def _sample_dense_preview_polygons(
+    polygons: list[tuple[np.ndarray, int, int]],
+) -> list[tuple[np.ndarray, int, int]]:
+    """Keep structural planes plus representative repeated preview details."""
+    grouped: OrderedDict[tuple[int, int], list[tuple[np.ndarray, int, int]]] = OrderedDict()
+    for polygon in polygons:
+        grouped.setdefault((polygon[1], polygon[2]), []).append(polygon)
+    reduced: list[tuple[np.ndarray, int, int]] = []
+    for group in grouped.values():
+        if len(group) <= _PREVIEW_MAX_POLYGONS_PER_LAYER:
+            reduced.extend(group)
+            continue
+        areas = []
+        for index, (points, _, _) in enumerate(group):
+            x = points[:, 0]
+            y = points[:, 1]
+            area = abs(float(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))) / 2.0
+            areas.append((area, index))
+        structural_count = min(32, max(3, _PREVIEW_MAX_POLYGONS_PER_LAYER // 10))
+        structural = {index for _, index in sorted(areas, reverse=True)[:structural_count]}
+        remaining = [index for index in range(len(group)) if index not in structural]
+        sample_count = max(0, _PREVIEW_MAX_POLYGONS_PER_LAYER - len(structural))
+        if remaining and sample_count:
+            positions = np.linspace(0, len(remaining) - 1, sample_count, dtype=int)
+            structural.update(remaining[int(position)] for position in np.unique(positions))
+        reduced.extend(group[index] for index in sorted(structural))
+    return reduced
+
+
+def component_preview_cache_key(component: dict[str, Any]) -> str:
+    local = safe_json_copy(component)
+    local["x"] = 0.0
+    local["y"] = 0.0
+    local["orientation_deg"] = 0.0
+    local["attachment"] = None
+    _canonicalize_component_layers(local)
+    _apply_preview_resolution(local)
+    # Preview geometry is independent of UID and global transform.  Caching it
+    # avoids rebuilding identical gdstk cells on every scene refresh.
+    cache_payload = {
+        "kind": local.get("kind"),
+        "mirrored": bool(local.get("mirrored", False)),
+        "params": local.get("params", {}),
+    }
+    return json.dumps(cache_payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def component_local_polygons(component: dict[str, Any]) -> list[tuple[np.ndarray, int, int]]:
@@ -42,14 +109,8 @@ def component_local_polygons(component: dict[str, Any]) -> list[tuple[np.ndarray
     local["orientation_deg"] = 0.0
     local["attachment"] = None
     _canonicalize_component_layers(local)
-    # Preview geometry is independent of UID and global transform.  Caching it
-    # avoids rebuilding identical gdstk cells on every scene refresh.
-    cache_payload = {
-        "kind": local.get("kind"),
-        "mirrored": bool(local.get("mirrored", False)),
-        "params": local.get("params", {}),
-    }
-    cache_key = json.dumps(cache_payload, sort_keys=True, separators=(",", ":"), default=str)
+    _apply_preview_resolution(local)
+    cache_key = component_preview_cache_key(component)
     cached = _PREVIEW_GEOMETRY_CACHE.get(cache_key)
     if cached is not None:
         _PREVIEW_GEOMETRY_CACHE.move_to_end(cache_key)
@@ -75,6 +136,7 @@ def component_local_polygons(component: dict[str, Any]) -> list[tuple[np.ndarray
         layer = int(getattr(polygon, "layer", local.get("params", {}).get("layer", 1)))
         datatype = int(getattr(polygon, "datatype", local.get("params", {}).get("datatype", 0)))
         result.append((points, layer, datatype))
+    result = _sample_dense_preview_polygons(result)
     _PREVIEW_GEOMETRY_CACHE[cache_key] = result
     _PREVIEW_GEOMETRY_CACHE.move_to_end(cache_key)
     while len(_PREVIEW_GEOMETRY_CACHE) > _PREVIEW_GEOMETRY_CACHE_LIMIT:
@@ -82,16 +144,49 @@ def component_local_polygons(component: dict[str, Any]) -> list[tuple[np.ndarray
     return result
 
 
+def component_layer_paths(
+    component: dict[str, Any],
+    polygons: list[tuple[np.ndarray, int, int]],
+) -> dict[tuple[int, int], QPainterPath]:
+    """Return immutable standard Qt paths shared by identical components."""
+    cache_key = component_preview_cache_key(component)
+    cached = _PREVIEW_PATH_CACHE.get(cache_key)
+    if cached is not None:
+        _PREVIEW_PATH_CACHE.move_to_end(cache_key)
+        return cached
+    layer_paths: dict[tuple[int, int], QPainterPath] = {}
+    for points, layer, datatype in polygons:
+        preview_points = points
+        if component.get("kind") == "Boolean geometry" and len(points) > 2000:
+            stride = max(1, math.ceil(len(points) / 2000))
+            preview_points = points[::stride]
+        polygon = QPolygonF([QPointF(float(x), -float(y)) for x, y in preview_points])
+        key = (int(layer), int(datatype))
+        path = layer_paths.setdefault(key, QPainterPath())
+        path.addPolygon(polygon)
+        path.closeSubpath()
+    _PREVIEW_PATH_CACHE[cache_key] = layer_paths
+    _PREVIEW_PATH_CACHE.move_to_end(cache_key)
+    while len(_PREVIEW_PATH_CACHE) > _PREVIEW_PATH_CACHE_LIMIT:
+        _PREVIEW_PATH_CACHE.popitem(last=False)
+    return layer_paths
+
+
 class LayoutView(QGraphicsView):
     cursorWorldChanged = Signal(float, float)
     zoomChanged = Signal(float)
+    regionFitRequested = Signal(QRectF)
 
-    def __init__(self, scene: QGraphicsScene, parent: QWidget | None = None) -> None:
+    def __init__(self, scene: QGraphicsScene, parent: QWidget | None = None, use_opengl: bool | None = None) -> None:
         super().__init__(scene, parent)
         self.setRenderHints(
             QPainter.RenderHint.Antialiasing
             | QPainter.RenderHint.TextAntialiasing
             | QPainter.RenderHint.SmoothPixmapTransform
+        )
+        self.setOptimizationFlags(
+            QGraphicsView.OptimizationFlag.DontSavePainterState
+            | QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing
         )
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -109,25 +204,36 @@ class LayoutView(QGraphicsView):
         self.measure_start: QPointF | None = None
         self.measure_end: QPointF | None = None
         self.measure_third: QPointF | None = None
+        self.fit_region_mode = False
+        self.fit_region_start: QPointF | None = None
+        self.fit_region_end: QPointF | None = None
         self.sketch_mode=False
         self.sketch_strokes:list[list[QPointF]]=[]
         self._active_sketch:list[QPointF]|None=None
         self._middle_pan = False
         self._last_pan = QPoint()
         self.opengl_enabled = False
-        # Qt's OpenGL paint engine can emit "Painter path exceeds +/-32767 pixels"
-        # for long photonic/RF polygons at high zoom.  Use the stable raster
-        # viewport by default; OpenGL remains available as an explicit opt-in.
-        use_opengl = str(os.environ.get("PHOTONIC_LAYOUT_USE_OPENGL", "0")).strip().lower() in {
-            "1", "true", "yes", "on"
-        }
-        if use_opengl and QOpenGLWidget is not None:
+        if use_opengl is None:
+            use_opengl = str(os.environ.get("PHOTONIC_LAYOUT_USE_OPENGL", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        self.set_opengl_enabled(bool(use_opengl))
+
+    def set_opengl_enabled(self, enabled: bool) -> bool:
+        """Switch between GPU-assisted OpenGL painting and CPU raster."""
+        if enabled and QOpenGLWidget is not None:
             try:
                 self.setViewport(QOpenGLWidget())
-                self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
+                # QOpenGLWidget supports partial updates.  Repainting only the
+                # changed scene region avoids redrawing every dense polygon
+                # whenever a component is added, selected, or moved.
+                self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.MinimalViewportUpdate)
                 self.opengl_enabled = True
+                return True
             except Exception:
-                self.opengl_enabled = False
+                pass
+        self.setViewport(QWidget())
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
+        self.opengl_enabled = False
+        return False
 
     def current_zoom_percent(self) -> float:
         return abs(float(self.transform().m11())) * 100.0
@@ -142,6 +248,13 @@ class LayoutView(QGraphicsView):
         if abs(applied - 1.0) > 1e-12:
             self.scale(applied, applied)
         self.emit_zoom()
+
+    def begin_fit_region(self) -> None:
+        self.fit_region_mode = True
+        self.fit_region_start = None
+        self.fit_region_end = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.viewport().update()
 
     def reset_one_to_one(self) -> None:
         center = self.mapToScene(self.viewport().rect().center())
@@ -161,6 +274,8 @@ class LayoutView(QGraphicsView):
         return event.pos()
 
     def mousePressEvent(self, event) -> None:
+        if self.fit_region_mode and event.button()==Qt.MouseButton.LeftButton:
+            point=self.mapToScene(self.event_view_pos(event));self.fit_region_start=point;self.fit_region_end=point;event.accept();return
         if self.sketch_mode and event.button()==Qt.MouseButton.LeftButton:
             point=self.mapToScene(self.event_view_pos(event));self._active_sketch=[point];event.accept();return
         if self.measure_mode and event.button() == Qt.MouseButton.LeftButton:
@@ -191,9 +306,15 @@ class LayoutView(QGraphicsView):
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
             event.accept()
             return
+        if self.fit_region_mode and self.fit_region_start is not None:
+            self.fit_region_end=scene_point;self.viewport().update();event.accept();return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self.fit_region_mode and event.button()==Qt.MouseButton.LeftButton and self.fit_region_start is not None:
+            self.fit_region_end=self.mapToScene(self.event_view_pos(event));rect=QRectF(self.fit_region_start,self.fit_region_end).normalized();self.fit_region_mode=False;self.fit_region_start=None;self.fit_region_end=None;self.setCursor(Qt.CursorShape.ArrowCursor);self.viewport().update()
+            if rect.width()>1e-9 and rect.height()>1e-9:self.regionFitRequested.emit(rect)
+            event.accept();return
         if self.sketch_mode and event.button()==Qt.MouseButton.LeftButton and self._active_sketch is not None:
             point=self.mapToScene(self.event_view_pos(event));self._active_sketch.append(point)
             if len(self._active_sketch)>=2:self.sketch_strokes.append(self._active_sketch)
@@ -240,6 +361,8 @@ class LayoutView(QGraphicsView):
 
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
         super().drawForeground(painter, rect)
+        if self.fit_region_start is not None and self.fit_region_end is not None:
+            painter.save();pen=QPen(QColor('#65e6ff'),1.5,Qt.PenStyle.DashLine);pen.setCosmetic(True);painter.setPen(pen);painter.setBrush(QColor(101,230,255,35));painter.drawRect(QRectF(self.fit_region_start,self.fit_region_end).normalized());painter.restore()
         if self.sketch_strokes or self._active_sketch:
             painter.save();pen=QPen(QColor('#ffd166'),2);pen.setCosmetic(True);painter.setPen(pen);painter.setBrush(Qt.BrushStyle.NoBrush)
             for stroke in self.sketch_strokes+([self._active_sketch] if self._active_sketch else []):
@@ -357,6 +480,7 @@ class ComponentGraphicsItem(QGraphicsItemGroup):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsFocusable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
+        self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
         self.setZValue(10)
         self.rebuild_geometry()
         self.sync_transform()
@@ -390,15 +514,7 @@ class ComponentGraphicsItem(QGraphicsItemGroup):
         # A photonic-crystal array can contain tens of thousands of polygons;
         # creating one QGraphicsItem per hole makes scene construction and
         # selection unnecessarily expensive.
-        layer_paths: dict[tuple[int,int],QPainterPath] = {}
-        for points, layer, datatype in polygons:
-            # Preserve full polygon data for GDS export, but cap the Qt preview
-            # vertex count so selecting a detailed photo engraving cannot
-            # overwhelm the native graphics scene.
-            preview_points=points
-            if self.component.get("kind")=="Boolean geometry" and len(points)>2000:
-                stride=max(1,math.ceil(len(points)/2000));preview_points=points[::stride]
-            polygon=QPolygonF([QPointF(float(x),-float(y)) for x,y in preview_points]);key=(int(layer),int(datatype));path=layer_paths.setdefault(key,QPainterPath());path.addPolygon(polygon);path.closeSubpath()
+        layer_paths = component_layer_paths(self.component, polygons)
         for (layer,datatype),path in layer_paths.items():
             child=QGraphicsPathItem(path);child.setBrush(QBrush(color_for_layer(layer,135)));pen=QPen(color_for_layer(layer,230),0);pen.setCosmetic(True);child.setPen(pen);child.setData(0,layer);child.setData(1,datatype);child.setData(2,"geometry");self.addToGroup(child);rect=path.boundingRect();bounds=rect if bounds is None else bounds.united(rect)
 

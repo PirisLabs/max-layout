@@ -37,6 +37,8 @@ def resize_component_parameters(
         "MZI": ("mmi_length", "input_taper_length", "output_taper_length", "input_length", "output_length", "s_bend_length", "arm_length"),
         "MZI vertical GC": ("mmi_length", "input_taper_length", "output_taper_length", "input_length", "output_length", "s_bend_length", "arm_length", "gc_prebend_straight", "gc_inward_run"),
         "Vertical-GC MZI test block": ("mmi_length", "input_taper_length", "output_taper_length", "input_length", "output_length", "s_bend_length", "arm_length", "gc_prebend_straight", "gc_inward_run"),
+        "Straight-GC MZI + segmented RF bends test block": ("gc_wg_length", "mzi_total_length", "mmi_length", "input_taper_length", "output_taper_length", "input_length", "output_length", "s_bend_length", "seg_taper_length", "seg_inner_flat_length"),
+        "Straight-GC MZI + CPW RF bends test block": ("gc_wg_length", "mzi_total_length", "mmi_length", "input_taper_length", "output_taper_length", "input_length", "output_length", "s_bend_length", "cpw_taper_length", "cpw_end_straight_length"),
         "Long MZI test block": ("mzi_total_length", "gc_straight_length", "mmi_length", "input_taper_length", "output_taper_length", "input_length", "output_length", "s_bend_length", "gc_taper_L", "gc_wg_length"),
         "Chip marker block": ("chip_width", "corner_square_size", "edge_clearance", "vernier_pitch", "vernier_pitch_delta", "vernier_finger_width"),
         "MZI + CPW module": ("rf_input_taper_length", "s_bend_length", "arm_length", "rf_output_taper_length"),

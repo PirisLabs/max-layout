@@ -84,7 +84,7 @@ def segmented_electrode_landmarks(p: dict[str, Any]) -> dict[str, Any]:
     section is calculated internally from those endpoint dimensions and the
     T-electrode transverse dimensions.
 
-    Each endpoint has a 14.5-µm-gap port lead, a linear transition, and then a
+    Each endpoint has a user-defined-gap port lead, a linear transition, and then a
     50-µm plain CPW section whose gap equals the finger-tip gap before the
     patterned T-electrode begins.
 
@@ -104,9 +104,9 @@ def segmented_electrode_landmarks(p: dict[str, Any]) -> dict[str, Any]:
     """
     ws_end = float(p["signal_width"])
     residual_gap = float(p["gap"])
-    end_gap = float(p.get("end_gap", 14.5))
+    end_gap = float(p.get("end_gap", 3.0))
     wg_end = float(p["ground_width"])
-    transition_length = float(p.get("transition_length", 50.0))
+    transition_length = float(p.get("transition_length", 1.0))
     end_flat_length = float(p.get("end_flat_length", 50.0))
     inner_flat_length = float(p.get("inner_flat_length", 50.0))
     s = float(p["t_top_width"])

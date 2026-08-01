@@ -171,10 +171,30 @@ CURRENT SOURCE:
     }
 
 
+def _call_openai_native_test(payload: dict[str, Any]) -> dict[str, Any]:
+    """Perform a minimal authenticated request without reading or editing a layout."""
+    api_key = str(payload.get("api_key") or os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise ValueError("Enter an OpenAI API key or set OPENAI_API_KEY before testing.")
+    model = str(payload.get("model") or os.environ.get("OPENAI_MODEL") or "gpt-5.6").strip()
+    output = _openai_native_request(
+        api_key,
+        model,
+        "Reply with exactly: API connection successful.",
+        timeout=45,
+    )
+    return {
+        "test": True,
+        "message": f"OpenAI API connection successful. Model: {model}. Response: {output[:200]}",
+    }
+
+
 def _worker_llm_assistant(request_file: str, response_file: str) -> None:
     payload = json.loads(Path(request_file).read_text())
     task = str(payload.get("task") or "layout")
-    if task == "source":
+    if task == "test":
+        result = _call_openai_native_test(payload)
+    elif task == "source":
         result = _call_openai_native_source(payload)
     else:
         result = {"plan": _call_openai_native_layout(payload)}
