@@ -23,8 +23,8 @@ from PySide6.QtCore import QPoint, QPointF, QProcess, QRectF, QSettings, QSize, 
 from PySide6.QtGui import QAction, QCloseEvent, QImageReader, QKeySequence, QPainterPath, QPixmap
 from PySide6.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGraphicsItem, QGraphicsScene, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSpinBox, QStatusBar, QTableWidget, QTableWidgetItem, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
-from ..constants import CHOICE_PARAMETERS, COMPONENT_SPECS, DEFAULT_COMPONENT_VALUES, EBEAM_LAYER, GC_LAYER, LAYER_NAME_MAP, MARKER_COMPONENT_KINDS, MARKER_LAYER, NATIVE_APP_VERSION, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, component_display_name
-from ..gds.build import _add_component_geometry_to_cell, _canonicalize_component_layers, library_bbox_and_center, resolve_and_build, rotate_components_layout
+from ..constants import CHOICE_PARAMETERS, COMPONENT_SPECS, DEFAULT_COMPONENT_VALUES, EBEAM_LAYER, GC_LAYER, LAYER_NAME_MAP, LEGACY_PHOTONIC_TEST_BLOCK_KINDS, MARKER_COMPONENT_KINDS, MARKER_LAYER, NATIVE_APP_VERSION, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, component_display_name
+from ..gds.build import _add_component_geometry_to_cell, _canonicalize_component_layers, library_bbox_and_center, recenter_components_at_origin, resolve_and_build, rotate_components_layout
 from ..gds.ebeam import multipass_field_layout
 from ..geometry.shapes import mmi_total_length
 from ..geometry.rf_taper import synchronize_rf_taper_points
@@ -35,7 +35,43 @@ from ..ports import PORT_ALIASES, component_global_ports, component_local_ports,
 from ..ui.dialogs import ArrayDialog, EbeamDialog, ModuleVariablesDialog
 from ..ui.items import ComponentGraphicsItem, EbeamContainerItem, LayoutView, WriteFieldItem, clear_preview_caches
 from ..ui.theme import _force_dark_popup, color_for_layer
-from ..utils import inclusive_sweep, parse_sequence, safe_json_copy
+from ..utils import inclusive_sweep, numeric_list, parse_sequence, safe_json_copy
+
+
+CHIP_BOUNDARY_MARGIN_UM = 50.0
+BOUNDARY_COMPONENT_KINDS = {"Chip outline", "4-inch wafer outline"}
+
+
+def add_fixed_default_row(table: QTableWidget, row: int, key: str, value: Any) -> tuple[str, Any, bool, Any]:
+    """Render a non-scanned parameter as a single editable default cell and return its reader spec."""
+    table.setItem(row, 0, QTableWidgetItem(key.replace("_", " ")))
+    for column in (1, 2, 3):
+        table.setItem(row, column, QTableWidgetItem("—"))
+    if key in CHOICE_PARAMETERS or isinstance(value, bool):
+        allowed = CHOICE_PARAMETERS.get(key, [False, True] if isinstance(value, bool) else [value])
+        box = QComboBox();box.addItems([str(option).lower() if isinstance(option, bool) else str(option) for option in allowed])
+        box.setCurrentText(str(value).lower() if isinstance(value, bool) else str(value));box.setMinimumSize(290, 42)
+        table.setCellWidget(row, 4, box);return ("choice", box, isinstance(value, bool), value)
+    if isinstance(value, str):
+        entry = QLineEdit(str(value));entry.setMinimumSize(290, 42)
+        table.setCellWidget(row, 4, entry);return ("text", entry, False, value)
+    box = QDoubleSpinBox();box.setRange(-1e9, 1e9);box.setDecimals(0 if isinstance(value, int) else 9)
+    box.setValue(float(value));box.setMinimumSize(290, 42)
+    table.setCellWidget(row, 4, box);return ("number", box, isinstance(value, int), value)
+
+
+def read_fixed_default(spec: tuple[str, Any, bool, Any]) -> Any:
+    """Pull the edited default back out of the widget created by :func:`add_fixed_default_row`."""
+    mode, widget, flag, original = spec
+    if mode == "choice":
+        text = widget.currentText()
+        return text.lower() in {"1", "true", "yes", "on"} if flag else text
+    if mode == "text":
+        return widget.text()
+    # An untouched spin box must not quantize a value carrying more digits than the box displays.
+    if abs(widget.value() - float(original)) <= 0.5 * 10 ** -widget.decimals():
+        return original
+    return int(round(widget.value())) if flag else float(widget.value())
 
 
 class NativeLayoutWindow(QMainWindow):
@@ -163,6 +199,7 @@ class NativeLayoutWindow(QMainWindow):
             "Other photonic": [],
         }
         rf_groups: dict[str,list[str]]={
+            "RF test blocks":[],
             "CPW transmission lines":[],
             "RF tapers":[],
             "RF bends":[],
@@ -177,11 +214,14 @@ class NativeLayoutWindow(QMainWindow):
             "User modules": [],
         }
         for kind in DEFAULT_COMPONENT_VALUES:
+            if kind in LEGACY_PHOTONIC_TEST_BLOCK_KINDS:
+                continue
             if filter_text and filter_text not in kind.lower():
                 continue
             if kind in RF_COMPONENT_KINDS or kind == "MZI + CPW module":
                 lower=kind.lower()
-                if "open" in lower or "short" in lower:group="Calibration structures"
+                if kind == "RF test block":group="RF test blocks"
+                elif "open" in lower or "short" in lower:group="Calibration structures"
                 elif kind == "Segmented electrode":group="CPW transmission lines"
                 elif "electrode" in lower or "mzi" in lower:group="Electrodes & modulators"
                 elif "taper" in lower:group="RF tapers"
@@ -193,7 +233,7 @@ class NativeLayoutWindow(QMainWindow):
                 categories["Alignment / labels"].append(kind)
             elif kind == "E-beam multipass":
                 categories["E-beam"].append(kind)
-            elif kind == "Chip outline":
+            elif kind in {"Chip outline", "4-inch wafer outline"}:
                 categories["Chip / utility"].append(kind)
             else:
                 lower=kind.lower()
@@ -214,25 +254,8 @@ class NativeLayoutWindow(QMainWindow):
             photonic_parent=QTreeWidgetItem(["Photonic"]);photonic_parent.setFlags(photonic_parent.flags()&~Qt.ItemFlag.ItemIsSelectable);self.library_tree.addTopLevelItem(photonic_parent)
             for group,names in populated_photonic.items():
                 group_item=QTreeWidgetItem([group]);group_item.setFlags(group_item.flags()&~Qt.ItemFlag.ItemIsSelectable);photonic_parent.addChild(group_item)
-                if group=="Photonic test blocks":
-                    test_groups={"Grating":[],"MMI":[],"MZI":[],"Resonator":[],"Other":[]}
-                    for name in names:
-                        lower=name.lower()
-                        if "grating" in lower:target="Grating"
-                        elif "mzi" in lower:target="MZI"
-                        elif "mmi" in lower:target="MMI"
-                        elif "ring" in lower or "resonator" in lower or "racetrack" in lower:target="Resonator"
-                        else:target="Other"
-                        test_groups[target].append(name)
-                    for test_group,test_names in test_groups.items():
-                        if not test_names:continue
-                        test_parent=QTreeWidgetItem([test_group]);test_parent.setFlags(test_parent.flags()&~Qt.ItemFlag.ItemIsSelectable);group_item.addChild(test_parent)
-                        for name in sorted(test_names):
-                            child=QTreeWidgetItem([component_display_name(name)]);child.setData(0,Qt.ItemDataRole.UserRole,("component",name));test_parent.addChild(child)
-                        test_parent.setExpanded(bool(filter_text))
-                else:
-                    for name in sorted(names):
-                        child=QTreeWidgetItem([component_display_name(name)]);child.setData(0,Qt.ItemDataRole.UserRole,("component",name));group_item.addChild(child)
+                for name in sorted(names):
+                    child=QTreeWidgetItem([component_display_name(name)]);child.setData(0,Qt.ItemDataRole.UserRole,("component",name));group_item.addChild(child)
                 group_item.setExpanded(bool(filter_text))
             photonic_parent.setExpanded(True)
         populated_rf={name:values for name,values in rf_groups.items() if values}
@@ -251,7 +274,7 @@ class NativeLayoutWindow(QMainWindow):
             parent.setFlags(parent.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             self.library_tree.addTopLevelItem(parent)
             for name in sorted(names):
-                child = QTreeWidgetItem([name])
+                child = QTreeWidgetItem([name if category == "User modules" else component_display_name(name)])
                 child.setData(0, Qt.ItemDataRole.UserRole, ("module" if category == "User modules" else "component", name))
                 parent.addChild(child)
             parent.setExpanded(True)
@@ -604,6 +627,8 @@ class NativeLayoutWindow(QMainWindow):
         layout_toolbar.addSeparator()
         layout_menu.addSeparator()
         action("layout_zero", "All GDS lower-left → (0, 0)", self.move_entire_layout_to_origin, "Ctrl+Shift+0", layout_toolbar, layout_menu, status_tip="Move every component together so the complete GDS bounding-box lower-left corner is exactly (0, 0).")
+        action("layout_center", "All GDS center → (0, 0)", self.center_entire_layout_at_origin, None, layout_toolbar, layout_menu, status_tip="Move every component together so the complete GDS bounding-box center is exactly (0, 0).")
+        action("push_within_chip", "Push within chip/wafer boundary", self.remove_outside_chip_outline, None, layout_toolbar, layout_menu, status_tip=f"Delete every component whose geometry reaches outside the Chip outline or 4-inch wafer outline, keeping a {CHIP_BOUNDARY_MARGIN_UM:g} µm margin from the edge.")
         action("rotate_all", "Rotate Entire GDS…", self.rotate_entire_layout_dialog, "Ctrl+Shift+R", layout_toolbar, layout_menu, status_tip="Rotate every component around the complete-layout center; no selection required.")
         action("rotate_all_90", "Rotate Entire GDS +90°", lambda: self.rotate_entire_layout(90), None, None, layout_menu)
         action("rotate_all_minus90", "Rotate Entire GDS −90°", lambda: self.rotate_entire_layout(-90), None, None, layout_menu)
@@ -911,6 +936,231 @@ class NativeLayoutWindow(QMainWindow):
         for key,box in integers.items():p[key]=box.value()
         return True
 
+    def test_block_scan_dialog(self, family: str, title: str, base: dict[str, Any], keys: list[str], selected: list[str], saved_ranges: dict[str, Any], edge_spacing: float, explicit_defaults: dict[str, str] | None = None):
+        """Scan ranges plus fixed defaults for one test block.
+
+        Shared by the final step of both wizards and by the right-click editor.  Returns
+        ``(sweep_ranges, base_with_defaults_applied, edge_spacing)``, or None when the dialog is
+        cancelled or the entries do not validate.
+        """
+        fixed_keys=[key for key in keys if key not in set(selected)]
+        ranges_dialog=QDialog(self);ranges_dialog.setWindowTitle(title);ranges_dialog.resize(1420,min(940,max(500,290+60*(len(selected)+min(len(fixed_keys),8)))));ranges_dialog.setMinimumWidth(1180);ranges_layout=QVBoxLayout(ranges_dialog)
+        values_hint=QLabel("Scanned parameters are listed first — enter explicit comma-separated values (for example: 500, 1000, 2000), or leave that field blank to use Start / Stop / Step. Every remaining parameter follows, where the last column sets the fixed default used by all devices in the block.");values_hint.setWordWrap(True);ranges_layout.addWidget(values_hint)
+        table=QTableWidget(len(selected)+len(fixed_keys),5);table.setHorizontalHeaderLabels(["Parameter","Start","Stop","Step","Explicit values / default"]);header=table.horizontalHeader();header.setSectionResizeMode(0,QHeaderView.ResizeMode.ResizeToContents)
+        for column in (1,2,3):header.setSectionResizeMode(column,QHeaderView.ResizeMode.Fixed);table.setColumnWidth(column,205)
+        header.setSectionResizeMode(4,QHeaderView.ResizeMode.Stretch);table.setColumnWidth(4,320);table.verticalHeader().setDefaultSectionSize(54);editors={};fixed_editors={}
+        for offset,key in enumerate(fixed_keys):fixed_editors[key]=add_fixed_default_row(table,len(selected)+offset,key,base[key])
+        for row,key in enumerate(selected):
+            table.setItem(row,0,QTableWidgetItem(f"● {key.replace('_',' ')}"));value=base[key];saved=saved_ranges.get(key) or {}
+            if key in CHOICE_PARAMETERS or isinstance(value,(str,bool)):
+                values=list(saved["values"]) if saved.get("values") else CHOICE_PARAMETERS.get(key,[False,True] if isinstance(value,bool) else [value]);entry=QLineEdit(", ".join(str(v).lower() if isinstance(v,bool) else str(v) for v in values));entry.setMinimumSize(290,42)
+                for column in (1,2,3):table.setItem(row,column,QTableWidgetItem("—"))
+                table.setCellWidget(row,4,entry);editors[key]=("values",entry)
+            else:
+                nominal=float(value);span=max(abs(nominal)*0.2,1.0);start=max(0.0,nominal-span);stop=nominal+span;step=max((stop-start)/4.0,1.0 if isinstance(value,int) else 0.001);widgets=[]
+                if "start" in saved:start,stop,step=float(saved.get("start",start)),float(saved.get("stop",stop)),float(saved.get("step",step))
+                for column,initial in zip((1,2,3),(start,stop,step)):
+                    box=QDoubleSpinBox();box.setRange(-1e9,1e9);box.setDecimals(0 if isinstance(value,int) else 6);box.setValue(initial);box.setMinimumSize(185,42);table.setCellWidget(row,column,box);widgets.append(box)
+                explicit=QLineEdit();explicit.setPlaceholderText("e.g. 500, 1000, 2000");explicit.setMinimumSize(290,42)
+                if saved.get("values"):explicit.setText(", ".join(f"{float(v):g}" for v in saved["values"]))
+                elif not saved and key in (explicit_defaults or {}):explicit.setText((explicit_defaults or {})[key])
+                table.setCellWidget(row,4,explicit);editors[key]=("numeric",widgets,isinstance(value,int),explicit)
+        ranges_layout.addWidget(table)
+        packing_hint=QLabel("The length-like scan parameter forms columns. Every combination of gap, width, and other selected values forms rows. True device and label bounds determine the compact row and column spacing.");packing_hint.setWordWrap(True);ranges_layout.addWidget(packing_hint)
+        options=QFormLayout();edge_box=QDoubleSpinBox();edge_box.setRange(0,1e7);edge_box.setDecimals(3);edge_box.setValue(float(edge_spacing));edge_box.setMinimumSize(230,40);options.addRow("Minimum edge-to-edge spacing (µm)",edge_box);ranges_layout.addLayout(options)
+        range_buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);range_buttons.accepted.connect(ranges_dialog.accept);range_buttons.rejected.connect(ranges_dialog.reject);ranges_layout.addWidget(range_buttons)
+        if ranges_dialog.exec()!=QDialog.DialogCode.Accepted:return None
+        sweep_ranges={};combination_count=1;updated=safe_json_copy(base)
+        try:
+            for key,editor in editors.items():
+                if editor[0]=="values":
+                    values=[token.strip() for token in editor[1].text().split(",") if token.strip()];allowed=CHOICE_PARAMETERS.get(key)
+                    if isinstance(base[key],bool):values=[value.lower() in {"1","true","yes","on"} for value in values]
+                    elif allowed:
+                        invalid=[value for value in values if value not in allowed]
+                        if invalid:raise ValueError(f"Invalid {key} value(s): {', '.join(invalid)}")
+                    if not values:raise ValueError(f"Enter at least one value for {key}.")
+                    sweep_ranges[key]={"values":values};combination_count*=len(values)
+                else:
+                    boxes,is_integer,explicit=editor[1],editor[2],editor[3];custom=explicit.text().strip()
+                    if custom:
+                        values=numeric_list(custom)
+                        if is_integer:
+                            if any(abs(value-round(value))>1e-9 for value in values):raise ValueError(f"{key} requires whole-number values.")
+                            values=[int(round(value)) for value in values]
+                        sweep_ranges[key]={"values":values}
+                    else:
+                        start,stop,step=(box.value() for box in boxes);values=inclusive_sweep(start,stop,step);sweep_ranges[key]={"start":start,"stop":stop,"step":step}
+                    combination_count*=len(values)
+            if combination_count>500:raise ValueError(f"This scan creates {combination_count} devices. Reduce it to 500 or fewer.")
+            for key,spec in fixed_editors.items():updated[key]=read_fixed_default(spec)
+        except Exception as exc:
+            QMessageBox.critical(self,f"Invalid {family} scan",str(exc));return None
+        return sweep_ranges,updated,float(edge_box.value())
+
+    def edit_test_block_scan(self, component: dict[str, Any]) -> None:
+        """Right-click entry point: re-open the ranges-and-defaults table for an existing block."""
+        is_rf=component.get("kind")=="RF test block";family="RF" if is_rf else "photonic"
+        params=component["params"];base_key="rf_base_params" if is_rf else "photonic_base_params"
+        source_kind=str(params.get("rf_component_kind" if is_rf else "photonic_component_kind") or ("CPW" if is_rf else "Straight"))
+        if source_kind not in DEFAULT_COMPONENT_VALUES:
+            QMessageBox.critical(self,"Edit scan",f"Unknown component kind '{source_kind}'.");return
+        base=safe_json_copy(DEFAULT_COMPONENT_VALUES[source_kind])
+        base.update({key:safe_json_copy(value) for key,value in (params.get(base_key) or {}).items() if key in base})
+        excluded={"layer","datatype","points","oxide_layer","oxide_datatype"} if is_rf else {"layer","datatype","gc_layer","gc_datatype","waveguide_layer","waveguide_datatype","resonator_layer","resonator_datatype","hole_layer","hole_datatype","points","taper_points"}
+        keys=[key for key in base if key not in excluded and (is_rf or ("tolerance" not in key and not key.endswith("_points")))]
+        selected=[str(key) for key in (params.get("sweep_parameters") or []) if str(key) in keys]
+        if not selected:
+            QMessageBox.warning(self,"Edit scan","This block has no scan parameters recorded. Re-create it to choose which parameters to scan.");return
+        result=self.test_block_scan_dialog(family,f"{component.get('kind')} — ranges, defaults and spacing ({component_display_name(source_kind)})",base,keys,selected,params.get("sweep_ranges") or {},float(params.get("edge_spacing",300.0)))
+        if result is None:return
+        sweep_ranges,updated_base,edge_spacing=result
+        snapshot=self.snapshot()
+        params[base_key]=updated_base;params["sweep_ranges"]=sweep_ranges;params["edge_spacing"]=edge_spacing
+        self.commit_interaction_snapshot(snapshot);self.rebuild_scene();self.show_component_properties(component);self.statusBar().showMessage(f"Updated {component.get('kind')} scan ranges and defaults.",8000)
+
+    def configure_rf_test_block(self, component: dict[str, Any]) -> bool:
+        """Three-step RF component, parameter, and range selection wizard."""
+        source_kinds = sorted(RF_COMPONENT_KINDS - {"RF test block"})
+        choose = QDialog(self);choose.setWindowTitle("RF test block — 1 of 3: component and label");choose.resize(650,520);form=QFormLayout(choose)
+        component_box=QComboBox()
+        for kind in source_kinds:component_box.addItem(component_display_name(kind),kind)
+        saved_kind=str(component["params"].get("rf_component_kind","") or "")
+        if saved_kind in source_kinds:component_box.setCurrentIndex(source_kinds.index(saved_kind))
+        form.addRow("RF component to scan",component_box)
+        label_box=QLineEdit(str(component["params"].get("device_label_prefix") or component_box.currentData()));label_box.setMinimumWidth(320);label_box.setToolTip("Prefix added to every generated device label, for example CP.");form.addRow("Device label prefix",label_box)
+        component_box.currentIndexChanged.connect(lambda *_:label_box.setText(str(component_box.currentData())))
+        label_height_box=QDoubleSpinBox();label_height_box.setRange(0.1,10000.0);label_height_box.setDecimals(3);label_height_box.setValue(float(component["params"].get("label_height",20.0)));label_height_box.setMinimumSize(220,38);form.addRow("Label text height (µm)",label_height_box)
+        label_x_box=QDoubleSpinBox();label_x_box.setRange(-1e7,1e7);label_x_box.setDecimals(3);label_x_box.setValue(float(component["params"].get("label_offset_x",0.0)));label_x_box.setMinimumSize(220,38);form.addRow("Label X offset from top-left (µm)",label_x_box)
+        label_y_box=QDoubleSpinBox();label_y_box.setRange(-1e7,1e7);label_y_box.setDecimals(3);label_y_box.setValue(float(component["params"].get("label_offset_y",10.0)));label_y_box.setMinimumSize(220,38);form.addRow("Label Y offset from top-left (µm)",label_y_box)
+        taper_center_box=QComboBox();taper_center_box.addItems(["CPW","T electrode"]);taper_center_box.setCurrentText(str(component["params"].get("taper_test_center","CPW")));form.addRow("Taper test center section",taper_center_box)
+        probe_cpw_box=QDoubleSpinBox();probe_cpw_box.setRange(0.0,1e7);probe_cpw_box.setDecimals(3);probe_cpw_box.setValue(float(component["params"].get("probe_cpw_length",100.0)));probe_cpw_box.setMinimumSize(220,38);form.addRow("Probe CPW length, each end (µm)",probe_cpw_box)
+        input_transition_box=QDoubleSpinBox();input_transition_box.setRange(0.0,1e7);input_transition_box.setDecimals(3);input_transition_box.setValue(float(component["params"].get("input_transition_length",0.0)));input_transition_box.setMinimumSize(220,38);form.addRow("Input transition before taper (µm)",input_transition_box)
+        output_transition_box=QDoubleSpinBox();output_transition_box.setRange(0.0,1e7);output_transition_box.setDecimals(3);output_transition_box.setValue(float(component["params"].get("output_transition_length",0.0)));output_transition_box.setMinimumSize(220,38);form.addRow("Output transition after taper (µm)",output_transition_box)
+        t_transition_box=QDoubleSpinBox();t_transition_box.setRange(0.0,1e7);t_transition_box.setDecimals(3);t_transition_box.setValue(float(component["params"].get("t_electrode_transition_length",0.0)));t_transition_box.setMinimumSize(220,38);form.addRow("T-electrode transition, each side (µm)",t_transition_box)
+        taper_widgets=(taper_center_box,probe_cpw_box,input_transition_box,output_transition_box,t_transition_box)
+        def update_taper_test_fields(*_):
+            is_taper=str(component_box.currentData()) in {"Tapered CPW","Symmetric CPW taper"}
+            for widget in taper_widgets:
+                widget.setVisible(is_taper);label=form.labelForField(widget)
+                if label is not None:label.setVisible(is_taper)
+            t_visible=is_taper and taper_center_box.currentText()=="T electrode";t_transition_box.setVisible(t_visible);t_label=form.labelForField(t_transition_box)
+            if t_label is not None:t_label.setVisible(t_visible)
+        component_box.currentIndexChanged.connect(update_taper_test_fields);taper_center_box.currentIndexChanged.connect(update_taper_test_fields);update_taper_test_fields()
+        hint=QLabel("Choose a component from the RF library. The next window selects its scan parameters.");hint.setWordWrap(True);form.addRow(hint)
+        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Next");buttons.accepted.connect(choose.accept);buttons.rejected.connect(choose.reject);form.addRow(buttons)
+        if choose.exec()!=QDialog.DialogCode.Accepted:return False
+        source_kind=str(component_box.currentData());base=safe_json_copy(DEFAULT_COMPONENT_VALUES[source_kind])
+        if source_kind==saved_kind:base.update({key:safe_json_copy(value) for key,value in (component["params"].get("rf_base_params") or {}).items() if key in base})
+        excluded={"layer","datatype","points","oxide_layer","oxide_datatype"}
+        keys=[key for key in base if key not in excluded]
+        common={
+            "CPW":["signal_width","ground_width","length","gap"],
+            "CPW open":["signal_width","ground_width","length","gap","signal_recess"],
+            "CPW short":["signal_width","ground_width","length","gap","bridge_length"],
+            "Tapered CPW":["length","final_gap","initial_gap","signal_width","ground_width","profile","exponential_factor","target_s11_db"],
+            "Symmetric CPW taper":["taper_length","middle_gap","initial_gap","signal_width","ground_width","end_straight_length","middle_straight_length","profile","exponential_factor","target_s11_db"],
+            "CPW bend":["R_eff","bend_angle_deg","signal_width","ground_width","gap"],
+            "Segmented electrode":["signal_width","ground_width","segment_count","gap","end_gap","transition_length","t_top_width","t_top_length","t_neck_width","t_neck_length","segment_spacing"],
+        }.get(source_kind,keys[:6])
+        default_selected={
+            "CPW":{"signal_width","length"},
+            "Tapered CPW":{"length","final_gap","profile"},
+            "Symmetric CPW taper":{"taper_length","middle_gap","profile"},
+            "Segmented electrode":{"signal_width","ground_width","segment_count"},
+        }.get(source_kind,set(common[:3]))
+        saved_selected=[str(key) for key in (component["params"].get("sweep_parameters") or [])] if source_kind==saved_kind else []
+        default_selected=set(key for key in saved_selected if key in keys) or default_selected
+        select=QDialog(self);select.setWindowTitle("RF test block — 2 of 3: parameters");select.resize(560,560);layout=QVBoxLayout(select)
+        title=QLabel(f"Select parameters to scan for <b>{component_display_name(source_kind)}</b>.");title.setWordWrap(True);layout.addWidget(title)
+        show_all=QCheckBox("Show full physical parameter list");layout.addWidget(show_all)
+        scroll=QScrollArea();scroll.setWidgetResizable(True);holder=QWidget();holder_layout=QVBoxLayout(holder);checks={}
+        for key in keys:
+            check=QCheckBox(key.replace("_"," "));check.setChecked(key in default_selected);check.setVisible(key in common or key in default_selected);holder_layout.addWidget(check);checks[key]=check
+        holder_layout.addStretch(1);scroll.setWidget(holder);layout.addWidget(scroll,1)
+        show_all.toggled.connect(lambda enabled:[check.setVisible(enabled or key in common or key in default_selected) for key,check in checks.items()])
+        select_buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);select_buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Next");select_buttons.accepted.connect(select.accept);select_buttons.rejected.connect(select.reject);layout.addWidget(select_buttons)
+        if select.exec()!=QDialog.DialogCode.Accepted:return False
+        selected=[key for key,check in checks.items() if check.isChecked()]
+        if not selected:QMessageBox.warning(self,"RF test block","Select at least one parameter to scan.");return False
+
+        rf_explicit_defaults={
+            "CPW":{"signal_width":"10, 11, 12, 13, 14, 15","length":"500, 1000, 2000"},
+            "Tapered CPW":{"length":"500, 1000, 2000"},
+            "Symmetric CPW taper":{"taper_length":"500, 1000, 2000"},
+        }
+        result=self.test_block_scan_dialog("RF","RF test block — 3 of 3: ranges, defaults and spacing",base,keys,selected,(component["params"].get("sweep_ranges") or {}) if source_kind==saved_kind else {},float(component["params"].get("edge_spacing",300.0)),rf_explicit_defaults.get(source_kind,{}))
+        if result is None:return False
+        sweep_ranges,base,edge_spacing=result
+        component["params"].pop("columns",None);component["params"].update({"rf_component_kind":source_kind,"rf_base_params":base,"device_label_prefix":label_box.text().strip() or source_kind,"label_height":label_height_box.value(),"label_offset_x":label_x_box.value(),"label_offset_y":label_y_box.value(),"taper_test_structure":source_kind in {"Tapered CPW","Symmetric CPW taper"},"taper_test_center":taper_center_box.currentText(),"probe_cpw_length":probe_cpw_box.value(),"input_transition_length":input_transition_box.value(),"output_transition_length":output_transition_box.value(),"t_electrode_transition_length":t_transition_box.value(),"sweep_parameters":selected,"sweep_ranges":sweep_ranges,"edge_spacing":edge_spacing})
+        return True
+
+    def configure_photonic_test_block(self, component: dict[str, Any]) -> bool:
+        """Choose a photonic component, its scan parameters, and scan ranges."""
+        source_kinds=sorted(PHOTONIC_COMPONENT_KINDS)
+        choose=QDialog(self);choose.setWindowTitle("Photonic test block — 1 of 3: component and label");choose.resize(650,320);form=QFormLayout(choose)
+        component_box=QComboBox()
+        for kind in source_kinds:component_box.addItem(component_display_name(kind),kind)
+        saved_kind=str(component["params"].get("photonic_component_kind","") or "")
+        if saved_kind in source_kinds:component_box.setCurrentIndex(source_kinds.index(saved_kind))
+        form.addRow("Photonic component to scan",component_box)
+        label_box=QLineEdit(str(component["params"].get("device_label_prefix") or component_box.currentData()));label_box.setMinimumWidth(320);label_box.setToolTip("Prefix added to every generated device label, for example MZI.");form.addRow("Device label prefix",label_box)
+        component_box.currentIndexChanged.connect(lambda *_:label_box.setText(str(component_box.currentData())))
+        label_height_box=QDoubleSpinBox();label_height_box.setRange(0.1,10000.0);label_height_box.setDecimals(3);label_height_box.setValue(float(component["params"].get("label_height",20.0)));label_height_box.setMinimumSize(220,38);form.addRow("Label text height (µm)",label_height_box)
+        label_x_box=QDoubleSpinBox();label_x_box.setRange(-1e7,1e7);label_x_box.setDecimals(3);label_x_box.setValue(float(component["params"].get("label_offset_x",0.0)));label_x_box.setMinimumSize(220,38);form.addRow("Label X offset from top-left (µm)",label_x_box)
+        label_y_box=QDoubleSpinBox();label_y_box.setRange(-1e7,1e7);label_y_box.setDecimals(3);label_y_box.setValue(float(component["params"].get("label_offset_y",10.0)));label_y_box.setMinimumSize(220,38);form.addRow("Label Y offset from top-left (µm)",label_y_box)
+        hint=QLabel("Choose a component from the photonic library. The next window selects its scan parameters.");hint.setWordWrap(True);form.addRow(hint)
+        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Next");buttons.accepted.connect(choose.accept);buttons.rejected.connect(choose.reject);form.addRow(buttons)
+        if choose.exec()!=QDialog.DialogCode.Accepted:return False
+        source_kind=str(component_box.currentData());base=safe_json_copy(DEFAULT_COMPONENT_VALUES[source_kind])
+        if source_kind==saved_kind:base.update({key:safe_json_copy(value) for key,value in (component["params"].get("photonic_base_params") or {}).items() if key in base})
+        excluded={"layer","datatype","gc_layer","gc_datatype","waveguide_layer","waveguide_datatype","resonator_layer","resonator_datatype","hole_layer","hole_datatype","points","taper_points"}
+        keys=[key for key in base if key not in excluded and "tolerance" not in key and not key.endswith("_points")]
+        common={
+            "Straight":["length","width"],
+            "Taper":["length","width_start","width_end"],
+            "S-bend":["length","offset","width"],
+            "Euler bend":["radius","bend_angle_deg","width","euler_fraction"],
+            "Grating coupler":["pitch","fill_factor","N","alpha_t","taper_L","wg_width","wg_length"],
+            "1x2 MMI":["mmi_length","mmi_width","taper_width","wg_width","port_sep","input_taper_length","output_taper_length"],
+            "Cascaded MMI":["N_levels","mmi_length","mmi_width","taper_width","wg_width","s_bend_length","output_gc_spacing"],
+            "MMI + Reference":["mmi_length","mmi_width","taper_width","wg_width","reference_dy","reference_branch"],
+            "MMI split-combine cascade":["cascade_count","mmi_length","mmi_width","taper_width","wg_width","interconnect_length"],
+            "MZI":["mmi_length","mmi_width","taper_width","wg_width","arm_separation","s_bend_length","arm_length"],
+            "MZI vertical GC":["mmi_length","mmi_width","taper_width","wg_width","arm_separation","arm_length","gc_vertical_run"],
+            "Ring":["radius","width"],
+            "Elliptical ring":["radius_x","radius_y","width"],
+            "Racetrack":["radius","coupling_length","width"],
+            "Ring + two feedlines":["ring_radius","ring_width","coupling_gap","feedline_width","feedline_length","grating_coupler_separation"],
+            "Edge coupler":["tip_width","wg_width","taper_length","wg_straight_length"],
+            "Loopback mirror":["Lc","gap","s_bend_length","arc_radius","width"],
+            "Feedline":["wg_width","Lc","offset","s_bend_length","pitch","fill_factor"],
+            "Ring + feedline":["ring_radius","ring_width","coupling_gap","resonator_count","resonator_spacing","wg_width","Lc"],
+            "Racetrack + feedline":["racetrack_radius","racetrack_coupling_length","racetrack_width","coupling_gap","resonator_count","resonator_spacing","wg_width"],
+            "Photonic crystal":["pitch_x","pitch_y","hole_radius_x","hole_radius_y","columns","rows","defect_rows","lattice","hole_shape"],
+        }.get(source_kind,keys[:6])
+        common=[key for key in common if key in keys]
+        saved_selected=[str(key) for key in (component["params"].get("sweep_parameters") or [])] if source_kind==saved_kind else []
+        default_selected=set(key for key in saved_selected if key in keys) or set(common[:3])
+        select=QDialog(self);select.setWindowTitle("Photonic test block — 2 of 3: parameters");select.resize(560,560);layout=QVBoxLayout(select)
+        title=QLabel(f"Select parameters to scan for <b>{component_display_name(source_kind)}</b>.");title.setWordWrap(True);layout.addWidget(title)
+        show_all=QCheckBox("Show full physical parameter list");layout.addWidget(show_all)
+        scroll=QScrollArea();scroll.setWidgetResizable(True);holder=QWidget();holder_layout=QVBoxLayout(holder);checks={}
+        for key in keys:
+            check=QCheckBox(key.replace("_"," "));check.setChecked(key in default_selected);check.setVisible(key in common or key in default_selected);holder_layout.addWidget(check);checks[key]=check
+        holder_layout.addStretch(1);scroll.setWidget(holder);layout.addWidget(scroll,1)
+        show_all.toggled.connect(lambda enabled:[check.setVisible(enabled or key in common or key in default_selected) for key,check in checks.items()])
+        select_buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);select_buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Next");select_buttons.accepted.connect(select.accept);select_buttons.rejected.connect(select.reject);layout.addWidget(select_buttons)
+        if select.exec()!=QDialog.DialogCode.Accepted:return False
+        selected=[key for key,check in checks.items() if check.isChecked()]
+        if not selected:QMessageBox.warning(self,"Photonic test block","Select at least one parameter to scan.");return False
+
+        result=self.test_block_scan_dialog("photonic","Photonic test block — 3 of 3: ranges, defaults and spacing",base,keys,selected,(component["params"].get("sweep_ranges") or {}) if source_kind==saved_kind else {},float(component["params"].get("edge_spacing",300.0)))
+        if result is None:return False
+        sweep_ranges,base,edge_spacing=result
+        component["params"].pop("columns",None);component["params"].update({"photonic_component_kind":source_kind,"photonic_base_params":base,"device_label_prefix":label_box.text().strip() or source_kind,"label_height":label_height_box.value(),"label_offset_x":label_x_box.value(),"label_offset_y":label_y_box.value(),"sweep_parameters":selected,"sweep_ranges":sweep_ranges,"edge_spacing":edge_spacing})
+        return True
+
     def add_selected_library_component(self) -> None:
         item = self.library_tree.currentItem()
         if item is None:
@@ -925,9 +1175,13 @@ class NativeLayoutWindow(QMainWindow):
         center = scene_to_world_point(self.view.mapToScene(self.view.viewport().rect().center()))
         snapshot = self.snapshot()
         component = self.make_component(name, *center)
+        if name=="RF test block" and not self.configure_rf_test_block(component):
+            self.next_uid=max(1,self.next_uid-1);return
+        if name=="Photonic test block" and not self.configure_photonic_test_block(component):
+            self.next_uid=max(1,self.next_uid-1);return
         if name=="Photonic crystal" and not self.configure_photonic_crystal(component):
             self.next_uid=max(1,self.next_uid-1);return
-        if name.endswith("test block") and not self.configure_test_block_sweeps(component):
+        if name in LEGACY_PHOTONIC_TEST_BLOCK_KINDS and not self.configure_test_block_sweeps(component):
             self.next_uid=max(1,self.next_uid-1);return
         self.components.append(component)
         self.commit_interaction_snapshot(snapshot)
@@ -1176,6 +1430,8 @@ class NativeLayoutWindow(QMainWindow):
 
         specs = COMPONENT_SPECS.get(component.get("kind"), {})
         for key, value in component.get("params", {}).items():
+            if component.get("kind") in {"RF test block","Photonic test block"} and key=="columns":
+                continue
             if key in {
                 "manual_field_offsets",
                 "manual_field_order",
@@ -1183,6 +1439,9 @@ class NativeLayoutWindow(QMainWindow):
                 "auto_pruned_field_keys",
                 "explicit_fields",
                 "sweep_parameters",
+                "sweep_ranges",
+                "rf_base_params",
+                "photonic_base_params",
                 "polygons",
             }:
                 continue
@@ -1309,6 +1568,8 @@ class NativeLayoutWindow(QMainWindow):
             return MARKER_LAYER
         if kind == "Grating coupler":
             return GC_LAYER
+        if kind in {"Chip outline", "4-inch wafer outline"}:
+            return int(component.get("params", {}).get("layer", 100))
         return PHOTONIC_LAYER
 
     def refresh_project_tree_selection(self) -> None:
@@ -1571,6 +1832,74 @@ class NativeLayoutWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self,'Could not zero complete GDS',str(exc))
 
+    def component_world_bbox(self, component: dict[str, Any]) -> tuple[tuple[float, float], tuple[float, float]] | None:
+        """World-space bounding box of one component, or None when it draws nothing."""
+        library=gdstk.Library(unit=1e-6,precision=1e-9);cell=library.new_cell(f"BOUNDS_{int(component.get('uid',0))}")
+        _add_component_geometry_to_cell(safe_json_copy(component),cell);box=cell.bounding_box()
+        return None if box is None else ((float(box[0][0]),float(box[0][1])),(float(box[1][0]),float(box[1][1])))
+
+    def boundary_containment_test(self):
+        """Return (contains(x, y), description) for the layout's Chip outline or wafer outline,
+        inset by the edge margin. Dimensions come from the params rather than the drawn bounds,
+        because these outlines also render dimension text well outside the boundary itself.
+        Both shapes are convex, so a bounding box fits exactly when its four corners do."""
+        boundaries=[component for component in self.components if component.get("kind") in BOUNDARY_COMPONENT_KINDS]
+        if not boundaries:raise ValueError("This layout has no Chip outline or 4-inch wafer outline component; add one to define the boundary.")
+        if len(boundaries)>1:raise ValueError("This layout has "+str(len(boundaries))+" boundary components ("+", ".join(sorted({str(component.get("kind")) for component in boundaries}))+"); keep exactly one.")
+        boundary=boundaries[0];p=boundary.get("params",{});kind=str(boundary.get("kind"))
+        cx,cy=float(boundary["x"]),float(boundary["y"]);margin=CHIP_BOUNDARY_MARGIN_UM
+        orientation=float(boundary.get("orientation_deg",0.0))
+        if kind=="Chip outline":
+            squared=orientation%180.0
+            if min(squared,abs(squared-90.0))>1e-9:raise ValueError(f"The chip outline is rotated {orientation:g}°; only multiples of 90° are supported.")
+            width=float(p["width"]);height=float(p["height"])
+            if abs(squared-90.0)<=1e-9:width,height=height,width
+            x0,y0,x1,y1=cx-width/2.0+margin,cy-height/2.0+margin,cx+width/2.0-margin,cy+height/2.0-margin
+            if x1<=x0 or y1<=y0:raise ValueError(f"A {margin:g} µm margin leaves no usable area inside a {width:g} × {height:g} µm chip outline.")
+            return (lambda px,py:x0-1e-9<=px<=x1+1e-9 and y0-1e-9<=py<=y1+1e-9),f"{width:g} × {height:g} µm chip outline"
+        radius=float(p.get("diameter",100000.0))/2.0;flat_length=float(p.get("primary_flat_length",32500.0))
+        half_flat=flat_length/2.0
+        if radius<=0 or half_flat<=0 or half_flat>=radius:raise ValueError("The wafer outline needs 0 < primary flat length < diameter.")
+        keep_radius=radius-margin;flat_y=-math.sqrt(max(0.0,radius*radius-half_flat*half_flat))+margin
+        if keep_radius<=0 or flat_y>=keep_radius:raise ValueError(f"A {margin:g} µm margin leaves no usable area inside a {radius*2.0:g} µm wafer outline.")
+        angle=math.radians(-orientation);cos_a,sin_a=math.cos(angle),math.sin(angle)
+        def contains(px,py):
+            dx,dy=px-cx,py-cy;lx,ly=dx*cos_a-dy*sin_a,dx*sin_a+dy*cos_a
+            return lx*lx+ly*ly<=keep_radius*keep_radius+1e-6 and ly>=flat_y-1e-9
+        return contains,f"{radius*2.0/1000.0:g} mm wafer outline"
+
+    def remove_outside_chip_outline(self) -> None:
+        if not self.components:
+            return
+        try:
+            contains,description=self.boundary_containment_test()
+            dropped=set()
+            for component in self.components:
+                if component.get("kind") in BOUNDARY_COMPONENT_KINDS:continue
+                box=self.component_world_bbox(component)
+                if box is None:continue
+                if not all(contains(px,py) for px in (box[0][0],box[1][0]) for py in (box[0][1],box[1][1])):dropped.add(int(component["uid"]))
+            if not dropped:
+                self.statusBar().showMessage(f'Every component already fits inside the {description} with a {CHIP_BOUNDARY_MARGIN_UM:g} µm edge margin.',8000);return
+            snapshot=self.snapshot()
+            self.components=[component for component in self.components if int(component["uid"]) not in dropped]
+            for component in self.components:
+                if component.get("kind")=="E-beam multipass":
+                    component["coverage_source_uids"]=[int(uid) for uid in component.get("coverage_source_uids",[]) if int(uid) not in dropped]
+            self.commit_interaction_snapshot(snapshot);self.rebuild_scene();self.statusBar().showMessage(f'Removed {len(dropped)} component(s) reaching outside the {description} ({CHIP_BOUNDARY_MARGIN_UM:g} µm edge margin).',8000)
+        except Exception as exc:
+            QMessageBox.critical(self,'Could not push within boundary',str(exc))
+
+    def center_entire_layout_at_origin(self) -> None:
+        if not self.components:
+            return
+        try:
+            centered,initial_center,_=recenter_components_at_origin(self.components)
+            snapshot=self.snapshot();self.components=centered
+            self.commit_interaction_snapshot(snapshot);self.rebuild_scene();self.center_origin();self.statusBar().showMessage(f'Moved entire GDS by ({-initial_center[0]:.6g}, {-initial_center[1]:.6g}) µm; bounding-box center is now (0, 0).',8000)
+        except Exception as exc:
+            QMessageBox.critical(self,'Could not center complete GDS',str(exc))
+
     def rotate_entire_layout_dialog(self) -> None:
         angle,ok=QInputDialog.getDouble(self,'Rotate Entire GDS','Rotation angle (degrees, counter-clockwise):',90.0,-360000.0,360000.0,6)
         if ok:self.rotate_entire_layout(angle)
@@ -1631,7 +1960,7 @@ class NativeLayoutWindow(QMainWindow):
     def fit_design(self) -> None:
         bounds: QRectF | None = None
         for component in self.components:
-            if component.get("kind") == "Chip outline":
+            if component.get("kind") in {"Chip outline", "4-inch wafer outline"}:
                 continue
             item = self.items_by_uid.get(int(component["uid"]))
             if item is None or not item.isVisible():
@@ -3664,6 +3993,16 @@ ENDFLOW
         scene_position: QPointF,
     ) -> None:
         """Resolve the exact polygon under a normal click and show its local controls."""
+        component = self.component_by_uid(component_item.uid)
+        if component is None:
+            return
+        # A generated scan is one selectable parent containing many devices.
+        # Its normal selection panel already exposes the block-level controls;
+        # resolving a child polygon here is both ambiguous and unsafe while a
+        # very large QGraphicsPath has just handled the mouse release.
+        if component.get("kind") in {"RF test block", "Photonic test block"}:
+            self.show_component_properties(component)
+            return
         hit_item = self.scene.itemAt(scene_position, self.view.transform())
         clicked_layer = None
         current = hit_item
@@ -3675,9 +4014,6 @@ ENDFLOW
                 except (TypeError, ValueError):
                     pass
             current = current.parentItem()
-        component = self.component_by_uid(component_item.uid)
-        if component is None:
-            return
         local = component_item.mapFromScene(scene_position)
         sections = self.contextual_parameter_sections(component, local, clicked_layer)
         if sections:
@@ -3739,10 +4075,17 @@ ENDFLOW
         while component_item is not None and component_item.data(10) is None:
             component_item = component_item.parentItem()
         section_actions: dict[QAction, tuple[dict[str, Any], str, list[str]]] = {}
+        scan_action = None
+        scan_component = None
         if component_item is not None and component_item.data(10) is not None:
             component = self.component_by_uid(int(component_item.data(10)))
             if component is not None:
                 component_item.setSelected(True)
+                if component.get("kind") in {"RF test block", "Photonic test block"}:
+                    scan_component = component
+                    scan_action = menu.addAction("Edit scan ranges and defaults…")
+                    scan_font = scan_action.font();scan_font.setBold(True);scan_action.setFont(scan_font)
+                    menu.addSeparator()
                 local = component_item.mapFromScene(scene_position)
                 sections = self.contextual_parameter_sections(component, local, clicked_layer)
                 if sections:
@@ -3769,7 +4112,9 @@ ENDFLOW
         menu.addAction("Fit Drawn Region…", self.start_fit_drawn_region)
         menu.addAction("Fit Design", self.fit_design)
         chosen = menu.exec(self.view.viewport().mapToGlobal(viewport_position))
-        if chosen in section_actions:
+        if scan_action is not None and chosen is scan_action:
+            self.edit_test_block_scan(scan_component)
+        elif chosen in section_actions:
             self.edit_component_section(*section_actions[chosen])
         elif chosen is save_module_action:
             self.save_selection_as_module()

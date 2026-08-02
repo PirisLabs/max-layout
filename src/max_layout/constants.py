@@ -40,6 +40,23 @@ RF_COMPONENT_KINDS = {
     "Symmetric CPW taper",
     "CPW bend",
     "Segmented electrode",
+    "RF test block",
+}
+
+# These generators remain available so older JSON projects still load, but
+# they are hidden from the component library in favor of the generic wizard.
+LEGACY_PHOTONIC_TEST_BLOCK_KINDS = {
+    "Long MZI test block",
+    "Double-ring test block",
+    "Grating test block",
+    "Grating angle-taper test block",
+    "MMI + Reference test block",
+    "MMI split-combine test block",
+    "Vertical-GC MZI test block",
+    "Vertical-GC MZI + CPW test block",
+    "Vertical-GC MZI + segmented electrode test block",
+    "Straight-GC MZI + segmented RF bends test block",
+    "Straight-GC MZI + CPW RF bends test block",
 }
 
 MARKER_COMPONENT_KINDS = {
@@ -318,9 +335,9 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                          'gap': 3.0,
                          'end_gap': 3.0,
                          'ground_width': 130.0,
-                         'transition_length': 1.0,
-                         'end_flat_length': 50.0,
-                         'inner_flat_length': 50.0,
+                         'transition_length': 0.0,
+                         'end_flat_length': 100.0,
+                         'inner_flat_length': 0.0,
                          't_top_width': 2.0,
                          't_top_length': 45.0,
                          't_neck_width': 4.0,
@@ -333,6 +350,7 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                          'oxide_layer': 4,
                          'oxide_datatype': 0},
  'Chip outline': {'width': 14000.0, 'height': 12000.0, 'line_width': 10.0, 'show_dimensions': 1, 'dimension_offset': 150.0, 'dimension_text_scale': 1.0, 'layer': 100, 'datatype': 0, 'dimension_layer': 101},
+ '4-inch wafer outline': {'diameter': 100000.0, 'primary_flat_length': 32500.0, 'line_width': 100.0, 'points': 720, 'filled': 0, 'layer': 100, 'datatype': 0},
  'E-beam multipass': {'field_size': 520.0,
                        'overlap_x_enabled': False,
                        'overlap_y_enabled': False,
@@ -664,6 +682,31 @@ DEFAULT_COMPONENT_VALUES["Straight-GC MZI + CPW RF bends test block"] = dict(DEF
 
 DEFAULT_COMPONENT_VALUES["Straight-GC MZI + CPW RF bends test block"].update({"gc_three_euler_inward":False,"gc_input_route":"straight","gc_output_route":"straight","gc_wg_length":3000.0,"mzi_total_length":8000.0,"vertical_spacing":1000.0,"cpw_s_bend_clearance":0.0,"cpw_end_straight_length":0.0,"include_rf_edge_bends":True,"rf_edge_bend_radius":500.0,"rf_edge_bend_angle_deg":90.0,"rf_edge_bend_points":321})
 
+DEFAULT_COMPONENT_VALUES["RF test block"] = {
+    "rf_component_kind": "CPW",
+    "rf_base_params": dict(DEFAULT_COMPONENT_VALUES["CPW"]),
+    "device_label_prefix": "CPW",
+    "label_height": 20.0,
+    "label_offset_x": 0.0,
+    "label_offset_y": 10.0,
+    "label_layer": MARKER_LAYER,
+    "label_datatype": DEFAULT_DATATYPE,
+    "taper_test_structure": False,
+    "taper_test_center": "CPW",
+    "probe_cpw_length": 100.0,
+    "input_transition_length": 0.0,
+    "output_transition_length": 0.0,
+    "t_electrode_transition_length": 0.0,
+    "sweep_parameters": ["signal_width", "length"],
+    "sweep_ranges": {
+        "signal_width": {"values": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]},
+        "length": {"values": [500.0, 1000.0, 2000.0]},
+    },
+    "edge_spacing": 300.0,
+    "layer": RF_LAYER,
+    "datatype": DEFAULT_DATATYPE,
+}
+
 DEFAULT_COMPONENT_VALUES["MMI split-combine cascade"] = dict(DEFAULT_COMPONENT_VALUES["1x2 MMI"])
 
 DEFAULT_COMPONENT_VALUES["MMI split-combine cascade"].update({"cascade_count":3,"interconnect_length":5.0,"add_grating_couplers":False,"add_input_grating_coupler":True,"add_output_grating_coupler":True,"add_reference_waveguide":True,"reference_vertical_offset":150.0,"add_opposed_output_s_bends":True,"output_s_bend_length":200.0,"output_s_bend_offset":100.0,"gc_wg_length":50.0})
@@ -688,7 +731,42 @@ BOOL_PARAMETERS.update({"cpw_align_to_mzi_s_bends","include_segmented_electrode"
 
 BOOL_PARAMETERS.add("seg_auto_segment_count")
 
-CHOICE_PARAMETERS = {"reference_branch": ["upper", "lower"], "profile": ["linear", "exponential", "klopfenstein"], "input_profile": ["linear", "exponential", "klopfenstein"], "output_profile": ["linear", "exponential", "klopfenstein"], "rf_input_taper_profile": ["linear", "exponential", "klopfenstein"], "rf_output_taper_profile": ["linear", "exponential", "klopfenstein"], "resonator_side": ["upper", "lower"], "grating_route": ["straight", "up", "down"], "gc_input_route": ["straight", "up", "down"], "gc_output_route": ["straight", "up", "down"], "gc_upper_output_route": ["straight", "up", "down"], "gc_lower_output_route": ["straight", "up", "down"], "gc_vertical_side": ["up", "down"], "input_s_bend_direction": ["up", "down"], "output_s_bend_direction": ["up", "down"], "start_corner": ["top-left", "top-right", "bottom-left", "bottom-right"], "primary_axis": ["x", "y"]}
+BOOL_PARAMETERS.add("taper_test_structure")
+
+PHOTONIC_COMPONENT_KINDS = (
+    set(DEFAULT_COMPONENT_VALUES)
+    - RF_COMPONENT_KINDS
+    - MARKER_COMPONENT_KINDS
+    - LEGACY_PHOTONIC_TEST_BLOCK_KINDS
+    - {
+        "MZI + CPW module",
+        "Chip outline",
+        "4-inch wafer outline",
+        "E-beam multipass",
+        "Boolean geometry",
+    }
+)
+
+DEFAULT_COMPONENT_VALUES["Photonic test block"] = {
+    "photonic_component_kind": "Straight",
+    "photonic_base_params": dict(DEFAULT_COMPONENT_VALUES["Straight"]),
+    "device_label_prefix": "Straight",
+    "label_height": 20.0,
+    "label_offset_x": 0.0,
+    "label_offset_y": 10.0,
+    "label_layer": MARKER_LAYER,
+    "label_datatype": DEFAULT_DATATYPE,
+    "sweep_parameters": ["length", "width"],
+    "sweep_ranges": {
+        "length": {"start": 25.0, "stop": 100.0, "step": 25.0},
+        "width": {"start": 0.8, "stop": 1.6, "step": 0.2},
+    },
+    "edge_spacing": 300.0,
+    "layer": PHOTONIC_LAYER,
+    "datatype": DEFAULT_DATATYPE,
+}
+
+CHOICE_PARAMETERS = {"reference_branch": ["upper", "lower"], "profile": ["linear", "exponential", "klopfenstein"], "input_profile": ["linear", "exponential", "klopfenstein"], "output_profile": ["linear", "exponential", "klopfenstein"], "rf_input_taper_profile": ["linear", "exponential", "klopfenstein"], "rf_output_taper_profile": ["linear", "exponential", "klopfenstein"], "taper_test_center": ["CPW", "T electrode"], "resonator_side": ["upper", "lower"], "grating_route": ["straight", "up", "down"], "gc_input_route": ["straight", "up", "down"], "gc_output_route": ["straight", "up", "down"], "gc_upper_output_route": ["straight", "up", "down"], "gc_lower_output_route": ["straight", "up", "down"], "gc_vertical_side": ["up", "down"], "input_s_bend_direction": ["up", "down"], "output_s_bend_direction": ["up", "down"], "start_corner": ["top-left", "top-right", "bottom-left", "bottom-right"], "primary_axis": ["x", "y"]}
 
 CHOICE_PARAMETERS["cpw_profile"] = ["linear", "exponential", "klopfenstein"]
 
@@ -710,6 +788,9 @@ COMPONENT_DISPLAY_NAMES={
     "Double-ring test block":"Dual-ring resonator sweep block",
     "Grating test block":"Grating-coupler pitch/fill sweep block",
     "Grating angle-taper test block":"Grating-coupler angle/taper sweep block",
+    "Photonic test block":"Photonic component parameter-scan test block",
+    "RF test block":"RF component parameter-scan test block",
+    "4-inch wafer outline":"4-inch (100 mm) wafer outline with primary flat",
 }
 
 

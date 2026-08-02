@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import itertools
 import json
 import math
 
@@ -10,7 +11,7 @@ import gdstk
 import numpy as np
 
 from ..backend import backend
-from ..constants import DEFAULT_COMPONENT_VALUES, DEFAULT_DATATYPE, EBEAM_LAYER, GC_COMPOSITE_KINDS, GC_LAYER, MARKER_COMPONENT_KINDS, MARKER_LAYER, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER
+from ..constants import DEFAULT_COMPONENT_VALUES, DEFAULT_DATATYPE, EBEAM_LAYER, GC_COMPOSITE_KINDS, GC_LAYER, MARKER_COMPONENT_KINDS, MARKER_LAYER, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER
 from ..gds.couplers import add_parent_focusing_gc, add_routed_parent_gc, add_three_euler_inward_gc
 from ..gds.ebeam import add_ebeam_field_outline, add_ebeam_parameter_text, add_write_field_number, multipass_field_layout
 from ..gds.primitives import add_rect, copy_cell_polygons_to_top
@@ -35,6 +36,124 @@ def add_component_centered_in_field(top: gdstk.Cell, kind: str, params: dict[str
     for label in cell.labels:
         point=tuple(np.asarray(center)+rot(np.asarray(label.origin,float)-geometry_center,orientation));top.add(gdstk.Label(label.text,point,rotation=float(label.rotation or 0)+math.radians(orientation),layer=int(label.layer),texttype=int(label.texttype)))
     if draw_field:add_ebeam_field_outline(top,center,orientation,field_size)
+
+
+def scan_parameter_grid_layout(
+    bounds: list[tuple[np.ndarray, np.ndarray]],
+    edge_spacing: float,
+    columns: int,
+) -> tuple[list[np.ndarray], int, tuple[float, float]]:
+    """Align one scanned parameter by columns and all others by rows.
+
+    Each column uses only that column's largest true width and each row uses
+    only that row's largest true height.  This preserves horizontal and
+    vertical edge spacing while keeping a consistent parameter matrix.
+    """
+    if not bounds:
+        return [], 0, (0.0, 0.0)
+    spacing=float(edge_spacing)
+    if spacing < 0.0:
+        raise ValueError("Test block edge spacing cannot be negative.")
+    sizes=[np.asarray(high,float)-np.asarray(low,float) for low,high in bounds]
+    columns=max(1,min(int(columns),len(sizes)));row_count=int(math.ceil(len(sizes)/columns))
+    column_widths=[max(float(sizes[index][0]) for index in range(column,len(sizes),columns)) for column in range(columns)]
+    row_heights=[max(float(sizes[index][1]) for index in range(row*columns,min((row+1)*columns,len(sizes)))) for row in range(row_count)]
+    width=sum(column_widths)+spacing*max(0,columns-1);height=sum(row_heights)+spacing*max(0,row_count-1)
+    x_centers=[];x_left=-width/2.0
+    for column_width in column_widths:
+        x_centers.append(x_left+column_width/2.0);x_left+=column_width+spacing
+    y_centers=[];y_top=height/2.0
+    for row_height in row_heights:
+        y_centers.append(y_top-row_height/2.0);y_top-=row_height+spacing
+    centers=[np.zeros(2,float) for _ in sizes]
+    for index in range(len(sizes)):
+        row,column=divmod(index,columns);centers[index]=np.array([x_centers[column],y_centers[row]],float)
+    return centers,columns,(width,height)
+
+
+def _is_length_scan_parameter(key:str)->bool:
+    normalized=str(key).strip().lower()
+    return "length" in normalized or normalized in {"lc","taper_l"}
+
+
+def _scan_parameter_title(key:str)->str:
+    acronyms={"cpw":"CPW","rf":"RF","mmi":"MMI","mzi":"MZI","gc":"GC","s11":"S11","db":"dB","lc":"Lc"}
+    return "".join(acronyms.get(part.lower(),part.capitalize()) for part in str(key).split("_"))
+
+
+def _scan_value_text(value:Any)->str:
+    if isinstance(value,(bool,np.bool_)):
+        return "true" if bool(value) else "false"
+    if isinstance(value,(int,float,np.integer,np.floating)):
+        return f"{float(value):g}"
+    return str(value)
+
+
+def scan_parameter_abbreviations(parameters:list[str])->dict[str,str]:
+    """Initial-letter codes for scan parameters, widened until unique: ``gap``->``G``, ``taper_width``->``TW``."""
+    result={};used=set()
+    for key in parameters:
+        segments=[segment for segment in str(key).split("_") if segment] or [str(key)]
+        code="".join(segment[0].upper() for segment in segments)
+        if code in used:
+            widened=next((candidate for candidate in ("".join(segment[:size].upper() for segment in segments) for size in range(2,max(len(segment) for segment in segments)+1)) if candidate not in used),None)
+            if widened is None:
+                index=2
+                while f"{code}{index}" in used:index+=1
+                widened=f"{code}{index}"
+            code=widened
+        used.add(code);result[key]=code
+    return result
+
+
+def scan_device_label(prefix:str,parameters:list[str],values:tuple[Any,...])->str:
+    """Create a stable label such as ``CP,G3,L500``."""
+    codes=scan_parameter_abbreviations(list(parameters))
+    fields=sorted(zip(parameters,values),key=lambda item:codes[item[0]])
+    parts=[str(prefix).strip()] if str(prefix).strip() else []
+    parts.extend(f"{codes[key]}{_scan_value_text(value)}" for key,value in fields)
+    return ",".join(parts)
+
+
+def add_rf_taper_test_device(
+    top:gdstk.Cell,
+    source_kind:str,
+    taper_params:dict[str,Any],
+    block_params:dict[str,Any],
+    uid:int,
+    mirrored:bool,
+) -> float:
+    """Build CPW–taper–center–taper–CPW calibration geometry."""
+    signal_width=float(taper_params["signal_width"]);ground_width=float(taper_params["ground_width"])
+    if source_kind=="Symmetric CPW taper":
+        taper_length=float(taper_params["taper_length"]);outer_gap=float(taper_params["initial_gap"]);center_gap=float(taper_params["middle_gap"]);center_cpw_length=float(taper_params.get("middle_straight_length",0.0))
+    else:
+        taper_length=float(taper_params["length"]);outer_gap=float(taper_params["final_gap"]);center_gap=float(taper_params["initial_gap"]);center_cpw_length=0.0
+    probe_length=float(block_params.get("probe_cpw_length",100.0));input_transition=float(block_params.get("input_transition_length",0.0));output_transition=float(block_params.get("output_transition_length",0.0));t_transition=float(block_params.get("t_electrode_transition_length",0.0))
+    if min(signal_width,ground_width,taper_length)<=0.0 or min(outer_gap,center_gap,probe_length,input_transition,output_transition,t_transition)<0.0:
+        raise ValueError("Taper test dimensions require positive widths/taper length and nonnegative gaps, probe, and transition lengths.")
+    layer=int(taper_params.get("layer",RF_LAYER));datatype=int(taper_params.get("datatype",DEFAULT_DATATYPE));x=0.0;child_index=0
+
+    def add_child(kind:str,params:dict[str,Any],length:float|None=None)->None:
+        nonlocal x,child_index
+        if length is not None and length<=0.0:return
+        child_index+=1;_add_component_geometry_to_cell({"uid":uid*100+child_index,"kind":kind,"x":x,"y":0.0,"orientation_deg":0.0,"mirrored":mirrored,"attachment":None,"params":params},top)
+        if length is not None:x+=length
+
+    cpw_common={"signal_width":signal_width,"ground_width":ground_width,"gap":outer_gap,"layer":layer,"datatype":datatype}
+    add_child("CPW",dict(cpw_common,length=probe_length),probe_length)
+    add_child("CPW",dict(cpw_common,length=input_transition),input_transition)
+    taper_common={"signal_width":signal_width,"ground_width":ground_width,"profile":str(taper_params.get("profile","linear")),"target_s11_db":float(taper_params.get("target_s11_db",20.0)),"exponential_factor":float(taper_params.get("exponential_factor",1.0)),"points":rf_taper_point_count(taper_length),"layer":layer,"datatype":datatype}
+    add_child("Tapered CPW",dict(taper_common,length=taper_length,initial_gap=outer_gap,final_gap=center_gap),taper_length)
+    if str(block_params.get("taper_test_center","CPW"))=="T electrode":
+        electrode=safe_json_copy(DEFAULT_COMPONENT_VALUES["Segmented electrode"]);electrode.update({"signal_width":signal_width,"ground_width":ground_width,"end_gap":center_gap,"transition_length":t_transition,"end_flat_length":0.0,"inner_flat_length":0.0,"include_oxide_masks":False,"layer":layer,"datatype":datatype})
+        electrode_length=float(segmented_electrode_landmarks(electrode)["total_length"]);add_child("Segmented electrode",electrode,electrode_length)
+    else:
+        center_params={"length":center_cpw_length,"signal_width":signal_width,"ground_width":ground_width,"gap":center_gap,"layer":layer,"datatype":datatype};add_child("CPW",center_params,center_cpw_length)
+    add_child("Tapered CPW",dict(taper_common,length=taper_length,initial_gap=center_gap,final_gap=outer_gap),taper_length)
+    add_child("CPW",dict(cpw_common,length=output_transition),output_transition)
+    add_child("CPW",dict(cpw_common,length=probe_length),probe_length)
+    return x
 
 
 def add_ring_to_gds(top: gdstk.Cell, ring_center_local: tuple[float, float], radius: float, width: float, points: int, component_center: tuple[float, float], orientation: float, layer: int, datatype: int) -> None:
@@ -134,13 +253,91 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
     elif kind == "Grating coupler":
         layer = GC_LAYER
         datatype = DEFAULT_DATATYPE
-    elif kind == "Chip outline":
+    elif kind in {"Chip outline", "4-inch wafer outline"}:
         layer = int(p.get("layer", 100))
         datatype = int(p.get("datatype", 0))
     else:
         layer = PHOTONIC_LAYER
         datatype = DEFAULT_DATATYPE
     uid = int(component.get("uid", 0))
+
+    if kind in {"RF test block", "Photonic test block"}:
+        is_rf = kind == "RF test block"
+        family = "RF" if is_rf else "Photonic"
+        source_key = "rf_component_kind" if is_rf else "photonic_component_kind"
+        base_key = "rf_base_params" if is_rf else "photonic_base_params"
+        default_source = "CPW" if is_rf else "Straight"
+        allowed = sorted((RF_COMPONENT_KINDS - {"RF test block"}) if is_rf else PHOTONIC_COMPONENT_KINDS)
+        source_kind = str(p.get(source_key, default_source))
+        if source_kind not in allowed:
+            raise ValueError(f"{family} test block component must be one of: {', '.join(allowed)}")
+        base_params = safe_json_copy(p.get(base_key) or DEFAULT_COMPONENT_VALUES[source_kind])
+        selected = [str(key) for key in p.get("sweep_parameters", [])]
+        ranges = p.get("sweep_ranges", {})
+        value_lists: list[list[Any]] = []
+        for key in selected:
+            rule = ranges.get(key, {})
+            if "values" in rule:
+                values = list(rule.get("values") or [])
+            else:
+                values = inclusive_sweep(rule.get("start", base_params.get(key, 0.0)), rule.get("stop", base_params.get(key, 0.0)), rule.get("step", 1.0))
+                if isinstance(base_params.get(key), int) and not isinstance(base_params.get(key), bool):
+                    values = [int(round(value)) for value in values]
+            if not values:
+                raise ValueError(f"{family} test block sweep '{key}' has no values.")
+            value_lists.append(values)
+        combination_count = math.prod(len(values) for values in value_lists) if value_lists else 1
+        if combination_count > 500:
+            raise ValueError(f"{family} test block creates {combination_count} devices; reduce the scan to 500 or fewer.")
+        if value_lists:
+            horizontal_index=next((index for index,key in enumerate(selected) if _is_length_scan_parameter(key)),0)
+            horizontal_values=value_lists[horizontal_index]
+            row_indices=[index for index in range(len(selected)) if index!=horizontal_index]
+            row_combinations=list(itertools.product(*(value_lists[index] for index in row_indices))) if row_indices else [tuple()]
+            combinations=[]
+            for row_values in row_combinations:
+                row_mapping=dict(zip(row_indices,row_values))
+                for horizontal_value in horizontal_values:
+                    combinations.append(tuple(horizontal_value if index==horizontal_index else row_mapping[index] for index in range(len(selected))))
+            grid_columns=len(horizontal_values)
+        else:
+            combinations=[tuple()];grid_columns=1
+        templates: list[tuple[list[Any], np.ndarray, np.ndarray]] = []
+        for index, values in enumerate(combinations):
+            child_params = safe_json_copy(base_params)
+            child_params.update(dict(zip(selected, values)))
+            temp_library = gdstk.Library(unit=1e-6, precision=1e-9)
+            temp_cell = temp_library.new_cell(f"{'RF' if is_rf else 'PHOTONIC'}_SCAN_{uid}_{index}")
+            child = {"uid": uid * 1000 + index + 1, "kind": source_kind, "x": 0.0, "y": 0.0, "orientation_deg": 0.0, "mirrored": mirrored, "attachment": None, "params": child_params}
+            if is_rf and source_kind in {"Tapered CPW","Symmetric CPW taper"} and bool(p.get("taper_test_structure",False)):
+                add_rf_taper_test_device(temp_cell,source_kind,child_params,p,uid*1000+index+1,mirrored)
+            else:
+                _add_component_geometry_to_cell(child, temp_cell)
+            child_bbox=temp_cell.bounding_box()
+            label_height=float(p.get("label_height",20.0));label_offset_x=float(p.get("label_offset_x",0.0));label_offset_y=float(p.get("label_offset_y",p.get("label_gap",10.0)))
+            label_text=scan_device_label(str(p.get("device_label_prefix") or source_kind),selected,values)
+            if child_bbox is not None and label_height>0.0 and label_text:
+                label_layer=int(p.get("label_layer",MARKER_LAYER));label_datatype=int(p.get("label_datatype",DEFAULT_DATATYPE));label_polygons=list(gdstk.text(label_text,label_height,(0.0,0.0),layer=label_layer,datatype=label_datatype))
+                if label_polygons:
+                    label_points=np.vstack([np.asarray(polygon.points,float) for polygon in label_polygons]);label_low=label_points.min(axis=0);child_low=np.asarray(child_bbox[0],float);child_high=np.asarray(child_bbox[1],float)
+                    shift=np.array([child_low[0]+label_offset_x-label_low[0],child_high[1]+label_offset_y-label_low[1]],float)
+                    for polygon in label_polygons:temp_cell.add(gdstk.Polygon(np.asarray(polygon.points,float)+shift,layer=label_layer,datatype=label_datatype))
+            bbox = temp_cell.bounding_box()
+            if bbox is None:
+                continue
+            templates.append((temp_cell.get_polygons(apply_repetitions=True, include_paths=True), np.asarray(bbox[0], float), np.asarray(bbox[1], float)))
+        if not templates:
+            return
+        edge_spacing = float(p.get("edge_spacing", 300.0))
+        if edge_spacing < 0.0:
+            raise ValueError(f"{family} test block edge spacing cannot be negative.")
+        cell_centers,_,_=scan_parameter_grid_layout([(low,high) for _,low,high in templates],edge_spacing,grid_columns)
+        for cell_center,(polygons,low,high) in zip(cell_centers,templates):
+            shift = cell_center - (low + high) / 2.0
+            for polygon in polygons:
+                local_points = np.asarray(polygon.points, float) + shift
+                top.add(gdstk.Polygon(transform_points(local_points, start, orientation), layer=int(polygon.layer), datatype=int(polygon.datatype)))
+        return
 
     if kind == "Straight":
         length = float(p["length"]); width = float(p["width"])
@@ -988,6 +1185,20 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             top.add(gdstk.Label(f"W = {width:g} um",bottom,anchor="n",rotation=math.radians(orientation),magnification=scale_label,layer=dim_layer,texttype=datatype))
             top.add(gdstk.Label(f"H = {height:g} um",left,anchor="n",rotation=math.radians(orientation+90.0),magnification=scale_label,layer=dim_layer,texttype=datatype))
         return
+    if kind == "4-inch wafer outline":
+        diameter=float(p.get("diameter",100000.0));flat_length=float(p.get("primary_flat_length",32500.0));line_width=float(p.get("line_width",100.0));point_count=max(64,int(p.get("points",720)));filled=bool(int(p.get("filled",0)))
+        radius=diameter/2.0
+        if diameter<=0 or flat_length<=0 or flat_length>=diameter or line_width<=0 or line_width>=radius:
+            raise ValueError("4-inch wafer outline requires diameter > flat length > 0 and a positive line width smaller than the radius.")
+        half_flat=flat_length/2.0;y_flat=-math.sqrt(max(0.0,radius*radius-half_flat*half_flat));theta_right=math.atan2(y_flat,half_flat);theta_left=math.atan2(y_flat,-half_flat)+2.0*math.pi
+        angles=np.unique(np.concatenate((np.linspace(theta_right,theta_left,point_count),np.array([0.0,math.pi/2.0,math.pi]))));outer_points=np.column_stack((radius*np.cos(angles),radius*np.sin(angles)));outer=gdstk.Polygon(outer_points,layer=layer,datatype=datatype)
+        if filled:
+            top.add(gdstk.Polygon(transform_points(outer_points,start,orientation),layer=layer,datatype=datatype))
+        else:
+            inner=gdstk.offset(outer,-line_width,join="round",tolerance=2,precision=0.001,layer=layer,datatype=datatype)
+            outline=gdstk.boolean(outer,inner,"not",precision=0.001,layer=layer,datatype=datatype)
+            for polygon in outline:top.add(gdstk.Polygon(transform_points(np.asarray(polygon.points,float),start,orientation),layer=layer,datatype=datatype))
+        return
     if kind == "Chip marker block":
         chip_w=float(p.get("chip_width",14000));chip_h=float(p.get("chip_height",12000));size=float(p.get("corner_square_size",50));clear=float(p.get("edge_clearance",0));half=size/2;inset=clear+half
         if min(chip_w,chip_h,size)<=0 or clear<0 or size+2*clear>min(chip_w,chip_h):raise ValueError("Invalid chip marker dimensions or edge clearance.")
@@ -1146,7 +1357,7 @@ def _canonicalize_component_layers(component: dict[str, Any]) -> None:
         params["rf_layer"] = RF_LAYER
         params["rf_datatype"] = DEFAULT_DATATYPE
     elif kind not in {
-        "Chip outline", "E-beam multipass",
+        "Chip outline", "4-inch wafer outline", "E-beam multipass",
     }:
         params["layer"] = PHOTONIC_LAYER
         params["datatype"] = DEFAULT_DATATYPE

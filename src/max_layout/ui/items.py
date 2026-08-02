@@ -82,6 +82,31 @@ def _sample_dense_preview_polygons(
     return reduced
 
 
+def _needs_exact_t_electrode_preview(component:dict[str,Any])->bool:
+    kind=str(component.get("kind",""));params=component.get("params",{})
+    if kind=="Segmented electrode":
+        return True
+    return kind=="RF test block" and (
+        str(params.get("rf_component_kind",""))=="Segmented electrode"
+        or (bool(params.get("taper_test_structure",False)) and str(params.get("taper_test_center",""))=="T electrode")
+    )
+
+
+def _union_preview_polygons(polygons:list[tuple[np.ndarray,int,int]])->list[tuple[np.ndarray,int,int]]:
+    """Merge overlapping metal only for the GUI; exported polygons are untouched."""
+    grouped:OrderedDict[tuple[int,int],list[np.ndarray]]=OrderedDict()
+    for points,layer,datatype in polygons:grouped.setdefault((layer,datatype),[]).append(points)
+    result:list[tuple[np.ndarray,int,int]]=[]
+    for (layer,datatype),groups in grouped.items():
+        try:
+            sources=[gdstk.Polygon(points,layer=layer,datatype=datatype) for points in groups]
+            merged=gdstk.boolean(sources,[],"or",precision=0.001,layer=layer,datatype=datatype)
+            result.extend((np.asarray(polygon.points,float),layer,datatype) for polygon in merged)
+        except Exception:
+            result.extend((points,layer,datatype) for points in groups)
+    return result
+
+
 def component_preview_cache_key(component: dict[str, Any]) -> str:
     local = safe_json_copy(component)
     local["x"] = 0.0
@@ -136,7 +161,10 @@ def component_local_polygons(component: dict[str, Any]) -> list[tuple[np.ndarray
         layer = int(getattr(polygon, "layer", local.get("params", {}).get("layer", 1)))
         datatype = int(getattr(polygon, "datatype", local.get("params", {}).get("datatype", 0)))
         result.append((points, layer, datatype))
-    result = _sample_dense_preview_polygons(result)
+    if _needs_exact_t_electrode_preview(local):
+        result=_union_preview_polygons(result)
+    else:
+        result = _sample_dense_preview_polygons(result)
     _PREVIEW_GEOMETRY_CACHE[cache_key] = result
     _PREVIEW_GEOMETRY_CACHE.move_to_end(cache_key)
     while len(_PREVIEW_GEOMETRY_CACHE) > _PREVIEW_GEOMETRY_CACHE_LIMIT:
@@ -480,7 +508,15 @@ class ComponentGraphicsItem(QGraphicsItemGroup):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsFocusable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
-        self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+        # A generated test block can span many thousands of microns.  Qt's
+        # device-coordinate cache turns that complete extent into one raster
+        # when selection handles appear, which can exceed the raster engine's
+        # 32,767-pixel limit and crash on mouse release.  The shared painter
+        # paths already provide the useful cache for these composite items.
+        if component.get("kind") in {"RF test block", "Photonic test block"}:
+            self.setCacheMode(QGraphicsItem.CacheMode.NoCache)
+        else:
+            self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
         self.setZValue(10)
         self.rebuild_geometry()
         self.sync_transform()
@@ -622,18 +658,56 @@ class ComponentGraphicsItem(QGraphicsItemGroup):
     def mouseReleaseEvent(self, event) -> None:
         start_payload = self._drag_snapshot
         self._drag_snapshot = None
-        super().mouseReleaseEvent(event)
-        moved = QLineF(self._drag_start_position, self.pos()).length() > 1e-9
-        self.main_window.move_group_with_primary(self)
-        if moved:
-            self.main_window.snap_component_after_move(self.uid)
-        if start_payload is not None:
-            self.main_window.commit_interaction_snapshot(start_payload)
-        self.main_window.refresh_project_tree()
-        self.main_window.on_scene_selection_changed()
-        if not moved and self._press_scene_position is not None:
-            self.main_window.show_properties_for_scene_click(self, self._press_scene_position)
+        press_scene_position = (
+            QPointF(self._press_scene_position)
+            if self._press_scene_position is not None
+            else None
+        )
         self._press_scene_position = None
+        try:
+            super().mouseReleaseEvent(event)
+        except Exception as exc:
+            # Do not let a Qt/PySide event-wrapper exception escape: affected
+            # PySide6 macOS builds can segfault while formatting that error.
+            self.main_window.statusBar().showMessage(
+                f"Selection event recovered safely: {exc}", 6000
+            )
+        moved = QLineF(self._drag_start_position, self.pos()).length() > 1e-9
+        # Finish bookkeeping after Qt has returned from the graphics-scene
+        # mouse event.  This avoids re-entering itemAt/property rebuilding
+        # while QGraphicsScene is still dispatching the release to a child.
+        QTimer.singleShot(
+            0,
+            lambda: self._finish_mouse_release(
+                start_payload,
+                moved,
+                press_scene_position,
+            ),
+        )
+
+    def _finish_mouse_release(
+        self,
+        start_payload: str | None,
+        moved: bool,
+        press_scene_position: QPointF | None,
+    ) -> None:
+        try:
+            self.main_window.move_group_with_primary(self)
+            if moved:
+                self.main_window.snap_component_after_move(self.uid)
+            if start_payload is not None:
+                self.main_window.commit_interaction_snapshot(start_payload)
+            self.main_window.refresh_project_tree()
+            self.main_window.on_scene_selection_changed()
+            if not moved and press_scene_position is not None:
+                self.main_window.show_properties_for_scene_click(
+                    self,
+                    press_scene_position,
+                )
+        except Exception as exc:
+            self.main_window.statusBar().showMessage(
+                f"Selection update recovered safely: {exc}", 6000
+            )
 
 
 class WriteFieldGroupHandle(QGraphicsRectItem):

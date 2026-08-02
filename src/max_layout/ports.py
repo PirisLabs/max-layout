@@ -339,7 +339,7 @@ def component_local_ports(component: dict[str, Any]) -> dict[str, dict[str, Any]
         add("upper_left_gc",q["upper_left_gc"],180); add("upper_left_bus",q["upper_left_bus"],0); add("upper_right_bus",q["upper_right_bus"],0); add("upper_right_gc",q["upper_right_gc"],0)
         add("lower_left_gc",q["lower_left_gc"],180); add("lower_left_bus",q["lower_left_bus"],0); add("lower_right_bus",q["lower_right_bus"],0); add("lower_right_gc",q["lower_right_gc"],0)
         add("center",q["center"],0,"alignment"); add("upper_bus_center",q["upper_bus_center"],0,"alignment"); add("lower_bus_center",q["lower_bus_center"],0,"alignment")
-    elif kind in {"Double-ring test block", "Grating test block", "Grating angle-taper test block", "MMI + Reference test block", "MMI split-combine test block", "Vertical-GC MZI test block", "Vertical-GC MZI + CPW test block", "Vertical-GC MZI + segmented electrode test block", "Straight-GC MZI + segmented RF bends test block", "Straight-GC MZI + CPW RF bends test block"}:
+    elif kind in {"Double-ring test block", "Grating test block", "Grating angle-taper test block", "MMI + Reference test block", "MMI split-combine test block", "Vertical-GC MZI test block", "Vertical-GC MZI + CPW test block", "Vertical-GC MZI + segmented electrode test block", "Straight-GC MZI + segmented RF bends test block", "Straight-GC MZI + CPW RF bends test block", "RF test block", "Photonic test block", "4-inch wafer outline"}:
         # Compound test arrays expose one stable parent alignment port.  The
         # child devices are intentionally not connectable at this level.
         add("center",(0.0,0.0),0.0,"alignment")

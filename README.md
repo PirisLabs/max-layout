@@ -140,7 +140,15 @@ Raise the thread count at **Layout → Performance / CPU Threads…**, or set
   For ordinary photographs, start with **Photo edges — recommended**, detail
   192, edge strength 38, polygon merging enabled, and a 500 µm output width.
   Camera/EXIF rotation is applied automatically.
-- Parameterized test blocks and selectable parameter sweeps.
+- Generic RF and photonic three-step test-block wizards: choose a library component and label settings, choose common or full parameters, then enter uniform Start/Stop/Step ranges or explicit nonuniform lists such as `500, 1000, 2000`. Each generated device receives visible parameter text such as `CP,Gap=3,Length=500`, anchored consistently from its true top-left corner using editable text height and X/Y offsets (20 µm default height). Length-like values define aligned columns, while every combination of gap, width, and other values defines aligned rows. Per-column widths, per-row heights, and label geometry preserve the requested edge spacing without a manual column-count setting.
+- The initial CPW test-block scan uses signal widths `10, 11, 12, 13, 14, 15 µm` as six rows and lengths `500, 1000, 2000 µm` as three columns.
+- Tapered CPW and symmetric CPW taper scans use `500, 1000, 2000 µm` as their initial taper-length columns.
+- RF taper test blocks ask whether the center is plain CPW or a T electrode. Their generated sequence is probe CPW → input taper → center section → output taper → probe CPW. Probe CPW leads default to 100 µm; extra input/output transitions default to 0 µm. A taper-contained T electrode defaults to `inner_flat_length = 0 µm`, `end_flat_length = 0 µm`, and `transition_length = 0 µm`.
+- A standalone T electrode defaults to `inner_flat_length = 0 µm`, `end_flat_length = 100 µm`, and `transition_length = 0 µm`. T-electrode GUI previews use an exact preview-only metal union instead of dropping dense polygons, so the canvas matches the exported GDS while remaining lighter to render.
+- Three-step RF test-block wizard: choose an RF library component, select common
+  or full physical parameters, enter numeric ranges or taper-profile values,
+  and place the resulting scan with configurable edge-to-edge spacing.
+- 4-inch (100 mm) wafer outline with the standard 32.5 mm primary flat.
 - Test-block sweep tables let users select the major parameters and enter an
   inclusive start, stop, and step for each selected sweep before generation.
 - Smart Sketch removes hand shake and fits each stroke to a clean standard
