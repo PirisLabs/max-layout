@@ -75,7 +75,8 @@ def make_focusing_gc_gds(
         270 deg -> grating extends toward -y
 
     fill_factor:
-        LN tooth width divided by pitch.
+        LN tooth width divided by pitch. May be one scalar or an N-element
+        array for an apodized grating.
 
         tooth_width = pitch * fill_factor
         gap_width   = pitch * (1 - fill_factor)

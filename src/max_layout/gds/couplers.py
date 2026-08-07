@@ -13,6 +13,37 @@ from ..gds.primitives import add_rect
 from ..geometry.euler import gc_euler_output_local
 from ..geometry.shapes import mmi_total_length
 from ..geometry.transforms import rot, transform_points
+from ..utils import parse_sequence
+
+
+def resolve_grating_fill_factors(
+    parameters: dict[str, Any],
+    count: int,
+    *,
+    scalar_key: str,
+    array_key: str = "fill_factors",
+) -> np.ndarray:
+    """Return one validated fill factor per grating tooth."""
+    count = int(count)
+    if count <= 0:
+        raise ValueError("The grating tooth count N must be greater than zero.")
+
+    expression = parameters.get(array_key, "")
+    if expression is None or (isinstance(expression, str) and not expression.strip()):
+        values = [float(parameters.get(scalar_key, 0.5))] * count
+    else:
+        values = parse_sequence(str(expression), count)
+
+    result = np.asarray(values, dtype=float).reshape(-1)
+    if result.size != count:
+        raise ValueError(
+            f"Apodized fill factors require exactly N={count} values; received {result.size}."
+        )
+    if not np.all(np.isfinite(result)):
+        raise ValueError("Every grating fill factor must be a finite number.")
+    if np.any((result <= 0.0) | (result >= 1.0)):
+        raise ValueError("Every grating fill factor must be greater than 0 and less than 1.")
+    return result
 
 
 def add_parent_focusing_gc(
@@ -38,10 +69,19 @@ def add_parent_focusing_gc(
     gc_datatype = int(p.get("gc_datatype", DEFAULT_DATATYPE))
     wg_length = float(p.get("gc_wg_length", p.get("wg_length", 20.0)))
 
+    period_count = int(p.get("gc_N", p.get("N", 30)))
+    array_key = "gc_fill_factors" if str(p.get("gc_fill_factors", "")).strip() else "fill_factors"
+    fill_factors = resolve_grating_fill_factors(
+        p,
+        period_count,
+        scalar_key="gc_fill_factor" if "gc_fill_factor" in p else "fill_factor",
+        array_key=array_key,
+    )
+
     _, gc_cell, *_ = backend.make_focusing_gc_gds(
         pitch=float(p.get("gc_pitch", p.get("pitch", 0.75))),
-        fill_factor=float(p.get("gc_fill_factor", p.get("fill_factor", 0.57))),
-        N=int(p.get("gc_N", p.get("N", 30))),
+        fill_factor=fill_factors,
+        N=period_count,
         alpha_t=float(p.get("gc_alpha_t", p.get("alpha_t", 25.0))),
         taper_L=float(p.get("gc_taper_L", p.get("taper_L", 22.0))),
         wg_width=float(width),
@@ -113,7 +153,6 @@ def add_soi_grating_coupler(
     """
     pitch = float(p.get("pitch", 0.6713))
     target_length = float(p.get("target_length", 25.0))
-    duty_cycle = float(p.get("duty_cycle", 0.3992))
     radius = float(p.get("radius", 25.0))
     y_span = float(p.get("y_span", 15.0))
     extra_length = float(p.get("L_extra", 10.0))
@@ -133,15 +172,20 @@ def add_soi_grating_coupler(
     tolerance = max(1e-5, requested_tolerance)
     if min(pitch, target_length, radius, y_span, wg_width, wg_length) <= 0:
         raise ValueError("GC-SOI dimensions and pitch must be positive.")
-    if not 0.0 < duty_cycle < 1.0:
-        raise ValueError("GC-SOI duty cycle must be between 0 and 1.")
     if y_span >= 2.0 * radius:
         raise ValueError("GC-SOI y span must be smaller than twice its radius.")
 
     period_count = int(np.ceil(target_length / pitch))
-    tooth_width = duty_cycle * pitch
-    gap_width = pitch - tooth_width
-    grating_length = period_count * pitch + gap_width
+    fill_factors = resolve_grating_fill_factors(
+        p,
+        period_count,
+        scalar_key="duty_cycle",
+    )
+    tooth_widths = fill_factors * pitch
+    gap_widths = pitch - tooth_widths
+    # Preserve the official uniform geometry exactly. For an apodized
+    # grating, the terminal sector begins after the final tooth's own gap.
+    grating_length = period_count * pitch + float(gap_widths[-1])
     half_angle = float(np.arcsin(0.5 * y_span / radius))
     taper_length = radius * float(np.cos(half_angle))
     focus = np.array([wg_length, 0.0], dtype=float)
@@ -189,8 +233,8 @@ def add_soi_grating_coupler(
     # The residual slab is continuous beneath every etched grating period.
     top.add(annular(radius, radius + grating_length, slab_layer, slab_datatype))
     for index in range(period_count):
-        inner = radius + index * pitch + gap_width
-        outer = radius + (index + 1) * pitch
+        inner = radius + index * pitch + float(gap_widths[index])
+        outer = inner + float(tooth_widths[index])
         top.add(annular(inner, outer, etched_layer, etched_datatype))
 
 

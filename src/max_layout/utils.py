@@ -48,7 +48,9 @@ def parse_sequence(text: str, count: int) -> list[float]:
         1000; 1200; 1400
         (1000, 200, 1400)
         1000:200:1400
+        linspace(1000, 1400)     # count is supplied by the component
         linspace(1000, 1400, 3)
+        linspace(1000, 1400, N)  # N means the requested array count
 
     A trailing micrometre unit (um, µm, or μm) is accepted on each number.
     """
@@ -99,14 +101,16 @@ def parse_sequence(text: str, count: int) -> list[float]:
         return [parse_number(token) for token in tokens]
 
     linspace_match = re.fullmatch(
-        rf"linspace\s*\(\s*({number_pattern})\s*[,;]\s*({number_pattern})\s*[,;]\s*(\d+)\s*\)",
+        rf"linspace\s*\(\s*({number_pattern})\s*[,;]\s*({number_pattern})"
+        rf"(?:\s*[,;]\s*(\d+|N))?\s*\)",
         source,
         re.I,
     )
     if linspace_match:
         start = parse_number(linspace_match.group(1))
         stop = parse_number(linspace_match.group(2))
-        n = int(linspace_match.group(3))
+        count_token = linspace_match.group(3)
+        n = count if count_token is None or count_token.upper() == "N" else int(count_token)
         if n <= 0:
             raise ValueError("linspace count must be greater than zero.")
         values = np.linspace(start, stop, n).tolist()

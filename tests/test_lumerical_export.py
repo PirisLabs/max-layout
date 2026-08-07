@@ -9,8 +9,10 @@ import numpy as np
 
 from max_layout.constants import DEFAULT_COMPONENT_VALUES
 from max_layout.gds.build import component_geometry_arrays, resolve_and_build
+from max_layout.gds.couplers import resolve_grating_fill_factors
 from max_layout import lumerical
 from max_layout.lumerical import generate_lumerical_notebook, seed_simulation_ports
+from max_layout.utils import parse_sequence
 
 
 def component(kind: str, uid: int = 1) -> dict:
@@ -92,6 +94,45 @@ class LumericalExportTests(unittest.TestCase):
         with_arc_xmax = max(float(points[:, 0].max()) for points, _layer, _datatype in with_arc)
         without_arc_xmax = max(float(points[:, 0].max()) for points, _layer, _datatype in without_arc)
         self.assertAlmostEqual(with_arc_xmax - without_arc_xmax, 10.0, places=2)
+
+    def test_apodized_grating_fill_factors_match_n(self) -> None:
+        grating = component("Grating coupler")
+        grating["params"].update({"N": 5, "fill_factors": "linspace(0.30, 0.50)"})
+        resolved = resolve_grating_fill_factors(
+            grating["params"], 5, scalar_key="fill_factor"
+        )
+        np.testing.assert_allclose(resolved, [0.30, 0.35, 0.40, 0.45, 0.50])
+        polygons, _ = component_geometry_arrays(grating)
+        self.assertGreater(len(polygons), 5)
+
+        explicit = deepcopy(grating)
+        explicit["params"]["fill_factors"] = "[0.31, 0.34, 0.37, 0.40, 0.43]"
+        explicit_values = resolve_grating_fill_factors(
+            explicit["params"], 5, scalar_key="fill_factor"
+        )
+        np.testing.assert_allclose(explicit_values, [0.31, 0.34, 0.37, 0.40, 0.43])
+
+        mismatch = deepcopy(grating)
+        mismatch["params"]["fill_factors"] = "[0.3, 0.4]"
+        with self.assertRaisesRegex(ValueError, "Expected 5 values"):
+            component_geometry_arrays(mismatch)
+
+    def test_soi_grating_accepts_apodized_fill_factors(self) -> None:
+        grating = component("GC-SOI")
+        period_count = int(np.ceil(grating["params"]["target_length"] / grating["params"]["pitch"]))
+        grating["params"]["fill_factors"] = "linspace(0.30, 0.50)"
+        values = resolve_grating_fill_factors(
+            grating["params"], period_count, scalar_key="duty_cycle"
+        )
+        self.assertEqual(values.size, period_count)
+        self.assertAlmostEqual(float(values[0]), 0.30)
+        self.assertAlmostEqual(float(values[-1]), 0.50)
+        polygons, _ = component_geometry_arrays(grating)
+        self.assertEqual(len(polygons), 47)
+
+    def test_parse_sequence_symbolic_n(self) -> None:
+        self.assertEqual(parse_sequence("linspace(0.2, 0.8)", 4), [0.2, 0.4, 0.6000000000000001, 0.8])
+        self.assertEqual(parse_sequence("linspace(0.2, 0.8, N)", 4), [0.2, 0.4, 0.6000000000000001, 0.8])
 
     def test_mmi_export_includes_longitudinal_fundamental_field_plot(self) -> None:
         mmi = component("1x2 MMI")

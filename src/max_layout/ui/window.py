@@ -854,12 +854,14 @@ class NativeLayoutWindow(QMainWindow):
                     component.setdefault("params", {})["z reference"] = "top of SiO2 cladding"
                 if component.get("kind") == "GC-SOI":
                     params = component.setdefault("params", {})
+                    params.setdefault("fill_factors", "")
                     if abs(float(params.get("tolerance", 0.005)) - 0.0005) <= 1e-12:
                         params["tolerance"] = 0.005
                     if abs(float(params.get("fdtd_port_offset_from_waveguide_end_um", 2.0)) - 3.0) <= 1e-12:
                         params["fdtd_port_offset_from_waveguide_end_um"] = 2.0
                 elif component.get("kind") == "Grating coupler":
                     params = component.setdefault("params", {})
+                    params.setdefault("fill_factors", "")
                     if abs(float(params.get("fdtd_port_offset_from_waveguide_end_um", 2.0)) - 3.0) <= 1e-12:
                         params["fdtd_port_offset_from_waveguide_end_um"] = 2.0
             self.components = components
@@ -1822,6 +1824,16 @@ class NativeLayoutWindow(QMainWindow):
             return
         title = QLabel(f"<b>{component.get('kind')}</b> · UID {component.get('uid')}")
         self.properties_form.addRow(title)
+        if component.get("kind") in {"Grating coupler", "GC-SOI"}:
+            component.setdefault("params", {}).setdefault("fill_factors", "")
+        if component.get("kind") == "GC-SOI":
+            params = component.get("params", {})
+            pitch = float(params.get("pitch", 0.6713))
+            target_length = float(params.get("target_length", 25.0))
+            derived_count = int(math.ceil(target_length / pitch)) if pitch > 0.0 else 0
+            count_label = QLabel(str(derived_count))
+            count_label.setToolTip("Automatically calculated as ceil(target length / pitch).")
+            self.properties_form.addRow("Derived grating tooth count (N)", count_label)
         if component.get("kind") == "Grating coupler":
             # Older saved layouts predate these editable simulation offsets.
             # Add them non-destructively when the grating is selected.
@@ -1882,9 +1894,19 @@ class NativeLayoutWindow(QMainWindow):
                 else:
                     spec = ["string", value]
             widget = self.make_parameter_widget(key, spec, value)
+            if key == "fill_factors" and isinstance(widget, QLineEdit):
+                widget.setPlaceholderText("Uniform when blank; e.g. linspace(0.35, 0.55)")
+                widget.setToolTip(
+                    "Enter one fill factor per grating tooth as a list, or use "
+                    "linspace(start, stop). The component supplies the tooth count automatically."
+                )
             parameter_label = (
                 "Fiber offset after taper toward grating (µm)" if key == "fiber_offset_after_taper_um"
                 else "FDTD port offset from waveguide end (µm)" if key == "fdtd_port_offset_from_waveguide_end_um"
+                else "Apodized fill factors (one per tooth)" if key == "fill_factors"
+                else "Number of grating teeth (N)" if key == "N" and component.get("kind") == "Grating coupler"
+                else "Uniform fill factor" if key == "fill_factor" and component.get("kind") == "Grating coupler"
+                else "Uniform duty cycle" if key == "duty_cycle" and component.get("kind") == "GC-SOI"
                 else "GDS curve tolerance (µm)" if key == "tolerance" and component.get("kind") in {"Grating coupler", "GC-SOI"}
                 else "Grating straight waveguide length (µm)" if key == "wg_length" and component.get("kind") in {"Grating coupler", "GC-SOI"}
                 else "GC straight lead length (µm)" if key == "gc_wg_length"
@@ -4555,8 +4577,9 @@ ENDFLOW
                 groups.append((name, available))
 
         gc_keys = (
-            "pitch", "fill_factor", "N", "alpha_t", "taper_L", "L_extra", "wg_width", "wg_length",
-            "gc_pitch", "gc_fill_factor", "gc_N", "gc_alpha_t", "gc_taper_L", "gc_wg_length",
+            "pitch", "fill_factor", "duty_cycle", "fill_factors", "N", "target_length",
+            "alpha_t", "taper_L", "L_extra", "wg_width", "wg_length",
+            "gc_pitch", "gc_fill_factor", "gc_fill_factors", "gc_N", "gc_alpha_t", "gc_taper_L", "gc_wg_length",
         )
         mmi_keys = (
             "mmi_width", "mmi_length", "wg_width", "taper_width", "input_taper_length",
