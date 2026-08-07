@@ -993,6 +993,8 @@ set("name","cladding");
 set("radius",cladding_radius);
 set("material","<Object defined dielectric>");
 set("index",cladding_index);
+set("override color opacity from material database",1);
+set("alpha",0.03);
 set("override mesh order from material database",1);
 set("mesh order",3);
 set("x",0.0);
@@ -1006,6 +1008,8 @@ set("name","core");
 set("radius",core_radius);
 set("material","<Object defined dielectric>");
 set("index",core_index);
+set("override color opacity from material database",1);
+set("alpha",0.35);
 set("override mesh order from material database",1);
 set("mesh order",2);
 set("x",0.0);
@@ -1479,12 +1483,12 @@ def _draw_process_projection(axis, coordinate_index, coordinate_label):
         axis.plot(
             [start_horizontal, start_horizontal + horizontal_delta],
             [start_z, start_z + vertical_delta],
-            color="#0e7490", linewidth=5.0, alpha=0.40, solid_capstyle="round",
+            color="#bae6fd", linewidth=10.0, alpha=0.06, solid_capstyle="round",
         )
         axis.plot(
             [start_horizontal, start_horizontal + horizontal_delta],
             [start_z, start_z + vertical_delta],
-            color="#155e75", linewidth=1.4, solid_capstyle="round",
+            color="#0e7490", linewidth=4.0, alpha=0.35, solid_capstyle="round",
         )
 
     axis.add_patch(Rectangle(
@@ -1535,8 +1539,8 @@ for fiber in FIBER_GEOMETRIES:
     x_um, y_um = map(float, fiber.get("center", (0.0, 0.0)))
     cladding_radius = 0.5 * float(fiber.get("cladding diameter_um", 50.0))
     core_radius = 0.5 * float(fiber.get("core diameter_um", 9.0))
-    xy_axis.add_patch(plt.Circle((x_um, y_um), cladding_radius, fill=False, edgecolor="#0891b2", linewidth=1.0, linestyle=":"))
-    xy_axis.add_patch(plt.Circle((x_um, y_um), core_radius, fill=False, edgecolor="#0e7490", linewidth=1.6))
+    xy_axis.add_patch(plt.Circle((x_um, y_um), cladding_radius, facecolor="#bae6fd", edgecolor="#7dd3fc", linewidth=0.8, linestyle=":", alpha=0.06))
+    xy_axis.add_patch(plt.Circle((x_um, y_um), core_radius, facecolor="#0e7490", edgecolor="#155e75", linewidth=1.4, alpha=0.35))
     xy_axis.annotate(str(fiber.get("name", "fiber geometry")), (x_um, y_um), xytext=(4, 5), textcoords="offset points", fontsize=7, color="#0e7490")
 
 for port in PORTS:

@@ -550,9 +550,9 @@ class ThreeDModelPreview(QWidget):
                 fraction = min(1.0, max(0.0, (z1 - bottom_z) / max(1e-9, dz)))
                 start = screen(raw((cx, cy, max(z0, bottom_z))))
                 stop = screen(raw((cx + fraction * dx, cy + fraction * dy, min(z1, bottom_z + fraction * dz))))
-                painter.setPen(QPen(QColor(14, 116, 144, 100), 10, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.setPen(QPen(QColor(186, 230, 253, 18), 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 painter.drawLine(start, stop)
-                painter.setPen(QPen(QColor("#0e7490"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.setPen(QPen(QColor(14, 116, 144, 110), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 painter.drawLine(start, stop)
             elif kind in {"FDTD port", "Fiber-axis FDTD port"} and self.show_ports:
                 normal = str(params.get("plane normal", "X")).upper()

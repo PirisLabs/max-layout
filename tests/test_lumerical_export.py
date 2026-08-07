@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+from pathlib import Path
 import unittest
 
 import numpy as np
@@ -129,6 +130,9 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(DEFAULT_COMPONENT_VALUES["Fiber geometry"]["core diameter_um"], 9.0)
         self.assertEqual(DEFAULT_COMPONENT_VALUES["Fiber geometry"]["cladding diameter_um"], 50.0)
         self.assertEqual(DEFAULT_COMPONENT_VALUES["Fiber geometry"]["z reference"], "top of SiO2 cladding")
+        window_source = Path("src/max_layout/ui/window.py").read_text(encoding="utf-8")
+        self.assertNotIn("port_local_x += tox_offset_um * math.sin", window_source)
+        self.assertIn("fiber and port", window_source)
 
     def test_legacy_combined_fiber_never_creates_a_port(self) -> None:
         notebook, warnings = generate_lumerical_notebook(
@@ -256,6 +260,8 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn('set("x",0.0);', build_source)
         self.assertIn('set("y",0.0);', build_source)
         self.assertIn('set("z",0.0);', build_source)
+        self.assertIn('set("alpha",0.03);', build_source)
+        self.assertIn('set("alpha",0.35);', build_source)
         self.assertIn("fdtd.updateportmodes()", build_source)
         self.assertIn("no source or port was created", build_source)
         payload = cell_source_containing(notebook, "MATERIAL_STACK =")

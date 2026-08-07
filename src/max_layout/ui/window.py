@@ -1122,9 +1122,9 @@ class NativeLayoutWindow(QMainWindow):
             port_distance_um = 0.0
             if kind == "GC-SOI":
                 tox_offset_um = float(grating_params.get("fiber_tox_offset_um", 0.65))
-                port_local_x += tox_offset_um * math.sin(math.radians(fiber_angle_deg))
                 # Official model: TOX center + 0.65 cos(theta), with the port
-                # measured here from the 0.70 um TOX top.
+                # measured here from the 0.70 um TOX top. The fiber and port
+                # intentionally retain the same top-view center.
                 port_distance_um = tox_offset_um * math.cos(math.radians(fiber_angle_deg)) - 0.35
             fiber_port_x = float(component.get("x", 0.0)) + port_local_x * math.cos(angle)
             fiber_port_y = float(component.get("y", 0.0)) + port_local_x * math.sin(angle)
@@ -1238,9 +1238,6 @@ class NativeLayoutWindow(QMainWindow):
                     offset_um = max(0.0, float(params.get("fiber_x_from_grating_start_um", 2.74533)))
                     local_x = float(params.get("wg_length", 10.0)) + float(params.get("radius", 25.0)) + offset_um
                     theta_deg = float(params.get("fiber_tilt_deg", 10.0))
-                    if companion.get("kind") == "Fiber-axis FDTD port":
-                        tox_offset_um = float(params.get("fiber_tox_offset_um", 0.65))
-                        local_x += tox_offset_um * math.sin(math.radians(theta_deg))
                 else:
                     offset_um = max(
                         0.0,
