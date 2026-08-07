@@ -218,6 +218,9 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn('"rotation offset"', build_source)
         self.assertIn('fdtd.set("theta", theta_deg)', build_source)
         self.assertIn('fdtd.set("phi", phi_deg)', build_source)
+        self.assertIn('fdtd.set("frequency dependent profile", False)', build_source)
+        self.assertNotIn('fdtd.set("number of field profile samples", 1)', build_source)
+        self.assertNotIn('fdtd.set("auto update", True)', build_source)
         self.assertNotIn('fdtd.set("angle theta"', build_source)
         self.assertIn("addlayerbuilder", build_source)
         self.assertIn('addmaterial("Sampled 3D data")', build_source)
@@ -265,13 +268,13 @@ class LumericalExportTests(unittest.TestCase):
         analysis = assignment_value(notebook, "GRATING_ANALYSIS")
         self.assertEqual(analysis["waveguide_port_name"], "waveguide_in")
         self.assertEqual(analysis["fiber_port_name"], "fiber_out")
-        self.assertEqual(analysis["frequency_points"], 50)
+        self.assertEqual(analysis["frequency_points"], 31)
         settings = assignment_value(notebook, "SETTINGS")
         self.assertEqual(settings["resource_mode"], "GPU")
         self.assertEqual(settings["dt_stability_factor"], 0.99)
         self.assertEqual(settings["pml_profile"], "Standard")
         self.assertEqual(settings["simulation_time_fs"], 2000.0)
-        self.assertEqual(settings["frequency_points"], 50)
+        self.assertEqual(settings["frequency_points"], 31)
         self.assertEqual(settings["build_cpu_threads"], 30)
         self.assertEqual(settings["tfln_crystal_cut"], "X")
         self.assertEqual(settings["tfln_temperature_K"], 296.3)
@@ -303,8 +306,11 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("fiber port to waveguide port", analysis_source)
         self.assertIn("fiber_coupling_db", analysis_source)
         self.assertIn("coupling efficiency [dB]", analysis_source)
+        self.assertIn("lam.fetch(_remote_grating_npz", analysis_source)
+        self.assertIn("display(Image(filename=str(_local_response_png)", analysis_source)
         fetch_source = cell_source_containing(notebook, "REMOTE_ARTIFACTS")
-        self.assertIn("grating_analysis.npz", fetch_source)
+        self.assertNotIn('REMOTE_WORK + "/grating_analysis.npz"', fetch_source)
+        self.assertNotIn('REMOTE_WORK + "/grating_response.png"', fetch_source)
         self.assertIn("geometry_xyz_projections.png", fetch_source)
         self.assertIn("PIRIS_FSP_DIR if remote_path == REMOTE_PROJECT_FILE", fetch_source)
         paths_source = cell_source_containing(notebook, "PIRIS_PROJECT_ROOT =")
@@ -320,6 +326,32 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("file=_ml_sys.stdout", connection_source)
         self.assertIn("Lumerical solver log:", connection_source)
         self.assertIn("lam.show(GEOMETRY_PROJECTIONS_FILE", projection_source)
+
+    def test_official_gc_fast_settings_preserve_exact_domain_and_symmetry(self) -> None:
+        grating = component("GC-SOI")
+        notebook, _warnings = generate_lumerical_notebook(
+            [grating],
+            {
+                "included_layers": [[1, 0], [2, 0]],
+                "material_stack": lumerical.default_stack("SOI grating coupler (Ansys)"),
+                "frequency_points": 31,
+                "official_gc_domain": True,
+                "use_y_antisymmetry": True,
+                "antisymmetry_boundary": "y min",
+            },
+        )
+        settings = assignment_value(notebook, "SETTINGS")
+        self.assertEqual(settings["frequency_points"], 31)
+        self.assertTrue(settings["official_gc_domain"])
+        self.assertTrue(settings["use_y_antisymmetry"])
+        self.assertEqual(settings["antisymmetry_boundary"], "y min")
+        build_source = cell_source_containing(notebook, "REMOTE_MODEL_BUILDER")
+        self.assertIn('SETTINGS.get("official_gc_domain", False)', build_source)
+        self.assertIn('fdtd.set(antisymmetry_boundary + " bc", "Anti-Symmetric")', build_source)
+        solve_source = cell_source_containing(notebook, "_solve_code")
+        self.assertNotIn("Re-save solved project", solve_source)
+        save_source = cell_source_containing(notebook, "REMOTE_RESULTS_SAVER")
+        self.assertIn("Reused the already extracted grating spectrum", save_source)
 
     def test_symmetric_mmi_uses_pre_taper_input_reference_and_two_outputs(self) -> None:
         mmi = component("1x2 MMI")

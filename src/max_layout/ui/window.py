@@ -3573,14 +3573,28 @@ class NativeLayoutWindow(QMainWindow):
                 clicked_component,
             ) if parent_uid is not None else clicked_component
         saved = settings_component.get("lumerical_export_settings", {}) if settings_component else {}
+        if settings_component and settings_component.get("kind") == "GC-SOI" and saved:
+            saved = copy.deepcopy(saved)
+            # Migrate the first compact-domain preset, which cropped the
+            # terminal arc and enabled half-width symmetry by default. Keep
+            # later user-edited bounds untouched.
+            if int(saved.get("gc_domain_version", 0)) < 3:
+                saved.pop("domain_padding_um", None)
+                saved["official_gc_domain"] = True
+                saved["use_y_antisymmetry"] = False
+                saved["gc_domain_version"] = 3
         if settings_component and settings_component.get("kind") == "GC-SOI" and not saved:
             saved = {
                 "stack_preset": "SOI grating coupler (Ansys)",
                 "material_stack": default_stack("SOI grating coupler (Ansys)"),
                 "wavelength_start_um": 1.50,
                 "wavelength_stop_um": 1.60,
+                "frequency_points": 31,
                 "resource_mode": "GPU",
                 "dimension": "3D",
+                "official_gc_domain": True,
+                "use_y_antisymmetry": False,
+                "gc_domain_version": 3,
             }
         dialog = LumericalExportDialog(
             self.components,

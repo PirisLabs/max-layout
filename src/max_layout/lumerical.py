@@ -1078,6 +1078,12 @@ def _add_ports(fdtd, z_center_um, device_top_um, stack_top_um, silica_cladding_t
                 fdtd.set("phi", phi_deg)
             fdtd.set("rotation offset", float(port.get("rotation offset_um", 0.0)) * UM)
         fdtd.set("mode selection", str(port.get("mode", "fundamental TE mode")))
+        if GRATING_ANALYSIS:
+            # Match both ports in the official Ansys 3D grating example.
+            # A single central-frequency profile is reused across the sweep;
+            # otherwise getresult(..., "T") can trigger expensive modal
+            # post-processing at every sampled wavelength.
+            fdtd.set("frequency dependent profile", False)
         # Force the embedded eigensolver to store modal profiles now. Without
         # this step a programmatically created tilted port can finish an FDTD
         # solve yet expose neither S nor expansion results.
@@ -1285,8 +1291,15 @@ def build_simulation():
     # The editor can intentionally shrink the stack into a PML, but sources,
     # ports and monitors must remain strictly inside the solver.  The official
     # grating workflow keeps those sampling planes clear of the boundary.
-    z_min_padding = max(boundary_clearance_um, requested_z_min_padding)
-    z_max_padding = max(boundary_clearance_um, requested_z_max_padding)
+    if bool(SETTINGS.get("official_gc_domain", False)):
+        # The official GC-SOI preset intentionally crops the substrate, top
+        # cladding, input waveguide and output grating at the PML. Preserve the
+        # exact editable bounds selected in the export preview.
+        z_min_padding = requested_z_min_padding
+        z_max_padding = requested_z_max_padding
+    else:
+        z_min_padding = max(boundary_clearance_um, requested_z_min_padding)
+        z_max_padding = max(boundary_clearance_um, requested_z_max_padding)
     if z_min_padding != requested_z_min_padding or z_max_padding != requested_z_max_padding:
         print(
             "Adjusted FDTD Z clearance to keep ports/monitors inside the domain: "
@@ -1303,6 +1316,12 @@ def build_simulation():
     fdtd.set("dt stability factor", dt_stability_factor)
     for boundary_property in ("x min bc", "x max bc", "y min bc", "y max bc", "z min bc", "z max bc"):
         fdtd.set(boundary_property, "PML")
+    antisymmetry_boundary = str(SETTINGS.get("antisymmetry_boundary", "")).strip().lower()
+    if bool(SETTINGS.get("use_y_antisymmetry", False)) and antisymmetry_boundary in {
+        "x min", "x max", "y min", "y max"
+    }:
+        fdtd.set(antisymmetry_boundary + " bc", "Anti-Symmetric")
+        print("Enabled official grating symmetry at the %s boundary." % antisymmetry_boundary.upper())
     pml_profile_name = str(SETTINGS.get("pml_profile", "standard")).strip().lower()
     if pml_profile_name not in {"standard", "stabilized"}:
         raise ValueError("pml_profile must be Standard or Stabilized")
@@ -1327,10 +1346,10 @@ def build_simulation():
         _add_ports(fdtd, device_z_um, device_top_um, stack_top_um, silica_cladding_top_um)
         if PORTS:
             fdtd.select("FDTD::ports")
-            fdtd.set("monitor frequency points", int(SETTINGS.get("frequency_points", 50)))
+            fdtd.set("monitor frequency points", int(SETTINGS.get("frequency_points", 31)))
     _add_monitors(fdtd, device_z_um, device_top_um)
     fdtd.setglobalmonitor("use source limits", True)
-    fdtd.setglobalmonitor("frequency points", int(SETTINGS.get("frequency_points", 50)))
+    fdtd.setglobalmonitor("frequency points", int(SETTINGS.get("frequency_points", 31)))
     model_bounds_um = [
         float(bounds[0]), float(bounds[1]), float(simulation_z_min_um),
         float(bounds[2]), float(bounds[3]), float(simulation_z_max_um),
@@ -1712,7 +1731,10 @@ def _collect_numeric(prefix, value):
 
 
 if SETTINGS.get("run_after_build", False):
-    for port in PORTS:
+    if GRATING_ANALYSIS and isinstance(globals().get("GRATING_RESULT_ARRAYS"), dict):
+        _collect_numeric("grating", GRATING_RESULT_ARRAYS)
+        print("Reused the already extracted grating spectrum for the result bundle.")
+    for port in ([] if GRATING_ANALYSIS and isinstance(globals().get("GRATING_RESULT_ARRAYS"), dict) else PORTS):
         name = str(port.get("name", ""))
         if not name:
             continue
@@ -1774,8 +1796,7 @@ print("Saved result summary:", REMOTE_RESULTS_JSON)
 '''
 
 
-_GRATING_ANALYSIS_REMOTE = r'''# Fiber-to-waveguide grating coupling efficiency.
-import matplotlib.pyplot as plt
+_GRATING_ANALYSIS_REMOTE = r'''# Extract the fiber-to-waveguide spectrum on Lambda.
 
 if not GRATING_ANALYSIS:
     print("No grating coupler was exported; grating analysis is not required.")
@@ -1836,31 +1857,18 @@ else:
         + float(SETTINGS.get("wavelength_stop_um", 1.35))
     ) * 1e-6
 
-    response_png = os.path.join(REMOTE_WORK, "grating_response.png")
-    plt.figure(figsize=(8.5, 4.6))
-    plt.plot(wavelengths_m / 1e-9, fiber_coupling_db, lw=2.0, color="#2563eb")
-    plt.axvline(wavelength_target_m / 1e-9, color="#dc2626", ls="--", lw=1.0)
-    plt.xlabel("wavelength [nm]")
-    plt.ylabel("coupling efficiency [dB]")
-    plt.title("Grating coupler — fiber port to waveguide port")
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(response_png, dpi=160, bbox_inches="tight")
-    plt.close()
-
     analysis_arrays = {
         "wavelength_m": wavelengths_m,
         "fiber_coupling": fiber_coupling,
         "fiber_coupling_db": fiber_coupling_db,
         "target_wavelength_m": np.asarray([wavelength_target_m]),
     }
+    GRATING_RESULT_ARRAYS = analysis_arrays
 
     grating_npz = os.path.join(REMOTE_WORK, "grating_analysis.npz")
     np.savez_compressed(grating_npz, **analysis_arrays)
-    for required_path in (response_png, grating_npz):
-        if not os.path.isfile(required_path) or os.path.getsize(required_path) <= 0:
-            raise RuntimeError("Required grating artifact was not created: " + required_path)
-    print("Saved grating response:", response_png)
+    if not os.path.isfile(grating_npz) or os.path.getsize(grating_npz) <= 0:
+        raise RuntimeError("Required grating artifact was not created: " + grating_npz)
     print("Saved grating analysis:", grating_npz)
 '''
 
@@ -2080,10 +2088,7 @@ REMOTE_ARTIFACTS = [
     REMOTE_WORK + "/max_layout_results.json",
 ]
 if GRATING_ANALYSIS and SETTINGS.get("run_after_build", False):
-    REMOTE_ARTIFACTS.extend([
-        REMOTE_WORK + "/grating_response.png",
-        REMOTE_WORK + "/grating_analysis.npz",
-    ])
+    print("Grating analysis and its locally rendered plot were already fetched by section 9.")
 elif GRATING_ANALYSIS:
     print("Grating plots were not requested because automatic solving is disabled.")
 if MMI_ANALYSIS and SETTINGS.get("run_after_build", False):
@@ -2235,7 +2240,7 @@ def generate_lumerical_notebook(
                     "waveguide_port_name": str(waveguide_receiver_port.get("name", f"gc_receiver_uid_{grating_uid}")),
                     "fiber_port_name": fiber_port_name,
                     "fiber_geometry_name": str(fiber_geometry.get("name", "fiber")),
-                    "frequency_points": 50,
+                    "frequency_points": int(configuration.get("frequency_points", 31)),
                 }
 
     mmi_analysis: dict[str, Any] | None = None
@@ -2384,13 +2389,16 @@ def generate_lumerical_notebook(
         "pml_profile": str(configuration.get("pml_profile", "Standard")).strip().title(),
         "pml_geometry_overlap_um": max(0.0, float(configuration.get("pml_geometry_overlap_um", 1.0))),
         "simulation_time_fs": float(configuration.get("simulation_time_fs", 2000.0)),
-        "frequency_points": int(configuration.get("frequency_points", 50)),
+        "frequency_points": int(configuration.get("frequency_points", 31)),
         "build_cpu_threads": max(1, int(configuration.get("build_cpu_threads", 30))),
         "resource_mode": configuration.get("resource_mode", "GPU"),
         "tfln_crystal_cut": str(configuration.get("tfln_crystal_cut", "X")).strip().upper(),
         "tfln_temperature_K": float(configuration.get("tfln_temperature_K", 296.3)),
         "include_ports": bool(configuration.get("include_ports", True)),
         "hide_cad": bool(configuration.get("hide_cad", False)),
+        "official_gc_domain": bool(configuration.get("official_gc_domain", False)),
+        "use_y_antisymmetry": bool(configuration.get("use_y_antisymmetry", False)),
+        "antisymmetry_boundary": str(configuration.get("antisymmetry_boundary", "")).strip().lower(),
         "run_after_build": bool(configuration.get("run_after_build", False)),
         "project_file": project_file,
     }
@@ -2403,7 +2411,7 @@ def generate_lumerical_notebook(
                 "dt_stability_factor": 0.99,
                 "pml_profile": "Standard",
                 "simulation_time_fs": 2000.0,
-                "frequency_points": 50,
+                "frequency_points": int(configuration.get("frequency_points", 31)),
             }
         )
     if settings["wavelength_stop_um"] <= settings["wavelength_start_um"]:
@@ -2511,7 +2519,7 @@ def generate_lumerical_notebook(
         "    else:\n"
         "        raise ValueError('resource_mode must be GPU or CPU')\n"
         "    solve_remote_checked(_solve_code, label='Max Layout 3D FDTD [' + _resource_mode + ']', timeout=21600)\n"
-        "    run_remote_checked('save_verified_project(); print(\"Simulation finished and project re-saved.\")', 'Re-save solved project', timeout=300)\n"
+        "    print(\"Simulation finished. The solved project is saved once with the numerical result bundle in section 10.\")\n"
         "else:\n"
         "    print(\"Run is disabled. The reviewed pre-solve .fsp is preserved and will still be fetched.\")\n"
     )
@@ -2521,11 +2529,32 @@ def generate_lumerical_notebook(
         "run_remote_checked(REMOTE_RESULTS_SAVER, 'Save project and numerical result bundle', timeout=1800)\n"
     )
     grating_analysis_cell = (
-        "# Plot the grating coupling efficiency before saving/fetching results.\n"
+        "# Extract the small spectrum remotely, then plot it locally without remote Matplotlib startup or PNG transfer.\n"
         f"REMOTE_GRATING_ANALYSIS = {repr(_GRATING_ANALYSIS_REMOTE)}\n"
         "run_remote_checked(REMOTE_GRATING_ANALYSIS, 'Grating coupling-efficiency analysis', timeout=1800)\n"
         "if SETTINGS.get('run_after_build', False):\n"
-        "    lam.show(REMOTE_WORK + '/grating_response.png', width=1000)\n"
+        "    import numpy as np\n"
+        "    import matplotlib.pyplot as plt\n"
+        "    from IPython.display import Image, display\n"
+        "    _remote_grating_npz = REMOTE_WORK + '/grating_analysis.npz'\n"
+        "    _local_grating_npz = PIRIS_RESULTS_DIR / 'grating_analysis.npz'\n"
+        "    lam.fetch(_remote_grating_npz, str(_local_grating_npz))\n"
+        "    with np.load(_local_grating_npz) as _grating_data:\n"
+        "        _wavelength_nm = np.asarray(_grating_data['wavelength_m']) * 1e9\n"
+        "        _coupling_db = np.asarray(_grating_data['fiber_coupling_db'])\n"
+        "        _target_nm = float(np.asarray(_grating_data['target_wavelength_m']).ravel()[0]) * 1e9\n"
+        "    _local_response_png = PIRIS_RESULTS_DIR / 'grating_response.png'\n"
+        "    _figure, _axis = plt.subplots(figsize=(8.5, 4.6))\n"
+        "    _axis.plot(_wavelength_nm, _coupling_db, lw=2.0, color='#2563eb')\n"
+        "    _axis.axvline(_target_nm, color='#dc2626', ls='--', lw=1.0)\n"
+        "    _axis.set(xlabel='wavelength [nm]', ylabel='coupling efficiency [dB]', title='Grating coupler — fiber port to waveguide port')\n"
+        "    _axis.grid(alpha=0.3)\n"
+        "    _figure.tight_layout()\n"
+        "    _figure.savefig(_local_response_png, dpi=160, bbox_inches='tight')\n"
+        "    plt.close(_figure)\n"
+        "    display(Image(filename=str(_local_response_png), width=1000))\n"
+        "    print('saved ->', _local_grating_npz)\n"
+        "    print('saved ->', _local_response_png)\n"
     )
     mmi_analysis_cell = (
         "# Plot the symmetric MMI splitting ratio and longitudinal fundamental-mode field.\n"

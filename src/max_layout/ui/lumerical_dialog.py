@@ -6,6 +6,7 @@ from copy import deepcopy
 import math
 from typing import Any
 
+import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QBrush, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
@@ -1051,6 +1052,8 @@ class LumericalExportDialog(QDialog):
         self.xy_padding = self.domain_padding_spins["x_min"]
         self.z_padding = self.domain_padding_spins["z_min"]
         self.mesh_accuracy = QSpinBox(); self.mesh_accuracy.setRange(1, 8); self.mesh_accuracy.setValue(int(self.saved.get("mesh_accuracy", 2)))
+        self.frequency_points = QSpinBox(); self.frequency_points.setRange(3, 10001); self.frequency_points.setValue(int(self.saved.get("frequency_points", 31)))
+        self.frequency_points.setToolTip("31 samples is the quick grating-coupler default. Increase this only for a final high-resolution spectrum.")
         self.dt_stability = QDoubleSpinBox(); self.dt_stability.setRange(0.1, 0.99); self.dt_stability.setDecimals(3); self.dt_stability.setSingleStep(0.05); self.dt_stability.setValue(float(self.saved.get("dt_stability_factor", 0.99)))
         self.pml_profile = QComboBox(); self.pml_profile.addItems(["Standard", "Stabilized"]); self.pml_profile.setCurrentText(str(self.saved.get("pml_profile", "Standard")).title())
         self.simulation_time = QDoubleSpinBox(); self.simulation_time.setRange(1, 1e9); self.simulation_time.setDecimals(3); self.simulation_time.setValue(float(self.saved.get("simulation_time_fs", 2000.0)))
@@ -1064,6 +1067,16 @@ class LumericalExportDialog(QDialog):
         self.project_file = QLineEdit(str(self.saved.get("project_file", "exported_component.fsp")))
         self.hide_cad = QCheckBox("Start Lumerical without showing the CAD window"); self.hide_cad.setChecked(bool(self.saved.get("hide_cad", False)))
         self.run_after_build = QCheckBox("Run automatically after building and saving the .fsp project"); self.run_after_build.setChecked(bool(self.saved.get("run_after_build", True)))
+        self.official_gc_domain = QCheckBox("Use compact official Ansys GC-SOI FDTD settings")
+        self.official_gc_domain.setChecked(bool(self.saved.get("official_gc_domain", False)))
+        self.official_gc_domain.setToolTip(
+            "Keeps manually typed/draggable bounds, permits the grating and waveguide to cross the PML, and uses the official boundary setup."
+        )
+        self.use_y_antisymmetry = QCheckBox("Use Y=0 anti-symmetry for a symmetric grating")
+        self.use_y_antisymmetry.setChecked(bool(self.saved.get("use_y_antisymmetry", False)))
+        self.use_y_antisymmetry.setToolTip(
+            "Cuts the simulated grating width in half. Turn this off if the geometry, fiber placement, or material stack is not symmetric about local Y=0."
+        )
         form.addRow("Wavelength start (µm)", self.wavelength_start)
         form.addRow("Wavelength stop (µm)", self.wavelength_stop)
         form.addRow("X-min signed offset", self.domain_padding_spins["x_min"])
@@ -1073,6 +1086,7 @@ class LumericalExportDialog(QDialog):
         form.addRow("Z-min signed offset", self.domain_padding_spins["z_min"])
         form.addRow("Z-max signed offset", self.domain_padding_spins["z_max"])
         form.addRow("Mesh accuracy", self.mesh_accuracy)
+        form.addRow("Wavelength samples", self.frequency_points)
         form.addRow("Time-step stability factor", self.dt_stability)
         form.addRow("PML profile", self.pml_profile)
         form.addRow("Simulation time (fs)", self.simulation_time)
@@ -1083,6 +1097,8 @@ class LumericalExportDialog(QDialog):
         form.addRow("TFLN temperature", self.tfln_temperature)
         form.addRow("Lumerical project file", self.project_file)
         form.addRow(self.hide_cad)
+        form.addRow(self.official_gc_domain)
+        form.addRow(self.use_y_antisymmetry)
         form.addRow(self.run_after_build)
         resource_note = QLabel(
             "GPU is the default for every 3D simulation. The notebook detects the GPU, sets its SM licence estimate, "
@@ -1272,11 +1288,12 @@ class LumericalExportDialog(QDialog):
         top = QHBoxLayout()
         self.preview_plane = QComboBox(); self.preview_plane.addItems(["XZ", "YZ"])
         reset_button = QPushButton("Reset domain clearances to λ/4")
+        official_gc_button = QPushButton("Apply fast GC-SOI domain")
         fit_preview_button = QPushButton("Fit preview")
         show_3d_button = QPushButton("Show me a 3D version of the file I have built")
         show_3d_button.setMinimumHeight(44)
         top.addWidget(QLabel("Cross-section plane")); top.addWidget(self.preview_plane)
-        top.addStretch(1); top.addWidget(fit_preview_button); top.addWidget(reset_button); top.addWidget(show_3d_button)
+        top.addStretch(1); top.addWidget(fit_preview_button); top.addWidget(reset_button); top.addWidget(official_gc_button); top.addWidget(show_3d_button)
         layout.addLayout(top)
         self.cross_section_preview = CrossSectionDomainPreview(self)
         layout.addWidget(self.cross_section_preview, 1)
@@ -1308,6 +1325,82 @@ class LumericalExportDialog(QDialog):
         def reset_domain() -> None:
             quarter_wave = 0.25 * min(self.wavelength_start.value(), self.wavelength_stop.value())
             for spin in self.domain_padding_spins.values(): spin.setValue(quarter_wave)
+
+        def apply_official_gc_domain() -> None:
+            """Place the editable FDTD box like the official 3D SOI example."""
+            grating = next(
+                (component for component in self._preview_components() if str(component.get("kind", "")) == "GC-SOI"),
+                None,
+            )
+            if grating is None:
+                return
+            theta = math.radians(float(grating.get("orientation_deg", 0.0)))
+            cosine, sine = math.cos(theta), math.sin(theta)
+            mirrored = bool(grating.get("mirrored", False))
+            local_y_min = 0.0 if self.use_y_antisymmetry.isChecked() else -10.0
+            local_y_max = 10.0
+            # Keep the manually shifted waveguide port 2 um inside X-min. The
+            # input waveguide crosses only the left PML; the complete output
+            # grating, including its thick terminal arc, remains at least
+            # lambda/4 inside the right boundary.
+            local_x_max = 51.0
+            try:
+                grating_polygons, _ = component_geometry_arrays(grating)
+                origin = np.asarray(
+                    [float(grating.get("x", 0.0)), float(grating.get("y", 0.0))],
+                    dtype=float,
+                )
+                local_x_values: list[float] = []
+                local_y_values: list[float] = []
+                mirror_sign = -1.0 if mirrored else 1.0
+                for points, _layer, _datatype in grating_polygons:
+                    points_array = np.asarray(points, dtype=float)
+                    delta_x = points_array[:, 0] - origin[0]
+                    delta_y = points_array[:, 1] - origin[1]
+                    local_x_values.extend((delta_x * cosine + delta_y * sine).tolist())
+                    local_y_values.extend((mirror_sign * (-delta_x * sine + delta_y * cosine)).tolist())
+                quarter_wave = 0.25 * min(self.wavelength_start.value(), self.wavelength_stop.value())
+                local_x_max = max(local_x_values) + quarter_wave
+                local_y_max = max(local_y_values) + quarter_wave
+                if not self.use_y_antisymmetry.isChecked():
+                    local_y_min = min(local_y_values) - quarter_wave
+            except Exception:
+                pass
+            local_corners = (
+                (0.0, local_y_min), (0.0, local_y_max),
+                (local_x_max, local_y_min), (local_x_max, local_y_max),
+            )
+            transformed = []
+            for local_x, local_y in local_corners:
+                if mirrored:
+                    local_y = -local_y
+                transformed.append(
+                    (
+                        float(grating.get("x", 0.0)) + local_x * cosine - local_y * sine,
+                        float(grating.get("y", 0.0)) + local_x * sine + local_y * cosine,
+                    )
+                )
+            state = self.preview_state()
+            geometry_ranges = [
+                (z0, z1) for row, z0, z1 in state["stack_ranges"]
+                if str(row.get("role", "background")) == "geometry"
+            ]
+            device_base = min((z0 for z0, _z1 in geometry_ranges), default=0.0)
+            exact = {
+                "x_min": min(point[0] for point in transformed),
+                "x_max": max(point[0] for point in transformed),
+                "y_min": min(point[1] for point in transformed),
+                "y_max": max(point[1] for point in transformed),
+                "z_min": device_base - 1.2,
+                "z_max": device_base + 1.3,
+            }
+            for key, value in exact.items():
+                base = state["z_base"] if key.startswith("z_") else state[key[0] + "_base"]
+                padding = float(base[0]) - value if key.endswith("_min") else value - float(base[1])
+                self.domain_padding_spins[key].setValue(padding)
+            self.official_gc_domain.setChecked(True)
+            self._sync_domain_bounds()
+            self.cross_section_preview.reset_view()
 
         def show_3d() -> None:
             preview_dialog = QDialog(self)
@@ -1365,6 +1458,7 @@ class LumericalExportDialog(QDialog):
             preview_dialog.exec()
 
         reset_button.clicked.connect(reset_domain)
+        official_gc_button.clicked.connect(apply_official_gc_domain)
         fit_preview_button.clicked.connect(self.cross_section_preview.reset_view)
         show_3d_button.clicked.connect(show_3d)
         self.preview_plane.currentTextChanged.connect(lambda *_: self.cross_section_preview.reset_view())
@@ -1376,6 +1470,8 @@ class LumericalExportDialog(QDialog):
         for spin in self.domain_padding_spins.values(): spin.valueChanged.connect(self._refresh_previews)
         self._connect_stack_preview_signals()
         self._sync_domain_bounds()
+        if self.official_gc_domain.isChecked() and not self.saved.get("domain_padding_um"):
+            apply_official_gc_domain()
 
     def configuration(self) -> dict[str, Any]:
         included_layers = []
@@ -1390,6 +1486,20 @@ class LumericalExportDialog(QDialog):
             domain_max = base_max + state["padding"][axis + "_max"]
             if domain_max <= domain_min:
                 raise ValueError(f"FDTD {axis.upper()} max must be greater than {axis.upper()} min.")
+        symmetry_boundary = ""
+        if self.use_y_antisymmetry.isChecked():
+            grating = next(
+                (component for component in self._preview_components() if str(component.get("kind", "")) == "GC-SOI"),
+                None,
+            )
+            if grating is not None:
+                theta = math.radians(float(grating.get("orientation_deg", 0.0)))
+                sign = -1.0 if bool(grating.get("mirrored", False)) else 1.0
+                normal_x, normal_y = -sign * math.sin(theta), sign * math.cos(theta)
+                if abs(normal_x) > abs(normal_y):
+                    symmetry_boundary = "x min" if normal_x > 0.0 else "x max"
+                else:
+                    symmetry_boundary = "y min" if normal_y > 0.0 else "y max"
         return {
             "scope_uids": [int(uid) for uid in (self.scope.currentData() or [])],
             "scope_label": self.scope.currentText(),
@@ -1403,6 +1513,7 @@ class LumericalExportDialog(QDialog):
             "z_padding_um": self.z_padding.value(),
             "domain_padding_um": {key: spin.value() for key, spin in self.domain_padding_spins.items()},
             "mesh_accuracy": self.mesh_accuracy.value(),
+            "frequency_points": self.frequency_points.value(),
             "dt_stability_factor": self.dt_stability.value(),
             "pml_profile": self.pml_profile.currentText(),
             "pml_geometry_overlap_um": self.pml_geometry_overlap.value(),
@@ -1413,5 +1524,9 @@ class LumericalExportDialog(QDialog):
             "tfln_temperature_K": self.tfln_temperature.value(),
             "project_file": self.project_file.text().strip() or "exported_component.fsp",
             "hide_cad": self.hide_cad.isChecked(),
+            "official_gc_domain": self.official_gc_domain.isChecked(),
+            "use_y_antisymmetry": self.use_y_antisymmetry.isChecked(),
+            "antisymmetry_boundary": symmetry_boundary,
+            "gc_domain_version": 3,
             "run_after_build": self.run_after_build.isChecked(),
         }
