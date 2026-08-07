@@ -63,7 +63,7 @@ def resize_component_parameters(
         "Loopback mirror": ("Lc", "s_bend_length"),
         "Feedline": ("input_straight_length", "s_bend_length", "Lc", "output_straight_length"),
         "Ring + feedline": ("input_straight_length", "s_bend_length", "Lc", "output_straight_length", "resonator_spacing"),
-        "Racetrack + feedline": ("input_straight_length", "s_bend_length", "Lc", "output_straight_length", "resonator_spacing", "racetrack_coupling_length"),
+        "Racetrack + feedline": ("input_straight_length", "s_bend_length", "Lc", "output_straight_length", "resonator_spacing", "racetrack_length"),
     }
     y_names: dict[str, tuple[str, ...]] = {
         "Straight": ("width",),

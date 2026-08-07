@@ -13,9 +13,9 @@ import numpy as np
 
 from PySide6.QtCore import QLineF, QPoint, QPointF, QRectF, QTimer, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF, QWheelEvent
-from PySide6.QtWidgets import QFrame, QGraphicsEllipseItem, QGraphicsItem, QGraphicsItemGroup, QGraphicsObject, QGraphicsPathItem, QGraphicsRectItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QWidget
+from PySide6.QtWidgets import QFrame, QGraphicsEllipseItem, QGraphicsItem, QGraphicsItemGroup, QGraphicsLineItem, QGraphicsObject, QGraphicsPathItem, QGraphicsRectItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QWidget
 
-from ..constants import EBEAM_LAYER
+from ..constants import EBEAM_LAYER, SIMULATION_COMPONENT_KINDS, SIMULATION_LAYER
 from ..gds.build import _add_component_geometry_to_cell, _canonicalize_component_layers
 from ..gds.ebeam import multipass_field_layout
 from ..geometry.transforms import scene_to_world_point
@@ -35,6 +35,9 @@ _PREVIEW_GEOMETRY_CACHE_LIMIT = 2048
 _PREVIEW_PATH_CACHE_LIMIT = 512
 
 _PREVIEW_MAX_VERTICES = max(32, int(os.environ.get("MAX_LAYOUT_PREVIEW_MAX_VERTICES", "256")))
+# Beyond this extent an item paints directly instead of through Qt's device-coordinate
+# raster cache; see ComponentGraphicsItem.apply_cache_mode.
+_DIRECT_PAINT_EXTENT_UM = float(os.environ.get("MAX_LAYOUT_DIRECT_PAINT_EXTENT_UM", "1200"))
 _PREVIEW_MAX_POLYGONS_PER_LAYER = max(100, int(os.environ.get("MAX_LAYOUT_PREVIEW_MAX_POLYGONS_PER_LAYER", "500")))
 
 
@@ -128,6 +131,45 @@ def component_preview_cache_key(component: dict[str, Any]) -> str:
 def component_local_polygons(component: dict[str, Any]) -> list[tuple[np.ndarray, int, int]]:
     if component.get("kind") == "E-beam multipass":
         return []
+    if component.get("kind") in SIMULATION_COMPONENT_KINDS:
+        kind = str(component.get("kind"))
+        params = component.get("params", {})
+        span = max(0.001, float(params.get("span_um", 2.0)))
+        if kind in {"Fiber geometry", "Fiber port"}:
+            radius = max(0.001, 0.5 * float(params.get("cladding diameter_um", span)))
+            angles = np.linspace(0.0, 2.0 * math.pi, 97, endpoint=False)
+            points = np.column_stack((radius * np.cos(angles), radius * np.sin(angles)))
+        else:
+            distance = float(params.get("distance_um", 0.0))
+            geometry = str(params.get("port geometry", params.get("monitor geometry", "surface"))).lower()
+            thickness = max(0.08, min(1.0 if geometry == "surface" else 0.15, span / 10.0))
+            plane_normal = str(params.get("plane normal", "X")).upper()
+            x_span = max(0.0, float(params.get("x span", span if plane_normal != "X" else 0.0)))
+            y_span = max(0.0, float(params.get("y span", span if plane_normal != "Y" else 0.0)))
+            transverse_span = max(x_span, y_span, span)
+            if plane_normal == "Z":
+                width = max(thickness, x_span or transverse_span)
+                height = max(thickness, y_span or transverse_span)
+                points = np.array(
+                    [[-width / 2.0, -height / 2.0], [width / 2.0, -height / 2.0],
+                     [width / 2.0, height / 2.0], [-width / 2.0, height / 2.0]],
+                    dtype=float,
+                )
+            elif plane_normal == "Y":
+                width = max(thickness, x_span or transverse_span)
+                points = np.array(
+                    [[-width / 2.0, distance - thickness / 2.0], [width / 2.0, distance - thickness / 2.0],
+                     [width / 2.0, distance + thickness / 2.0], [-width / 2.0, distance + thickness / 2.0]],
+                    dtype=float,
+                )
+            else:
+                height = max(thickness, y_span or transverse_span)
+                points = np.array(
+                    [[distance - thickness / 2.0, -height / 2.0], [distance + thickness / 2.0, -height / 2.0],
+                     [distance + thickness / 2.0, height / 2.0], [distance - thickness / 2.0, height / 2.0]],
+                    dtype=float,
+                )
+        return [(points, SIMULATION_LAYER, 0)]
     local = safe_json_copy(component)
     local["x"] = 0.0
     local["y"] = 0.0
@@ -188,9 +230,20 @@ def component_layer_paths(
         if component.get("kind") == "Boolean geometry" and len(points) > 2000:
             stride = max(1, math.ceil(len(points) / 2000))
             preview_points = points[::stride]
-        polygon = QPolygonF([QPointF(float(x), -float(y)) for x, y in preview_points])
+        # Every polygon on a layer shares one path, and adjoining sections of a device overlap
+        # at their joints (straight into S-bend into taper into grating).  Under Qt's default
+        # odd-even rule those overlaps cancel and render as holes, which is why a feedline used
+        # to look wrong on canvas while its GDS was correct.  Winding fill unions them instead,
+        # but only when the contours share an orientation, and some builders emit a mix of both
+        # -- so normalise to counter-clockwise here.  Preview only; exported geometry is untouched.
+        x = preview_points[:, 0]
+        y = preview_points[:, 1]
+        if float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) < 0.0:
+            preview_points = preview_points[::-1]
+        polygon = QPolygonF([QPointF(float(px), -float(py)) for px, py in preview_points])
         key = (int(layer), int(datatype))
         path = layer_paths.setdefault(key, QPainterPath())
+        path.setFillRule(Qt.FillRule.WindingFill)
         path.addPolygon(polygon)
         path.closeSubpath()
     _PREVIEW_PATH_CACHE[cache_key] = layer_paths
@@ -508,18 +561,27 @@ class ComponentGraphicsItem(QGraphicsItemGroup):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsFocusable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
-        # A generated test block can span many thousands of microns.  Qt's
-        # device-coordinate cache turns that complete extent into one raster
-        # when selection handles appear, which can exceed the raster engine's
-        # 32,767-pixel limit and crash on mouse release.  The shared painter
-        # paths already provide the useful cache for these composite items.
-        if component.get("kind") in {"RF test block", "Photonic test block"}:
-            self.setCacheMode(QGraphicsItem.CacheMode.NoCache)
-        else:
-            self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+        self.setCacheMode(QGraphicsItem.CacheMode.NoCache)
         self.setZValue(10)
         self.rebuild_geometry()
         self.sync_transform()
+
+    def apply_cache_mode(self) -> None:
+        """Pick the cache mode from the item's real extent, not from its kind.
+
+        Qt's device-coordinate cache rasterises the whole item extent into one pixmap.  Past a
+        few thousand microns that raster approaches the engine's 32,767-pixel limit, and the item
+        draws wrong or not at all -- a default feedline is already 3383 um long, and a test block
+        far more.  Long, thin devices are exactly the case where the raster also loses a 1.2 um
+        waveguide entirely.  The shared painter paths are the cache that actually matters here,
+        so anything large simply paints directly.
+        """
+        rect = self.geometry_bounds
+        extent = max(abs(rect.width()), abs(rect.height()))
+        large = extent > _DIRECT_PAINT_EXTENT_UM or self.component.get("kind") in {"RF test block", "Photonic test block"}
+        self.setCacheMode(
+            QGraphicsItem.CacheMode.NoCache if large else QGraphicsItem.CacheMode.DeviceCoordinateCache
+        )
 
     def rebuild_geometry(self) -> None:
         for child in list(self.childItems()):
@@ -565,13 +627,21 @@ class ComponentGraphicsItem(QGraphicsItemGroup):
             bounds = child.rect()
 
         self.geometry_bounds = bounds or QRectF(-15, -10, 30, 20)
+        self.apply_cache_mode()
         self.add_port_markers()
-        self.add_resize_handles()
+        if self.component.get("kind") not in SIMULATION_COMPONENT_KINDS:
+            self.add_resize_handles()
         self.set_handles_visible(self.isSelected())
-        self.setToolTip(
-            f"{self.component.get('kind')}\nUID {self.uid}\n"
-            f"Layer map: 1 WG, 2 GC, 3 Marker, 4 RF, 5 Probe, 6 Ebeam"
-        )
+        if self.component.get("kind") in SIMULATION_COMPONENT_KINDS:
+            self.setToolTip(
+                f"{self.component.get('kind')}\nUID {self.uid}\n"
+                "Simulation-only object — exported to Lumerical notebooks, never to GDS"
+            )
+        else:
+            self.setToolTip(
+                f"{self.component.get('kind')}\nUID {self.uid}\n"
+                f"Layer map: 1 WG, 2 GC, 3 Marker, 4 RF, 5 Probe, 6 Ebeam"
+            )
 
     def add_port_markers(self) -> None:
         try:
@@ -651,7 +721,7 @@ class ComponentGraphicsItem(QGraphicsItemGroup):
         self.component["attachment"] = None
         if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             group_id = self.component.get("group_id")
-            if group_id:
+            if group_id and self.component.get("kind") not in SIMULATION_COMPONENT_KINDS:
                 self.main_window.select_group(str(group_id))
         super().mousePressEvent(event)
 
@@ -692,6 +762,10 @@ class ComponentGraphicsItem(QGraphicsItemGroup):
         press_scene_position: QPointF | None,
     ) -> None:
         try:
+            if moved and self.component.get("kind") in SIMULATION_COMPONENT_KINDS:
+                # A port/monitor/fiber dragged by hand remains part of the
+                # export group but no longer snaps back to its starter point.
+                self.component["auto_placed"] = False
             self.main_window.move_group_with_primary(self)
             if moved:
                 self.main_window.snap_component_after_move(self.uid)

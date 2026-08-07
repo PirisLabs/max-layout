@@ -7,6 +7,7 @@ import math
 
 import numpy as np
 
+from .constants import SIMULATION_COMPONENT_KINDS
 from .geometry.euler import euler_output_local, grating_route_bend_angle, mmi_gc_fanout_local_points, routed_gc_local_endpoint, three_euler_inward_gc_endpoint
 from .geometry.landmarks import cpw_bend_landmarks, feedline_landmarks, loopback_landmarks, resonator_x_positions, ring_two_feedline_landmarks, segmented_electrode_landmarks
 from .geometry.rf_taper import gap_profile, symmetric_cpw_taper_profile
@@ -349,7 +350,7 @@ def component_local_ports(component: dict[str, Any]) -> dict[str, dict[str, Any]
         add("center",(0.0,0.0),0.0,"alignment")
     elif kind in {"Ring", "Elliptical ring", "Racetrack", "Text / Number", "Square mark", "Cross mark", "Pointy cross mark", "Cross + squares mark", "Vernier mark"}:
         add("center",(0,0),0,"alignment")
-    elif kind in {"Chip outline", "E-beam multipass"}:
+    elif kind in {"Chip outline", "E-beam multipass"} or kind in SIMULATION_COMPONENT_KINDS:
         add("center",(0.0,0.0),0.0,"alignment")
     else:
         raise ValueError(f"Unsupported component type: {kind}")

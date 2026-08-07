@@ -157,10 +157,111 @@ Raise the thread count at **Layout → Performance / CPU Threads…**, or set
   standard components rather than exporting noisy freehand paths.
 - Persistent User modules created from right-clicked geometry.
 - Port snapping, arrays, grouping, rotation, mirroring, ruler, layers, and labels.
+- Right-click Lumerical notebook export for a component, the current selection,
+  a complete group/module/array, or the entire layout. Exported notebooks embed
+  polygon geometry directly, so no GDS sidecar is required.
+- A dedicated **Ports & monitors** section in the left component library with
+  movable standard FDTD ports, a separate Ansys tilted fiber core/cladding geometry group, power monitors, mode-expansion
+  monitors, and field-profile monitors. Port data uses the
+  Lumerical compact-model names `name`, `dir`, `loc`, `pos`, and `order`; port
+  footprints are visible in the editor but are never written to GDS. Common
+  waveguides, tapers, bends, and MMIs receive movable endpoint starter ports.
+  A grating coupler also receives its waveguide port, separate fiber geometry,
+  and fiber-axis FDTD port; every starter object remains editable/removable.
+- Editable bottom-to-top TFLN, SOI, Al2O3, SiO2, silicon, and metal material
+  stacks with a named exported cross-section, etch depth, and waveguide
+  sidewall angle. Top cladding rows can be conformal so SiO2 fills etched gaps
+  before covering the device. A zero thickness disables that material.
+  Generated 3D FDTD notebooks use GPU execution by default.
 - E-beam write-field creation and GDS, project JSON, FTEXT, and field export.
 - CPU thread control and optional OpenGL canvas acceleration.
 - Cached component geometry and layer-batched rendering for fast generation of
   repeated arrays and large photonic-crystal structures.
+
+## Lumerical simulation notebooks
+
+Open **Ports & monitors** in the left component library, then double-click or
+use **Add selected component** to place a waveguide FDTD port, a separate fiber
+core/cladding geometry group, a standard Z-axis FDTD port through that fiber,
+power monitor, mode-expansion monitor, or field-profile monitor. These objects
+move and rotate like normal layout geometry and expose their position, span,
+offset distance, mode, and fiber-port settings in the Properties panel.
+X-normal objects appear as vertical lines in the top view, Y-normal objects as
+horizontal lines, and Z-normal objects as top-view areas. Surface monitors use
+explicit x/y/z spans with the normal-axis dimension set to zero.
+They are saved in the project but omitted from every GDS export.
+
+Right-click a component on the canvas or in the project tree and open
+**Lumerical simulation** to export it. The first geometry choice includes the
+clicked component together with the placed ports and monitors; selection,
+group/module/array, component-only, and entire-layout choices remain available.
+When a standalone port or monitor is right-clicked, the first choice instead
+uses the nearest physical device plus all placed simulation objects. A
+port/monitor-only choice remains available for setup inspection, but is clearly
+marked as containing no device geometry.
+
+Choose **Export simulation notebook** to select the geometry scope, GDS layers,
+material stack, film thicknesses, etch depths, wavelengths, mesh, padding, and compute resource. The `.ipynb`
+contains the geometry, the exact compact-model `PORTS_JSON` mapping, the lumapi
+loader, 3D FDTD construction, verified `.fsp` saving, GPU discovery/system checks, and an
+optional run cell (enabled by default for new exports). Every simulation export is
+strictly 3D; there is no 2D solver option. Before solving, every generated notebook—including
+waveguides, tapers, MMIs, coplanar waveguides, gratings, groups, and complete layouts—displays
+an `XY` top view, `XZ` side view, and `YZ` end view built from the exact embedded polygons,
+films, etch depths, and sidewall angles sent to Lumerical. The combined verification image is
+also saved with the results.
+
+The default TFLN stack is 2 µm silicon, 5 µm SiO2 BOX, 400 nm TFLN with a
+200 nm etch, 1 µm conformal SiO2 cladding, and 1 µm top Air. The export window
+includes Air in the material list, a live XZ/YZ process-stack cross-section,
+corner/edge dragging, and exact numeric X-min/X-max/Y-min/Y-max/Z-min/Z-max
+FDTD boundaries. The cross-section camera stays locked while those boundaries
+move, so the fixed stack/device geometry no longer appears to resize; **Fit
+preview** explicitly reframes it when requested. Dragging inside the red box
+translates its center in XZ/YZ without resizing; signed boundary offsets allow
+any boundary to sit inside Air or another layer. Domain edits never modify the physical polygon dimensions.
+A **Show me a 3D version of the file I have built** button opens
+an interactive pre-export view of the exact polygons, stack, ports, separate
+fiber geometry, material-colored layer faces, a material-name legend, and the
+FDTD wireframe. It supports orbit, pan, wheel zoom, and independent visibility
+checkboxes for device geometry, ports, fiber, the FDTD box, and every individual
+active material-stack layer. Materials are rendered as colored volumes between
+their lower and upper planes, including slab faces and patterned sidewalls,
+rather than as colored top planes only. Very thick first/last background layers are
+cropped by the chosen domain and continue through the PML.
+
+Every generated notebook follows the Piris Lambda licence
+lifecycle: seed Shared Web, roam three HPC Packs, build/run, save and fetch all
+results, close FDTD, check the packs back in, then close the remote session.
+Remote build, solve, analysis, and save stages are checked explicitly so a hidden remote
+traceback cannot turn into misleading missing-file messages at the end.
+Grating-coupler exports use only standard waveguide and Z-axis FDTD ports,
+with the Z-axis port passing through a separate 7° fiber geometry group. The
+starter fiber axis is placed on the grating side after the complete taper using
+the editable **Fiber offset after taper toward grating (µm)** parameter (5 µm by default).
+The standalone grating straight lead defaults to 5 µm, and its waveguide FDTD
+port defaults to 3 µm inward from the external lead end using the editable
+**FDTD port offset from waveguide end (µm)** parameter.
+The export centers the upward exit monitor near that port,
+record fiber coupling efficiency in dB versus wavelength, and save the natural
+3D far-field radiation pattern in polar coordinates with its peak exit angles.
+There is no synthetic “fiber port” object: the notebook creates the core/cladding
+structure group and the standard FDTD port independently, matching the Ansys example. The FDTD
+region keeps at least a quarter-wavelength clearance from ordinary device
+features, while substrate/top-cladding films and ported waveguide continuations
+extend through their PML boundaries as in the official Ansys example. New
+component exports default to 2 µm transverse clearance, placing endpoint ports
+2 µm from the matching PML boundary. Ported waveguides and the outer material
+stack continue 1 µm beyond the FDTD boundaries by default on X, Y, top, and
+bottom; **Geometry overlap beyond FDTD boundary** makes this editable. Exported cross-section rows use
+Lumerical Layer Builder so
+their sidewall angles are physical, rather than just notebook metadata.
+New simulations default to a 1.25–1.35 µm wavelength sweep. Automatic starter
+ports can be dragged independently in the top-view editor; doing so detaches
+their automatic position without removing them from the component export group.
+Material rows are ordered bottom-to-top; rows with a thickness of `0 µm` are
+intentionally skipped. TFLN is created as a dispersive anisotropic sampled
+material from the Zelmon/Moretti model with editable crystal cut and temperature.
 
 ## Optional AI assistant
 

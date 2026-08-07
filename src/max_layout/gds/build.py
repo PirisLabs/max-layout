@@ -11,7 +11,7 @@ import gdstk
 import numpy as np
 
 from ..backend import backend
-from ..constants import DEFAULT_COMPONENT_VALUES, DEFAULT_DATATYPE, EBEAM_LAYER, GC_COMPOSITE_KINDS, GC_LAYER, MARKER_COMPONENT_KINDS, MARKER_LAYER, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER
+from ..constants import DEFAULT_COMPONENT_VALUES, DEFAULT_DATATYPE, EBEAM_LAYER, GC_COMPOSITE_KINDS, GC_LAYER, MARKER_COMPONENT_KINDS, MARKER_LAYER, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, SIMULATION_COMPONENT_KINDS
 from ..gds.couplers import add_parent_focusing_gc, add_routed_parent_gc, add_three_euler_inward_gc
 from ..gds.ebeam import add_ebeam_field_outline, add_ebeam_parameter_text, add_write_field_number, multipass_field_layout
 from ..gds.primitives import add_rect, copy_cell_polygons_to_top
@@ -172,6 +172,82 @@ def add_ring_to_gds(top: gdstk.Cell, ring_center_local: tuple[float, float], rad
     top.add(_transform_polygon(ring, component_center, orientation))
 
 
+def euler_bend_centerline(radius: float, bend_angle_deg: float, samples: int = 4001) -> tuple[np.ndarray, float]:
+    """Centerline of a full-Euler bend, plus its arc length.
+
+    Curvature ramps linearly 0 -> 1/radius -> 0, so the total turn is s/(2*radius) and the arc
+    length of a bend through ``theta`` is ``2*radius*theta``.  Reproduces the backend Euler bend
+    endpoint to under a picometre, so a racetrack built here matches an Euler-bend component.
+    """
+    theta = math.radians(float(bend_angle_deg)); radius = float(radius)
+    if radius <= 0.0 or theta <= 0.0:
+        raise ValueError("Euler bend needs a positive radius and angle.")
+    arc = 2.0 * radius * theta
+    s = np.linspace(0.0, arc, max(101, int(samples)))
+    half = arc / 2.0
+    phi = np.where(s <= half, (1.0 / radius / arc) * s ** 2, theta - (1.0 / radius / arc) * (arc - s) ** 2)
+    step = np.diff(s); mid = (phi[:-1] + phi[1:]) / 2.0
+    x = np.concatenate(([0.0], np.cumsum(step * np.cos(mid))))
+    y = np.concatenate(([0.0], np.cumsum(step * np.sin(mid))))
+    return np.column_stack((x, y)), arc
+
+
+def euler_racetrack_metrics(total_length: float, radius: float, samples: int = 4001) -> tuple[float, float, float]:
+    """(straight length per side, one 180 bend arc, bend offset) for a total round-trip length."""
+    bend, arc = euler_bend_centerline(radius, 180.0, samples)
+    straight = float(total_length) / 2.0 - arc
+    if straight < 0.0:
+        raise ValueError(
+            f"Racetrack total length {float(total_length):g} um is shorter than its two Euler bends "
+            f"({2.0 * arc:.3f} um at R_eff {float(radius):g} um); increase the length or reduce R_eff."
+        )
+    return straight, arc, float(bend[-1][1])
+
+
+def add_euler_racetrack_to_gds(top: gdstk.Cell, race_center_local: tuple[float, float], total_length: float, radius: float, width: float, component_center: tuple[float, float], orientation: float, layer: int, datatype: int, samples: int = 4001) -> float:
+    """Closed racetrack with full-Euler 180 bends; returns the straight (coupling) length."""
+    straight, arc, height = euler_racetrack_metrics(total_length, radius, samples)
+    if width <= 0.0:
+        raise ValueError("Racetrack width must be positive.")
+    bend, _ = euler_bend_centerline(radius, 180.0, samples)
+    right = bend.copy()                                   # heading +x, turning up
+    left = np.column_stack((-bend[:, 0], -bend[:, 1]))    # same bend rotated 180
+    half_s = straight / 2.0; half_h = height / 2.0
+    loop = [np.array([[-half_s, -half_h], [half_s, -half_h]], float),
+            right + np.array([half_s, -half_h]),
+            np.array([[half_s, half_h], [-half_s, half_h]], float),
+            left + np.array([-half_s, half_h])]
+    centerline = np.vstack(loop)
+    keep = np.concatenate(([True], np.linalg.norm(np.diff(centerline, axis=0), axis=1) > 1e-9))
+    centerline = centerline[keep]
+    # The loop closes on itself, so the final point repeats the first.  Left in place it forms a
+    # zero-length segment at the seam whose normal is undefined, and the offset curves it produces
+    # are degenerate enough that the boolean returns nothing.
+    if len(centerline) > 1 and np.linalg.norm(centerline[0] - centerline[-1]) <= 1e-9:
+        centerline = centerline[:-1]
+    forward = np.roll(centerline, -1, axis=0) - np.roll(centerline, 1, axis=0)
+    norms = np.linalg.norm(forward, axis=1, keepdims=True); norms[norms == 0.0] = 1.0
+    forward = forward / norms
+    normal = np.column_stack((-forward[:, 1], forward[:, 0]))
+    offset = np.array([float(race_center_local[0]), float(race_center_local[1])], float)
+    side_a = centerline + normal * (width / 2.0) + offset
+    side_b = centerline - normal * (width / 2.0) + offset
+    # Which offset is the outer one depends on the loop's winding: for a counter-clockwise
+    # centerline the +normal side is the inner curve.  Choose by area rather than assuming.
+    def _abs_area(points: np.ndarray) -> float:
+        return abs(float(np.dot(points[:, 0], np.roll(points[:, 1], -1)) - np.dot(points[:, 1], np.roll(points[:, 0], -1)))) / 2.0
+    if _abs_area(side_a) < _abs_area(side_b):
+        side_a, side_b = side_b, side_a
+    outer = gdstk.Polygon(side_a, layer=layer, datatype=datatype)
+    inner = gdstk.Polygon(side_b, layer=layer, datatype=datatype)
+    track = gdstk.boolean(outer, inner, "not", layer=layer, datatype=datatype)
+    if not track:
+        raise ValueError("Could not generate a closed Euler racetrack polygon.")
+    for polygon in track:
+        top.add(_transform_polygon(polygon, component_center, orientation))
+    return straight
+
+
 def add_racetrack_to_gds(top: gdstk.Cell, race_center_local: tuple[float, float], radius: float, coupling_length: float, width: float, points: int, component_center: tuple[float, float], orientation: float, layer: int, datatype: int) -> None:
     """Add a continuous closed racetrack using outer-minus-inner capsules."""
     if radius <= 0 or coupling_length < 0 or width <= 0 or radius <= width / 2.0:
@@ -236,32 +312,16 @@ def add_feedline_to_gds(component: dict[str, Any], top: gdstk.Cell) -> dict[str,
     return points
 
 
-def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) -> None:
-    kind = str(component["kind"]); p = dict(component.get("params", {}))
-    start = (float(component["x"]), float(component["y"])); orientation = float(component.get("orientation_deg", 0.0)) % 360.0
-    mirrored = bool(component.get("mirrored", False)); ms = -1.0 if mirrored else 1.0
-    if kind == "E-beam multipass":
-        # EPBG write fields always export on the dedicated Ebeam layer.
-        layer = EBEAM_LAYER
-        datatype = DEFAULT_DATATYPE
-    elif kind in RF_COMPONENT_KINDS:
-        layer = RF_LAYER
-        datatype = DEFAULT_DATATYPE
-    elif kind in MARKER_COMPONENT_KINDS:
-        layer = MARKER_LAYER
-        datatype = DEFAULT_DATATYPE
-    elif kind == "Grating coupler":
-        layer = GC_LAYER
-        datatype = DEFAULT_DATATYPE
-    elif kind in {"Chip outline", "4-inch wafer outline"}:
-        layer = int(p.get("layer", 100))
-        datatype = int(p.get("datatype", 0))
-    else:
-        layer = PHOTONIC_LAYER
-        datatype = DEFAULT_DATATYPE
-    uid = int(component.get("uid", 0))
 
-    if kind in {"RF test block", "Photonic test block"}:
+def test_block_device_placements(component: dict[str, Any]) -> list[tuple[int, list[Any], np.ndarray]]:
+    """(combination index, local polygons, shift) for every device a test block generates.
+
+    Shared by the builder and by the editor's boundary cull so both agree on where each device
+    lands. Placement is computed from the full device set, so excluding one does not move the rest.
+    """
+    kind = str(component["kind"]); p = dict(component.get("params", {}))
+    mirrored = bool(component.get("mirrored", False)); uid = int(component.get("uid", 0))
+    if True:
         is_rf = kind == "RF test block"
         family = "RF" if is_rf else "Photonic"
         source_key = "rf_component_kind" if is_rf else "photonic_component_kind"
@@ -302,7 +362,12 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             grid_columns=len(horizontal_values)
         else:
             combinations=[tuple()];grid_columns=1
-        templates: list[tuple[list[Any], np.ndarray, np.ndarray]] = []
+        # A single swept parameter otherwise lays every device out in one row, which for
+        # millimetre-scale devices is a block tens of millimetres wide.  grid_columns lets a
+        # sweep stack instead; 1 gives the vertical column these test structures usually want.
+        requested_columns=int(p.get("grid_columns",0) or 0)
+        if requested_columns>0:grid_columns=max(1,min(requested_columns,len(combinations)))
+        templates: list[tuple[int, list[Any], np.ndarray, np.ndarray]] = []
         for index, values in enumerate(combinations):
             child_params = safe_json_copy(base_params)
             child_params.update(dict(zip(selected, values)))
@@ -325,18 +390,76 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             bbox = temp_cell.bounding_box()
             if bbox is None:
                 continue
-            templates.append((temp_cell.get_polygons(apply_repetitions=True, include_paths=True), np.asarray(bbox[0], float), np.asarray(bbox[1], float)))
+            templates.append((index, temp_cell.get_polygons(apply_repetitions=True, include_paths=True), np.asarray(bbox[0], float), np.asarray(bbox[1], float)))
         if not templates:
-            return
+            return []
         edge_spacing = float(p.get("edge_spacing", 300.0))
         if edge_spacing < 0.0:
             raise ValueError(f"{family} test block edge spacing cannot be negative.")
-        cell_centers,_,_=scan_parameter_grid_layout([(low,high) for _,low,high in templates],edge_spacing,grid_columns)
-        for cell_center,(polygons,low,high) in zip(cell_centers,templates):
-            shift = cell_center - (low + high) / 2.0
+        cell_centers,_,_=scan_parameter_grid_layout([(low,high) for _,_,low,high in templates],edge_spacing,grid_columns)
+        placements = []
+        for cell_center, (index, polygons, low, high) in zip(cell_centers, templates):
+            placements.append((index, polygons, cell_center - (low + high) / 2.0))
+        return placements
+
+def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) -> None:
+    kind = str(component["kind"]); p = dict(component.get("params", {}))
+    # Ports and monitors are notebook metadata, never mask geometry.
+    if kind in SIMULATION_COMPONENT_KINDS:
+        return
+    start = (float(component["x"]), float(component["y"])); orientation = float(component.get("orientation_deg", 0.0)) % 360.0
+    mirrored = bool(component.get("mirrored", False)); ms = -1.0 if mirrored else 1.0
+    if kind == "E-beam multipass":
+        # EPBG write fields always export on the dedicated Ebeam layer.
+        layer = EBEAM_LAYER
+        datatype = DEFAULT_DATATYPE
+    elif kind in RF_COMPONENT_KINDS:
+        layer = RF_LAYER
+        datatype = DEFAULT_DATATYPE
+    elif kind in MARKER_COMPONENT_KINDS:
+        layer = MARKER_LAYER
+        datatype = DEFAULT_DATATYPE
+    elif kind == "Grating coupler":
+        layer = GC_LAYER
+        datatype = DEFAULT_DATATYPE
+    elif kind in {"Chip outline", "4-inch wafer outline"}:
+        layer = int(p.get("layer", 100))
+        datatype = int(p.get("datatype", 0))
+    else:
+        layer = PHOTONIC_LAYER
+        datatype = DEFAULT_DATATYPE
+    uid = int(component.get("uid", 0))
+
+    if kind in {"RF test block", "Photonic test block"}:
+        excluded_devices={int(index) for index in p.get("excluded_device_indices",[])}
+        # Write fields are a photonic e-beam concern; the RF block does not draw them.
+        draw_fields=kind=="Photonic test block" and bool(p.get("include_ebeam_fields",True))
+        field_size=float(p.get("ebeam_field_size",520.0));clearance=float(p.get("ebeam_edge_clearance",10.0))
+        usable=field_size-2.0*clearance
+        if draw_fields and usable<=0.0:raise ValueError(f"Photonic test block edge clearance {clearance:g} µm leaves no usable area in a {field_size:g} µm write field.")
+        field_number=0
+        for index, polygons, shift in test_block_device_placements(component):
+            if index in excluded_devices:continue
+            device_points=[]
             for polygon in polygons:
                 local_points = np.asarray(polygon.points, float) + shift
+                if draw_fields:device_points.append(local_points)
                 top.add(gdstk.Polygon(transform_points(local_points, start, orientation), layer=int(polygon.layer), datatype=int(polygon.datatype)))
+            if not draw_fields or not device_points:continue
+            stacked=np.vstack(device_points);low=stacked.min(axis=0);high=stacked.max(axis=0);extent=high-low
+            center=(low+high)/2.0
+            # One field centred on the device, then grown outwards symmetrically.  Anchoring a
+            # field ON the centre rather than tiling from a corner keeps the critical feature --
+            # a ring, an MMI body -- whole inside a single field; an even tile count would put a
+            # stitch boundary exactly through it.  A device that fits gets exactly one field.
+            spans=[1+2*int(math.ceil(max(0.0,value/2.0-usable/2.0-1e-9)/usable)) for value in extent]
+            for row in range(spans[1]):
+                for column in range(spans[0]):
+                    local_center=np.array([center[0]+(column-(spans[0]-1)/2.0)*field_size,
+                                           center[1]+(row-(spans[1]-1)/2.0)*field_size],float)
+                    world_center=tuple(np.asarray(start)+rot(tuple(local_center),orientation));field_number+=1
+                    add_ebeam_field_outline(top,world_center,orientation,field_size)
+                    add_write_field_number(top,field_number,world_center,orientation,field_size,float(p.get("parameter_text_height",12.0)))
         return
 
     if kind == "Straight":
@@ -997,9 +1120,20 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             side *= ms
             bus_y = points["first_s_bend_end"][1]
             radius = float(p["racetrack_radius"]); race_width = float(p["racetrack_width"])
-            y = bus_y + side * (float(p["wg_width"])/2.0 + float(p["coupling_gap"]) + race_width/2.0 + radius)
-            for x in resonator_x_positions(p, points["first_s_bend_end"][0], points["lc_end"][0]):
-                add_racetrack_to_gds(top, (x, y), radius, float(p["racetrack_coupling_length"]), race_width, 128, start, orientation, int(p.get("resonator_layer",layer)), int(p.get("resonator_datatype",datatype)))
+            # racetrack_length is the round-trip optical path and implies Euler bends of minimum
+            # curvature racetrack_radius.  Files predating it still carry racetrack_coupling_length,
+            # which meant the straight section with circular bends -- keep building those as before
+            # so existing layouts do not silently change shape.
+            total_length = p.get("racetrack_length")
+            if total_length is not None:
+                straight, _arc, height = euler_racetrack_metrics(float(total_length), radius)
+                y = bus_y + side * (float(p["wg_width"])/2.0 + float(p["coupling_gap"]) + race_width/2.0 + height/2.0)
+                for x in resonator_x_positions(p, points["first_s_bend_end"][0], points["lc_end"][0]):
+                    add_euler_racetrack_to_gds(top, (x, y), float(total_length), radius, race_width, start, orientation, int(p.get("resonator_layer",layer)), int(p.get("resonator_datatype",datatype)))
+            else:
+                y = bus_y + side * (float(p["wg_width"])/2.0 + float(p["coupling_gap"]) + race_width/2.0 + radius)
+                for x in resonator_x_positions(p, points["first_s_bend_end"][0], points["lc_end"][0]):
+                    add_racetrack_to_gds(top, (x, y), radius, float(p["racetrack_coupling_length"]), race_width, 128, start, orientation, int(p.get("resonator_layer",layer)), int(p.get("resonator_datatype",datatype)))
         return
     if kind == "CPW":
         length=float(p["length"]); ws=float(p["signal_width"]); gap=float(p["gap"]); wg=float(p["ground_width"])
@@ -1320,10 +1454,57 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
     raise ValueError(f"Unsupported component type: {kind}")
 
 
+_COMPONENT_GEOMETRY_CACHE: dict[str, list[tuple[np.ndarray, int, int]]] = {}
+_COMPONENT_GEOMETRY_CACHE_LIMIT = 4096
+
+
+def clear_component_geometry_cache() -> None:
+    """Drop cached component geometry.  Only needed if a builder's output stops being a pure
+    function of the component dict; ordinary edits change the dict and so miss the cache anyway."""
+    _COMPONENT_GEOMETRY_CACHE.clear()
+
+
 def add_component_to_gds(component: dict[str, Any], top: gdstk.Cell, library: gdstk.Library) -> None:
-    """Add one fully resolved component directly to the single TOP cell."""
-    direct_component = json.loads(json.dumps(component))
-    _add_component_geometry_to_cell(direct_component, top)
+    """Add one fully resolved component directly to the single TOP cell.
+
+    A component's polygons are a pure function of its resolved dict, and a session rebuilds the
+    same unchanged components many times over (canvas preview, bounding-box queries, centering,
+    export).  Cache the flattened point arrays and re-emit fresh polygons from them; caching plain
+    numpy arrays rather than gdstk objects keeps this safe, since gdstk objects cannot be copied
+    reliably.
+    """
+    polygons, labels = component_geometry_arrays(component)
+    for points, layer, datatype in polygons:
+        top.add(gdstk.Polygon(points, layer=layer, datatype=datatype))
+    for text, origin, anchor, rotation, magnification, x_reflection, layer, texttype in labels:
+        top.add(gdstk.Label(text, origin, anchor=anchor, rotation=rotation, magnification=magnification,
+                            x_reflection=x_reflection, layer=layer, texttype=texttype))
+
+
+def component_geometry_arrays(component: dict[str, Any]):
+    """Cached ``(polygons, labels)`` for one resolved component, as plain arrays and tuples."""
+    serialized = json.dumps(component, sort_keys=True, default=str)
+    cached = _COMPONENT_GEOMETRY_CACHE.get(serialized)
+    if cached is None:
+        direct_component = json.loads(json.dumps(component))
+        scratch = gdstk.Library(unit=1e-6, precision=1e-9)
+        scratch_cell = scratch.new_cell("COMPONENT_TMP")
+        _add_component_geometry_to_cell(direct_component, scratch_cell)
+        polygons = [
+            (np.asarray(polygon.points, float), int(polygon.layer), int(polygon.datatype))
+            for polygon in scratch_cell.get_polygons(apply_repetitions=True, include_paths=True)
+        ]
+        # Several builders also emit text; get_polygons() does not see labels.
+        labels = [
+            (label.text, tuple(label.origin), label.anchor, float(label.rotation), float(label.magnification),
+             bool(label.x_reflection), int(label.layer), int(label.texttype))
+            for label in scratch_cell.labels
+        ]
+        cached = (polygons, labels)
+        if len(_COMPONENT_GEOMETRY_CACHE) >= _COMPONENT_GEOMETRY_CACHE_LIMIT:
+            _COMPONENT_GEOMETRY_CACHE.clear()
+        _COMPONENT_GEOMETRY_CACHE[serialized] = cached
+    return cached
 
 
 def _canonicalize_component_layers(component: dict[str, Any]) -> None:

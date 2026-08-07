@@ -23,23 +23,27 @@ from PySide6.QtCore import QPoint, QPointF, QProcess, QRectF, QSettings, QSize, 
 from PySide6.QtGui import QAction, QCloseEvent, QImageReader, QKeySequence, QPainterPath, QPixmap
 from PySide6.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGraphicsItem, QGraphicsScene, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSpinBox, QStatusBar, QTableWidget, QTableWidgetItem, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
-from ..constants import CHOICE_PARAMETERS, COMPONENT_SPECS, DEFAULT_COMPONENT_VALUES, EBEAM_LAYER, GC_LAYER, LAYER_NAME_MAP, LEGACY_PHOTONIC_TEST_BLOCK_KINDS, MARKER_COMPONENT_KINDS, MARKER_LAYER, NATIVE_APP_VERSION, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, component_display_name
-from ..gds.build import _add_component_geometry_to_cell, _canonicalize_component_layers, library_bbox_and_center, recenter_components_at_origin, resolve_and_build, rotate_components_layout
+from ..constants import CHOICE_PARAMETERS, COMPONENT_SPECS, DEFAULT_COMPONENT_VALUES, EBEAM_LAYER, GC_LAYER, LAYER_NAME_MAP, LEGACY_PHOTONIC_TEST_BLOCK_KINDS, MARKER_COMPONENT_KINDS, MARKER_LAYER, NATIVE_APP_VERSION, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, SIMULATION_COMPONENT_KINDS, SIMULATION_LAYER, component_display_name
+from ..gds.build import _add_component_geometry_to_cell, _canonicalize_component_layers, component_geometry_arrays, library_bbox_and_center, recenter_components_at_origin, resolve_and_build, rotate_components_layout, test_block_device_placements
 from ..gds.ebeam import multipass_field_layout
 from ..geometry.shapes import mmi_total_length
 from ..geometry.rf_taper import synchronize_rf_taper_points
 from ..geometry.transforms import scene_to_world_point, transform_points, transformed_local_points, world_to_scene_point
 from ..modules_db import load_native_modules, save_native_modules
+from ..lumerical import write_lumerical_notebook
 from ..params import resize_component_parameters
 from ..ports import PORT_ALIASES, component_global_ports, component_local_ports, solve_attachment
 from ..ui.dialogs import ArrayDialog, EbeamDialog, ModuleVariablesDialog
 from ..ui.items import ComponentGraphicsItem, EbeamContainerItem, LayoutView, WriteFieldItem, clear_preview_caches
+from ..ui.lumerical_dialog import LumericalExportDialog
 from ..ui.theme import _force_dark_popup, color_for_layer
 from ..utils import inclusive_sweep, numeric_list, parse_sequence, safe_json_copy
 
 
 CHIP_BOUNDARY_MARGIN_UM = 50.0
-BOUNDARY_COMPONENT_KINDS = {"Chip outline", "4-inch wafer outline"}
+WAFER_BOUNDARY_MARGIN_UM = 5000.0  # 0.5 cm keep-out from the wafer edge
+BOUNDARY_MARGINS_UM = {"Chip outline": CHIP_BOUNDARY_MARGIN_UM, "4-inch wafer outline": WAFER_BOUNDARY_MARGIN_UM}
+BOUNDARY_COMPONENT_KINDS = set(BOUNDARY_MARGINS_UM)
 
 
 def add_fixed_default_row(table: QTableWidget, row: int, key: str, value: Any) -> tuple[str, Any, bool, Any]:
@@ -213,12 +217,17 @@ class NativeLayoutWindow(QMainWindow):
             "Chip / utility": [],
             "User modules": [],
         }
+        simulation_names: list[str] = []
         for kind in DEFAULT_COMPONENT_VALUES:
             if kind in LEGACY_PHOTONIC_TEST_BLOCK_KINDS:
                 continue
+            if kind == "Fiber port":
+                continue
             if filter_text and filter_text not in kind.lower():
                 continue
-            if kind in RF_COMPONENT_KINDS or kind == "MZI + CPW module":
+            if kind in SIMULATION_COMPONENT_KINDS:
+                simulation_names.append(kind)
+            elif kind in RF_COMPONENT_KINDS or kind == "MZI + CPW module":
                 lower=kind.lower()
                 if kind == "RF test block":group="RF test blocks"
                 elif "open" in lower or "short" in lower:group="Calibration structures"
@@ -249,6 +258,15 @@ class NativeLayoutWindow(QMainWindow):
         for module_name in sorted(self.custom_modules):
             if not filter_text or filter_text in module_name.lower():
                 categories["User modules"].append(module_name)
+        if simulation_names:
+            simulation_parent = QTreeWidgetItem(["Ports & monitors"])
+            simulation_parent.setFlags(simulation_parent.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.library_tree.addTopLevelItem(simulation_parent)
+            for name in sorted(simulation_names):
+                child = QTreeWidgetItem([component_display_name(name)])
+                child.setData(0, Qt.ItemDataRole.UserRole, ("component", name))
+                simulation_parent.addChild(child)
+            simulation_parent.setExpanded(True)
         populated_photonic={name:values for name,values in photonic_groups.items() if values}
         if populated_photonic:
             photonic_parent=QTreeWidgetItem(["Photonic"]);photonic_parent.setFlags(photonic_parent.flags()&~Qt.ItemFlag.ItemIsSelectable);self.library_tree.addTopLevelItem(photonic_parent)
@@ -514,6 +532,15 @@ class NativeLayoutWindow(QMainWindow):
         file_menu.addSeparator()
         action("export_gds", "Export GDS", self.export_gds, None, file_toolbar, file_menu)
         action("export_python", "Export Python", self.export_python, None, None, file_menu)
+        action(
+            "export_lumerical",
+            "Export Lumerical Notebook…",
+            self.export_lumerical_notebook,
+            None,
+            None,
+            file_menu,
+            status_tip="Export selected geometry, material stack, simulation-only ports, and CPU/GPU settings as a self-contained notebook.",
+        )
         action("export_field", "Export Field TXT", self.export_field_txt, None, None, file_menu)
         action("export_ftext", "Export BEAMER FTEXT", self.export_beamer_ftext, None, file_toolbar, file_menu)
         action("import_field", "Import Field TXT", self.import_field_txt, None, None, file_menu)
@@ -628,7 +655,7 @@ class NativeLayoutWindow(QMainWindow):
         layout_menu.addSeparator()
         action("layout_zero", "All GDS lower-left → (0, 0)", self.move_entire_layout_to_origin, "Ctrl+Shift+0", layout_toolbar, layout_menu, status_tip="Move every component together so the complete GDS bounding-box lower-left corner is exactly (0, 0).")
         action("layout_center", "All GDS center → (0, 0)", self.center_entire_layout_at_origin, None, layout_toolbar, layout_menu, status_tip="Move every component together so the complete GDS bounding-box center is exactly (0, 0).")
-        action("push_within_chip", "Push within chip/wafer boundary", self.remove_outside_chip_outline, None, layout_toolbar, layout_menu, status_tip=f"Delete every component whose geometry reaches outside the Chip outline or 4-inch wafer outline, keeping a {CHIP_BOUNDARY_MARGIN_UM:g} µm margin from the edge.")
+        action("push_within_chip", "Push within chip/wafer boundary", self.remove_outside_chip_outline, None, layout_toolbar, layout_menu, status_tip=f"Delete every component whose geometry reaches outside the Chip outline or 4-inch wafer outline, keeping {CHIP_BOUNDARY_MARGIN_UM:g} µm clear of a chip edge and {WAFER_BOUNDARY_MARGIN_UM/1000.0:g} mm clear of a wafer edge.")
         action("rotate_all", "Rotate Entire GDS…", self.rotate_entire_layout_dialog, "Ctrl+Shift+R", layout_toolbar, layout_menu, status_tip="Rotate every component around the complete-layout center; no selection required.")
         action("rotate_all_90", "Rotate Entire GDS +90°", lambda: self.rotate_entire_layout(90), None, None, layout_menu)
         action("rotate_all_minus90", "Rotate Entire GDS −90°", lambda: self.rotate_entire_layout(-90), None, None, layout_menu)
@@ -823,6 +850,8 @@ class NativeLayoutWindow(QMainWindow):
                 raise ValueError("The selected file does not contain a component list.")
             for component in components:
                 synchronize_rf_taper_points(component)
+                if component.get("kind") == "Fiber geometry" and bool(component.get("auto_placed", False)):
+                    component.setdefault("params", {})["z reference"] = "top of SiO2 cladding"
             self.components = components
             self.next_uid = int(data.get("next_uid", max([int(c.get("uid", 0)) for c in components] + [0]) + 1))
             self.next_group_id = int(data.get("next_group_id", 1))
@@ -862,6 +891,21 @@ class NativeLayoutWindow(QMainWindow):
     # ------------------------------------------------------------------
     def make_component(self, kind: str, x: float, y: float) -> dict[str, Any]:
         params = safe_json_copy(DEFAULT_COMPONENT_VALUES[kind])
+        if kind in {"FDTD port", "Fiber-axis FDTD port"}:
+            order = 1 + sum(
+                component.get("kind") in {"FDTD port", "Fiber-axis FDTD port"}
+                for component in self.components
+            )
+            params["name"] = f"opt_{order}"
+            params["order"] = order
+        elif kind in {"Power monitor", "Mode expansion monitor", "Field profile monitor"}:
+            prefix = {
+                "Power monitor": "power_monitor",
+                "Mode expansion monitor": "mode_expansion",
+                "Field profile monitor": "field_profile",
+            }[kind]
+            count = 1 + sum(component.get("kind") == kind for component in self.components)
+            params["name"] = f"{prefix}_{count}"
         component = {
             "uid": self.next_uid,
             "kind": kind,
@@ -875,6 +919,177 @@ class NativeLayoutWindow(QMainWindow):
         synchronize_rf_taper_points(component)
         self.next_uid += 1
         return component
+
+    def automatic_simulation_companions(self, component: dict[str, Any]) -> list[dict[str, Any]]:
+        """Create movable Ansys-style ports for common optical components.
+
+        The planes sit at the physical optical endpoints. The export dialog's
+        2 µm default domain clearance and the notebook's boundary-extension
+        geometry continue each ported waveguide through the corresponding PML.
+        """
+        kind = str(component.get("kind", ""))
+        requested_ports = {
+            "Straight": ["left", "right"],
+            "Taper": ["left", "right"],
+            "S-bend": ["left", "right"],
+            "Euler bend": ["start", "end"],
+            "1x2 MMI": ["left_external", "upper_right", "lower_right"],
+            "Cascaded MMI": ["input", "output"],
+            "MMI + Reference": ["left_external", "upper_right", "lower_right", "reference_left_external", "reference_right"],
+            "Grating coupler": ["waveguide_point"],
+        }.get(kind)
+        if not requested_ports:
+            return []
+
+        global_ports = component_global_ports(component)
+        companions: list[dict[str, Any]] = []
+        next_order = 1 + sum(
+            existing.get("kind") in {"FDTD port", "Fiber-axis FDTD port"}
+            for existing in self.components
+        )
+        for port_name in requested_ports:
+            port = global_ports.get(port_name)
+            if not port or str(port.get("domain", "optical")) != "optical":
+                continue
+            outward = float(port["outward_orientation_deg"]) % 360.0
+            center = tuple(map(float, port["center"]))
+            port_offset_um = 0.0
+            if kind == "Grating coupler" and port_name == "waveguide_point":
+                port_offset_um = max(
+                    0.0,
+                    float(component.get("params", {}).get("fdtd_port_offset_from_waveguide_end_um", 3.0)),
+                )
+                inward_angle = math.radians(outward + 180.0)
+                center = (
+                    center[0] + port_offset_um * math.cos(inward_angle),
+                    center[1] + port_offset_um * math.sin(inward_angle),
+                )
+            placed = self.make_component("FDTD port", float(center[0]), float(center[1]))
+            placed["orientation_deg"] = outward
+            placed["auto_placed"] = True
+            placed["simulation_parent_uid"] = int(component["uid"])
+            placed["simulation_parent_port"] = port_name
+            placed["waveguide_end_offset_um"] = port_offset_um
+            placed["params"].update(
+                {
+                    "name": f"uid_{int(component['uid'])}_{port_name}",
+                    "order": next_order,
+                    "pos": "Right",
+                    "plane normal": "X",
+                    "distance_um": 0.0,
+                }
+            )
+            next_order += 1
+            companions.append(placed)
+
+        if kind == "Grating coupler":
+            # Place the fiber on the grating side: straight lead + complete
+            # taper length + the user-controlled offset beyond that taper.
+            grating_params = component.get("params", {})
+            taper_offset_um = max(
+                0.0,
+                float(grating_params.get("fiber_offset_after_taper_um", grating_params.get("fiber_offset_from_flare_um", 5.0))),
+            )
+            local_x = (
+                float(grating_params.get("wg_length", 5.0))
+                + float(grating_params.get("taper_L", 22.0))
+                + taper_offset_um
+            )
+            angle = math.radians(float(component.get("orientation_deg", 0.0)))
+            fiber_x = float(component.get("x", 0.0)) + local_x * math.cos(angle)
+            fiber_y = float(component.get("y", 0.0)) + local_x * math.sin(angle)
+            fiber = self.make_component("Fiber geometry", fiber_x, fiber_y)
+            fiber["orientation_deg"] = float(component.get("orientation_deg", 0.0))
+            fiber["auto_placed"] = True
+            fiber["simulation_parent_uid"] = int(component["uid"])
+            fiber["grating_taper_end_offset_um"] = taper_offset_um
+            fiber["params"].update(
+                {
+                    "name": f"uid_{int(component['uid'])}_fiber",
+                    "angle theta": 7.0,
+                    "angle phi": 0.0,
+                    "distance_um": 0.0,
+                    "z reference": "top of SiO2 cladding",
+                }
+            )
+            companions.append(fiber)
+
+            fiber_port = self.make_component("Fiber-axis FDTD port", fiber_x, fiber_y)
+            fiber_port["orientation_deg"] = float(component.get("orientation_deg", 0.0))
+            fiber_port["auto_placed"] = True
+            fiber_port["simulation_parent_uid"] = int(component["uid"])
+            fiber_port["grating_taper_end_offset_um"] = taper_offset_um
+            fiber_port["params"].update(
+                {
+                    "name": f"uid_{int(component['uid'])}_fiber_axis",
+                    # Match the official Ansys grating model: fiber is the
+                    # first/source port and waveguide is the second/receiver.
+                    "order": next_order - 1,
+                    "angle theta": 7.0,
+                    "angle phi": 0.0,
+                    "rotation offset_um": 4.0 * 9.0 * math.tan(math.radians(7.0)),
+                    "distance_um": 0.0,
+                    "z reference": "top of stack",
+                }
+            )
+            for companion in companions:
+                if companion.get("kind") == "FDTD port":
+                    companion.setdefault("params", {})["order"] = next_order
+            companions.append(fiber_port)
+        return companions
+
+    def synchronize_automatic_simulation_companions(self, component: dict[str, Any]) -> bool:
+        """Keep automatically placed ports/fiber aligned after parent edits."""
+        parent_uid = int(component.get("uid", 0))
+        companions = [
+            candidate for candidate in self.components
+            if int(candidate.get("simulation_parent_uid", -1)) == parent_uid
+            and bool(candidate.get("auto_placed", False))
+        ]
+        if not companions:
+            return False
+        global_ports = component_global_ports(component)
+        for companion in companions:
+            parent_port_name = companion.get("simulation_parent_port")
+            if parent_port_name:
+                port = global_ports.get(str(parent_port_name))
+                if port:
+                    outward = float(port["outward_orientation_deg"]) % 360.0
+                    center_x, center_y = map(float, port["center"])
+                    port_offset_um = 0.0
+                    if str(component.get("kind", "")) == "Grating coupler" and str(parent_port_name) == "waveguide_point":
+                        port_offset_um = max(
+                            0.0,
+                            float(component.get("params", {}).get("fdtd_port_offset_from_waveguide_end_um", 3.0)),
+                        )
+                        inward_angle = math.radians(outward + 180.0)
+                        center_x += port_offset_um * math.cos(inward_angle)
+                        center_y += port_offset_um * math.sin(inward_angle)
+                    companion["x"], companion["y"] = center_x, center_y
+                    companion["orientation_deg"] = outward
+                    companion["waveguide_end_offset_um"] = port_offset_um
+            if str(component.get("kind", "")) == "Grating coupler" and companion.get("kind") in {"Fiber geometry", "Fiber-axis FDTD port"}:
+                params = component.get("params", {})
+                offset_um = max(
+                    0.0,
+                    float(params.get("fiber_offset_after_taper_um", params.get("fiber_offset_from_flare_um", 5.0))),
+                )
+                local_x = (
+                    float(params.get("wg_length", 5.0))
+                    + float(params.get("taper_L", 22.0))
+                    + offset_um
+                )
+                angle = math.radians(float(component.get("orientation_deg", 0.0)))
+                companion["x"] = float(component.get("x", 0.0)) + local_x * math.cos(angle)
+                companion["y"] = float(component.get("y", 0.0)) + local_x * math.sin(angle)
+                companion["orientation_deg"] = float(component.get("orientation_deg", 0.0))
+                companion["grating_taper_end_offset_um"] = offset_um
+                if companion.get("kind") == "Fiber geometry":
+                    # Migrate automatic fibers created before the SiO2-specific
+                    # vertical reference was introduced. Manual fibers retain
+                    # their independently selected reference.
+                    companion.setdefault("params", {})["z reference"] = "top of SiO2 cladding"
+        return True
 
     def configure_test_block_sweeps(self, component: dict[str, Any]) -> bool:
         kind=str(component.get("kind",""));p=component["params"];options={
@@ -1136,7 +1351,7 @@ class NativeLayoutWindow(QMainWindow):
             "Loopback mirror":["Lc","gap","s_bend_length","arc_radius","width"],
             "Feedline":["wg_width","Lc","offset","s_bend_length","pitch","fill_factor"],
             "Ring + feedline":["ring_radius","ring_width","coupling_gap","resonator_count","resonator_spacing","wg_width","Lc"],
-            "Racetrack + feedline":["racetrack_radius","racetrack_coupling_length","racetrack_width","coupling_gap","resonator_count","resonator_spacing","wg_width"],
+            "Racetrack + feedline":["racetrack_length","racetrack_radius","racetrack_width","Lc","coupling_gap","resonator_count","resonator_spacing","wg_width"],
             "Photonic crystal":["pitch_x","pitch_y","hole_radius_x","hole_radius_y","columns","rows","defect_rows","lattice","hole_shape"],
         }.get(source_kind,keys[:6])
         common=[key for key in common if key in keys]
@@ -1184,12 +1399,25 @@ class NativeLayoutWindow(QMainWindow):
         if name in LEGACY_PHOTONIC_TEST_BLOCK_KINDS and not self.configure_test_block_sweeps(component):
             self.next_uid=max(1,self.next_uid-1);return
         self.components.append(component)
+        companions = self.automatic_simulation_companions(component)
+        if companions:
+            group_id = f"G{self.next_group_id}"
+            self.next_group_id += 1
+            component["group_id"] = group_id
+            for companion in companions:
+                companion["group_id"] = group_id
+                self.components.append(companion)
         self.commit_interaction_snapshot(snapshot)
         self.scene.clearSelection()
         self.add_component_scene_item(component, selected=True)
+        for companion in companions:
+            self.add_component_scene_item(companion, selected=False)
         self.refresh_project_tree()
         self.on_scene_selection_changed()
-        self.statusBar().showMessage(f"Added {name}.")
+        if companions:
+            self.statusBar().showMessage(f"Added {name} with {len(companions)} movable FDTD/fiber simulation object(s).")
+        else:
+            self.statusBar().showMessage(f"Added {name}.")
 
     def add_component_scene_item(self, component: dict[str, Any], selected: bool = False) -> QGraphicsItem:
         if component.get("kind") == "E-beam multipass":
@@ -1292,6 +1520,8 @@ class NativeLayoutWindow(QMainWindow):
                     item.setSelected(True)
 
     def move_group_with_primary(self, primary: ComponentGraphicsItem) -> None:
+        if primary.component.get("kind") in SIMULATION_COMPONENT_KINDS:
+            return
         group_id = primary.component.get("group_id")
         if not group_id or self._group_move_guard:
             return
@@ -1405,6 +1635,15 @@ class NativeLayoutWindow(QMainWindow):
             return
         title = QLabel(f"<b>{component.get('kind')}</b> · UID {component.get('uid')}")
         self.properties_form.addRow(title)
+        if component.get("kind") == "Grating coupler":
+            # Older saved layouts predate these editable simulation offsets.
+            # Add them non-destructively when the grating is selected.
+            component.setdefault("params", {})
+            if "fiber_offset_after_taper_um" not in component["params"]:
+                component["params"]["fiber_offset_after_taper_um"] = float(component["params"].pop("fiber_offset_from_flare_um", 5.0))
+            else:
+                component["params"].pop("fiber_offset_from_flare_um", None)
+            component["params"].setdefault("fdtd_port_offset_from_waveguide_end_um", 3.0)
         for key, value in (
             ("x", component.get("x", 0.0)),
             ("y", component.get("y", 0.0)),
@@ -1456,7 +1695,15 @@ class NativeLayoutWindow(QMainWindow):
                 else:
                     spec = ["string", value]
             widget = self.make_parameter_widget(key, spec, value)
-            self.properties_form.addRow("GC straight lead length (µm)" if key=="gc_wg_length" else "CPW taper model" if key=="cpw_profile" else key, widget)
+            parameter_label = (
+                "Fiber offset after taper toward grating (µm)" if key == "fiber_offset_after_taper_um"
+                else "FDTD port offset from waveguide end (µm)" if key == "fdtd_port_offset_from_waveguide_end_um"
+                else "Grating straight waveguide length (µm)" if key == "wg_length" and component.get("kind") == "Grating coupler"
+                else "GC straight lead length (µm)" if key == "gc_wg_length"
+                else "CPW taper model" if key == "cpw_profile"
+                else key
+            )
+            self.properties_form.addRow(parameter_label, widget)
             self.parameter_widgets[f"params.{key}"] = (widget, spec[0])
 
         active = self.active_field
@@ -1498,7 +1745,28 @@ class NativeLayoutWindow(QMainWindow):
                     continue
                 else:
                     component[key] = value
+            if (
+                component.get("kind") in {"Power monitor", "Mode expansion monitor", "Field profile monitor"}
+                and str(component.get("params", {}).get("monitor geometry", "surface")).lower() == "surface"
+            ):
+                params = component["params"]
+                normal = str(params.get("plane normal", "X")).upper()
+                transverse = max(
+                    0.001,
+                    abs(float(params.get("x span", 0.0))),
+                    abs(float(params.get("y span", 0.0))),
+                    abs(float(params.get("span_um", 4.0))),
+                )
+                raw_depth = abs(float(params.get("z span", params.get("z_span_um", 2.0))))
+                depth = raw_depth if raw_depth > 0.0 else 2.0
+                if normal == "Y":
+                    params.update({"x span": transverse, "y span": 0.0, "z span": depth})
+                elif normal == "Z":
+                    params.update({"x span": transverse, "y span": transverse, "z span": 0.0})
+                else:
+                    params.update({"plane normal": "X", "x span": 0.0, "y span": transverse, "z span": depth})
             synchronize_rf_taper_points(component)
+            companions_changed = self.synchronize_automatic_simulation_companions(component)
             if (
                 component.get("kind") == "E-beam multipass"
                 and self.active_field
@@ -1515,7 +1783,7 @@ class NativeLayoutWindow(QMainWindow):
                         desired = int(self.read_parameter_widget(*self.parameter_widgets["active_field_order"]))
                         self.set_field_global_order(int(component["uid"]), self.active_field[1], desired)
             self.commit_interaction_snapshot(snapshot)
-            if component.get("kind") == "E-beam multipass":
+            if component.get("kind") == "E-beam multipass" or companions_changed:
                 self.rebuild_scene(preserve_selection=True)
             else:
                 self.refresh_component_scene_item(int(component["uid"]), selected=True)
@@ -1560,6 +1828,8 @@ class NativeLayoutWindow(QMainWindow):
 
     def default_display_layer(self, component: dict[str, Any]) -> int:
         kind = component.get("kind")
+        if kind in SIMULATION_COMPONENT_KINDS:
+            return SIMULATION_LAYER
         if kind == "E-beam multipass":
             return EBEAM_LAYER
         if kind in RF_COMPONENT_KINDS or kind == "MZI + CPW module":
@@ -1621,6 +1891,8 @@ class NativeLayoutWindow(QMainWindow):
         duplicate_action = menu.addAction("Duplicate")
         array_action = menu.addAction("Make an array")
         lattice_action = menu.addAction("Create photonic-crystal lattice…")
+        simulation_menu = menu.addMenu("Lumerical simulation")
+        export_lumerical_action = simulation_menu.addAction("Export simulation notebook…")
         boolean_menu=menu.addMenu("Boolean operation")
         boolean_actions={boolean_menu.addAction(label):op for label,op in (("Union","union"),("Difference (first minus rest)","difference"),("Intersection","intersection"),("XOR","xor"))}
         save_module_action = menu.addAction("Add selection to User modules…")
@@ -1631,7 +1903,7 @@ class NativeLayoutWindow(QMainWindow):
         for action_item in (go_action, duplicate_action, array_action, lattice_action, save_module_action, delete_action):
             action_item.setEnabled(has_selection)
         boolean_menu.setEnabled(len(self.selected_components())>=2)
-
+        simulation_menu.setEnabled(len(self.selected_components()) == 1)
         chosen = menu.exec(self.project_tree.viewport().mapToGlobal(position))
         if chosen is go_action:
             self.fit_selection()
@@ -1641,6 +1913,8 @@ class NativeLayoutWindow(QMainWindow):
             self.create_array()
         elif chosen is lattice_action:
             self.create_photonic_crystal_lattice()
+        elif chosen is export_lumerical_action:
+            self.export_lumerical_notebook(self.selected_components()[0])
         elif chosen in boolean_actions:
             self.boolean_selected_geometry(boolean_actions[chosen])
         elif chosen is save_module_action:
@@ -1834,9 +2108,33 @@ class NativeLayoutWindow(QMainWindow):
 
     def component_world_bbox(self, component: dict[str, Any]) -> tuple[tuple[float, float], tuple[float, float]] | None:
         """World-space bounding box of one component, or None when it draws nothing."""
-        library=gdstk.Library(unit=1e-6,precision=1e-9);cell=library.new_cell(f"BOUNDS_{int(component.get('uid',0))}")
-        _add_component_geometry_to_cell(safe_json_copy(component),cell);box=cell.bounding_box()
-        return None if box is None else ((float(box[0][0]),float(box[0][1])),(float(box[1][0]),float(box[1][1])))
+        polygons,_labels=component_geometry_arrays(component)
+        if not polygons:return None
+        stacked=np.vstack([points for points,_layer,_datatype in polygons])
+        low=stacked.min(axis=0);high=stacked.max(axis=0)
+        return (float(low[0]),float(low[1])),(float(high[0]),float(high[1]))
+
+    def test_block_devices_outside(self, component: dict[str, Any], contains):
+        """(kept indices, excluded indices) for one test block, or None if it builds nothing.
+
+        Judged per generated device rather than per block, so a block straddling the edge keeps the
+        devices that fit instead of being deleted whole. Every device is re-tested from scratch, so
+        a previously excluded one comes back if the block is later moved inside."""
+        try:
+            placements=test_block_device_placements(component)
+        except Exception:
+            return None
+        if not placements:return None
+        origin=np.array([float(component["x"]),float(component["y"])],float);orientation=float(component.get("orientation_deg",0.0))
+        kept=[];excluded=[]
+        for index,polygons,shift in placements:
+            points=[np.asarray(polygon.points,float)+shift for polygon in polygons]
+            if not points:continue
+            world=transform_points(np.vstack(points),origin,orientation)
+            low=world.min(axis=0);high=world.max(axis=0)
+            if all(contains(px,py) for px in (low[0],high[0]) for py in (low[1],high[1])):kept.append(index)
+            else:excluded.append(index)
+        return kept,excluded
 
     def boundary_containment_test(self):
         """Return (contains(x, y), description) for the layout's Chip outline or wafer outline,
@@ -1847,7 +2145,7 @@ class NativeLayoutWindow(QMainWindow):
         if not boundaries:raise ValueError("This layout has no Chip outline or 4-inch wafer outline component; add one to define the boundary.")
         if len(boundaries)>1:raise ValueError("This layout has "+str(len(boundaries))+" boundary components ("+", ".join(sorted({str(component.get("kind")) for component in boundaries}))+"); keep exactly one.")
         boundary=boundaries[0];p=boundary.get("params",{});kind=str(boundary.get("kind"))
-        cx,cy=float(boundary["x"]),float(boundary["y"]);margin=CHIP_BOUNDARY_MARGIN_UM
+        cx,cy=float(boundary["x"]),float(boundary["y"]);margin=BOUNDARY_MARGINS_UM[kind]
         orientation=float(boundary.get("orientation_deg",0.0))
         if kind=="Chip outline":
             squared=orientation%180.0
@@ -1856,7 +2154,7 @@ class NativeLayoutWindow(QMainWindow):
             if abs(squared-90.0)<=1e-9:width,height=height,width
             x0,y0,x1,y1=cx-width/2.0+margin,cy-height/2.0+margin,cx+width/2.0-margin,cy+height/2.0-margin
             if x1<=x0 or y1<=y0:raise ValueError(f"A {margin:g} µm margin leaves no usable area inside a {width:g} × {height:g} µm chip outline.")
-            return (lambda px,py:x0-1e-9<=px<=x1+1e-9 and y0-1e-9<=py<=y1+1e-9),f"{width:g} × {height:g} µm chip outline"
+            return (lambda px,py:x0-1e-9<=px<=x1+1e-9 and y0-1e-9<=py<=y1+1e-9),f"{width:g} × {height:g} µm chip outline ({margin:g} µm edge margin)"
         radius=float(p.get("diameter",100000.0))/2.0;flat_length=float(p.get("primary_flat_length",32500.0))
         half_flat=flat_length/2.0
         if radius<=0 or half_flat<=0 or half_flat>=radius:raise ValueError("The wafer outline needs 0 < primary flat length < diameter.")
@@ -1866,27 +2164,41 @@ class NativeLayoutWindow(QMainWindow):
         def contains(px,py):
             dx,dy=px-cx,py-cy;lx,ly=dx*cos_a-dy*sin_a,dx*sin_a+dy*cos_a
             return lx*lx+ly*ly<=keep_radius*keep_radius+1e-6 and ly>=flat_y-1e-9
-        return contains,f"{radius*2.0/1000.0:g} mm wafer outline"
+        return contains,f"{radius*2.0/1000.0:g} mm wafer outline ({margin/1000.0:g} mm edge margin)"
 
     def remove_outside_chip_outline(self) -> None:
         if not self.components:
             return
         try:
             contains,description=self.boundary_containment_test()
-            dropped=set()
+            dropped=set();trimmed={}
             for component in self.components:
                 if component.get("kind") in BOUNDARY_COMPONENT_KINDS:continue
+                if component.get("kind") in {"RF test block","Photonic test block"}:
+                    # A test block builds many devices; drop only the ones crossing the edge.
+                    outside=self.test_block_devices_outside(component,contains)
+                    if outside is None:continue
+                    kept,excluded=outside
+                    if not kept:dropped.add(int(component["uid"]))
+                    elif excluded:trimmed[int(component["uid"])]=excluded
+                    continue
                 box=self.component_world_bbox(component)
                 if box is None:continue
                 if not all(contains(px,py) for px in (box[0][0],box[1][0]) for py in (box[0][1],box[1][1])):dropped.add(int(component["uid"]))
-            if not dropped:
-                self.statusBar().showMessage(f'Every component already fits inside the {description} with a {CHIP_BOUNDARY_MARGIN_UM:g} µm edge margin.',8000);return
+            if not dropped and not trimmed:
+                self.statusBar().showMessage(f'Every component already fits inside the {description}.',8000);return
             snapshot=self.snapshot()
             self.components=[component for component in self.components if int(component["uid"]) not in dropped]
+            device_total=0
             for component in self.components:
                 if component.get("kind")=="E-beam multipass":
                     component["coverage_source_uids"]=[int(uid) for uid in component.get("coverage_source_uids",[]) if int(uid) not in dropped]
-            self.commit_interaction_snapshot(snapshot);self.rebuild_scene();self.statusBar().showMessage(f'Removed {len(dropped)} component(s) reaching outside the {description} ({CHIP_BOUNDARY_MARGIN_UM:g} µm edge margin).',8000)
+                excluded=trimmed.get(int(component["uid"]))
+                if excluded:component["params"]["excluded_device_indices"]=sorted(excluded);device_total+=len(excluded)
+            parts=[]
+            if dropped:parts.append(f'{len(dropped)} component(s)')
+            if device_total:parts.append(f'{device_total} test-block device(s)')
+            self.commit_interaction_snapshot(snapshot);self.rebuild_scene();self.statusBar().showMessage(f'Removed {" and ".join(parts)} reaching outside the {description}.',8000)
         except Exception as exc:
             QMessageBox.critical(self,'Could not push within boundary',str(exc))
 
@@ -2146,6 +2458,7 @@ class NativeLayoutWindow(QMainWindow):
             scale_x,
             scale_y,
         )
+        self.synchronize_automatic_simulation_companions(component)
         _canonicalize_component_layers(component)
         self.commit_interaction_snapshot(snapshot_before)
         self.rebuild_scene(select_uids=[uid])
@@ -2963,6 +3276,150 @@ class NativeLayoutWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Exports
     # ------------------------------------------------------------------
+    def lumerical_scope_options(self, clicked_component: dict[str, Any] | None) -> list[tuple[str, list[int]]]:
+        """Geometry choices shown after a component-oriented simulation export."""
+        options: list[tuple[str, list[int]]] = []
+        seen: set[tuple[int, ...]] = set()
+
+        def add(label: str, members: list[dict[str, Any]]) -> None:
+            ordered_uids: list[int] = []
+            member_seen: set[int] = set()
+            for component in members:
+                uid = int(component["uid"])
+                if component.get("kind") == "E-beam multipass" or uid in member_seen:
+                    continue
+                member_seen.add(uid)
+                ordered_uids.append(uid)
+            uids = tuple(ordered_uids)
+            if not uids or uids in seen:
+                return
+            seen.add(uids)
+            options.append((label, list(uids)))
+
+        selected = self.selected_components()
+        if clicked_component is not None:
+            clicked_group_id = clicked_component.get("group_id")
+            if clicked_group_id:
+                add(
+                    f"Component with its automatic simulation setup — {clicked_group_id}",
+                    [component for component in self.components if component.get("group_id") == clicked_group_id],
+                )
+            placed_simulation = [component for component in self.components if component.get("kind") in SIMULATION_COMPONENT_KINDS]
+            physical_components = [
+                component for component in self.components
+                if component.get("kind") not in SIMULATION_COMPONENT_KINDS
+                and component.get("kind") != "E-beam multipass"
+            ]
+            if clicked_component.get("kind") in SIMULATION_COMPONENT_KINDS and physical_components:
+                selected_physical = [
+                    component for component in selected
+                    if component.get("kind") not in SIMULATION_COMPONENT_KINDS
+                    and component.get("kind") != "E-beam multipass"
+                ]
+                if selected_physical:
+                    add(
+                        f"Selected device geometry + {len(placed_simulation)} placed port/monitor object(s)",
+                        [*selected_physical, *placed_simulation],
+                    )
+
+                clicked_x = float(clicked_component.get("x", 0.0))
+                clicked_scene_y = -float(clicked_component.get("y", 0.0))
+
+                def device_distance(component: dict[str, Any]) -> float:
+                    item = self.items_by_uid.get(int(component["uid"]))
+                    if item is not None:
+                        bounds = item.sceneBoundingRect()
+                        dx = max(float(bounds.left()) - clicked_x, 0.0, clicked_x - float(bounds.right()))
+                        dy = max(float(bounds.top()) - clicked_scene_y, 0.0, clicked_scene_y - float(bounds.bottom()))
+                        return math.hypot(dx, dy)
+                    return math.hypot(
+                        float(component.get("x", 0.0)) - clicked_x,
+                        float(component.get("y", 0.0)) - float(clicked_component.get("y", 0.0)),
+                    )
+
+                nearest = min(physical_components, key=device_distance)
+                add(
+                    f"Nearest device ({nearest.get('kind')}, UID {nearest.get('uid')}) + {len(placed_simulation)} placed port/monitor object(s)",
+                    [nearest, *placed_simulation],
+                )
+            elif placed_simulation:
+                add(
+                    f"Clicked component + {len(placed_simulation)} placed port/monitor object(s)",
+                    [clicked_component, *placed_simulation],
+                )
+            clicked_only_label = f"Clicked component only — {clicked_component.get('kind')} (UID {clicked_component.get('uid')})"
+            if clicked_component.get("kind") in SIMULATION_COMPONENT_KINDS:
+                clicked_only_label += " — no device geometry"
+            add(clicked_only_label, [clicked_component])
+        if selected:
+            add(f"Current selection — {len(selected)} component(s)", selected)
+        if clicked_component is not None:
+            for key, title in (
+                ("module_instance_id", "Complete module"),
+                ("group_id", "Complete group"),
+                ("array_group_id", "Complete array"),
+            ):
+                value = clicked_component.get(key)
+                if value:
+                    add(f"{title} — {value}", [component for component in self.components if component.get(key) == value])
+        add(f"Entire layout — {len(self.components)} component(s)", self.components)
+        return options
+
+    def export_lumerical_notebook(self, clicked_component: dict[str, Any] | bool | None = None) -> None:
+        if isinstance(clicked_component, bool):
+            clicked_component = None
+        if not self.components:
+            QMessageBox.information(self, "Lumerical notebook", "Add at least one component before exporting.")
+            return
+        if clicked_component is None:
+            selected = self.selected_components()
+            clicked_component = selected[0] if selected else None
+        saved = clicked_component.get("lumerical_export_settings", {}) if clicked_component else {}
+        dialog = LumericalExportDialog(
+            self.components,
+            self.lumerical_scope_options(clicked_component),
+            saved=saved,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        configuration = dialog.configuration()
+        selected_uids = set(map(int, configuration.get("scope_uids", [])))
+        export_components = [safe_json_copy(component) for component in self.components if int(component["uid"]) in selected_uids]
+        base_name = "lumerical_simulation"
+        primary_geometry = next(
+            (component for component in export_components if component.get("kind") not in SIMULATION_COMPONENT_KINDS),
+            None,
+        )
+        naming_component = primary_geometry or clicked_component
+        if naming_component is not None:
+            base_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(naming_component.get("kind", "component"))).strip("_").lower() or "component"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Lumerical notebook",
+            str(Path.home() / f"{base_name}.ipynb"),
+            "Jupyter notebook (*.ipynb)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".ipynb"):
+            path += ".ipynb"
+        try:
+            warnings = write_lumerical_notebook(path, export_components, configuration)
+        except Exception as exc:
+            QMessageBox.critical(self, "Notebook export failed", str(exc))
+            return
+
+        snapshot = self.snapshot()
+        if clicked_component is not None:
+            clicked_component["lumerical_export_settings"] = safe_json_copy(configuration)
+        self.commit_interaction_snapshot(snapshot)
+        self.rebuild_scene(preserve_selection=True)
+        message = f"Exported self-contained Lumerical notebook: {path}"
+        if warnings:
+            message += f" ({len(warnings)} note(s) are recorded inside the notebook)"
+        self.statusBar().showMessage(message, 10000)
+
     def export_gds(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -4077,9 +4534,12 @@ ENDFLOW
         section_actions: dict[QAction, tuple[dict[str, Any], str, list[str]]] = {}
         scan_action = None
         scan_component = None
+        clicked_component = None
+        export_lumerical_action = None
         if component_item is not None and component_item.data(10) is not None:
             component = self.component_by_uid(int(component_item.data(10)))
             if component is not None:
+                clicked_component = component
                 component_item.setSelected(True)
                 if component.get("kind") in {"RF test block", "Photonic test block"}:
                     scan_component = component
@@ -4101,6 +4561,10 @@ ENDFLOW
                             action = section_menu.addAction(section_title)
                             section_actions[action] = (component, section_title, section_keys)
                     menu.addSeparator()
+                simulation_menu = menu.addMenu("Lumerical simulation")
+                export_lumerical_action = simulation_menu.addAction("Export simulation notebook…")
+                export_font = export_lumerical_action.font(); export_font.setBold(True); export_lumerical_action.setFont(export_font)
+                menu.addSeparator()
         save_module_action = menu.addAction("Add selection to User modules…")
         save_module_action.setEnabled(bool([component for component in self.selected_components() if component.get("kind") != "E-beam multipass"]))
         lattice_action=menu.addAction("Create photonic-crystal lattice…");lattice_action.setEnabled(save_module_action.isEnabled())
@@ -4116,6 +4580,8 @@ ENDFLOW
             self.edit_test_block_scan(scan_component)
         elif chosen in section_actions:
             self.edit_component_section(*section_actions[chosen])
+        elif chosen is export_lumerical_action and clicked_component is not None:
+            self.export_lumerical_notebook(clicked_component)
         elif chosen is save_module_action:
             self.save_selection_as_module()
         elif chosen is lattice_action:

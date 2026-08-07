@@ -23,13 +23,28 @@ EBEAM_LAYER = 6
 
 DEFAULT_DATATYPE = 0
 
+SIMULATION_LAYER = 0
+
 LAYER_NAME_MAP = {
+    SIMULATION_LAYER: "Simulation only (not GDS)",
     PHOTONIC_LAYER: "WG",
     GC_LAYER: "GC",
     MARKER_LAYER: "Marker",
     RF_LAYER: "RF",
     PROBE_LAYER: "Probe",
     EBEAM_LAYER: "Ebeam",
+}
+
+SIMULATION_COMPONENT_KINDS = {
+    "FDTD port",
+    "Fiber-axis FDTD port",
+    "Fiber geometry",
+    # Legacy combined object: older projects still load, but it is hidden from
+    # the library and exports as geometry only so it never creates a port.
+    "Fiber port",
+    "Power monitor",
+    "Mode expansion monitor",
+    "Field profile monitor",
 }
 
 RF_COMPONENT_KINDS = {
@@ -103,7 +118,9 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                      'alpha_t': 25.0,
                      'taper_L': 22.0,
                      'wg_width': 1.2,
-                     'wg_length': 20.0,
+                     'wg_length': 5.0,
+                     'fiber_offset_after_taper_um': 5.0,
+                     'fdtd_port_offset_from_waveguide_end_um': 3.0,
                      'layer': 2,
                      'datatype': 0,
                      'tolerance': 0.0005,
@@ -627,8 +644,8 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                           'offset': 50.0,
                           'Lc': 3000.0,
                           'output_straight_length': 50.0,
-                          'racetrack_radius': 30.0,
-                          'racetrack_coupling_length': 100.0,
+                          'racetrack_radius': 200.0,
+                          'racetrack_length': 4000.0,
                           'racetrack_width': 1.2,
                           'coupling_gap': 0.3,
                           'resonator_count': 1,
@@ -733,11 +750,61 @@ BOOL_PARAMETERS.add("seg_auto_segment_count")
 
 BOOL_PARAMETERS.add("taper_test_structure")
 
+# Simulation-only objects are ordinary movable editor items, but the GDS
+# builder explicitly ignores them. Their parameter names mirror lumapi/CML
+# names so the project JSON and exported notebook remain easy to compare.
+DEFAULT_COMPONENT_VALUES.update(
+    {
+        "FDTD port": {
+            "name": "opt_1", "dir": "Bidirectional", "loc": 0.5, "pos": "Left", "order": 1,
+            "port geometry": "surface", "plane normal": "X", "distance_um": 0.0, "span_um": 2.5, "z_span_um": 2.25,
+            "mode": "fundamental mode",
+        },
+        "Fiber-axis FDTD port": {
+            "name": "opt_1", "dir": "Bidirectional", "loc": 0.5, "pos": "Top", "order": 1,
+            "port geometry": "surface", "plane normal": "Z", "distance_um": 0.0, "z reference": "top of stack",
+            "span_um": 20.0, "z_span_um": 0.0, "mode": "fundamental mode",
+            "angle theta": 7.0, "angle phi": 0.0,
+            "rotation offset_um": 4.420244193,
+        },
+        "Fiber geometry": {
+            "name": "fiber", "distance_um": 0.0, "z reference": "top of SiO2 cladding",
+            "angle theta": 7.0, "angle phi": 0.0,
+            "core diameter_um": 9.0, "core index": 1.44427,
+            "cladding diameter_um": 50.0, "cladding index": 1.43482,
+            "fiber length_um": 20.0,
+        },
+        "Fiber port": {
+            "name": "opt_1", "dir": "Bidirectional", "loc": 0.5, "pos": "Top", "order": 1,
+            "port geometry": "fiber", "plane normal": "Z", "distance_um": 0.0, "span_um": 20.0,
+            "angle theta": 7.0, "angle phi": 0.0,
+            "core diameter_um": 9.0, "core index": 1.44427,
+            "cladding diameter_um": 50.0, "cladding index": 1.43482,
+            "fiber length_um": 20.0,
+        },
+        "Power monitor": {
+            "name": "power_monitor", "monitor geometry": "surface", "plane normal": "X", "distance_um": 0.0,
+            "x span": 0.0, "y span": 4.0, "z span": 2.0,
+        },
+        "Mode expansion monitor": {
+            "name": "mode_expansion", "monitor geometry": "surface", "plane normal": "X", "distance_um": 0.0,
+            "x span": 0.0, "y span": 4.0, "z span": 2.0, "mode": "fundamental TE mode",
+        },
+        "Field profile monitor": {
+            "name": "field_profile", "monitor geometry": "surface", "plane normal": "X", "distance_um": 0.0,
+            "x span": 0.0, "y span": 4.0, "z span": 2.0,
+        },
+    }
+)
+
+INTEGER_PARAMETERS.add("order")
+
 PHOTONIC_COMPONENT_KINDS = (
     set(DEFAULT_COMPONENT_VALUES)
     - RF_COMPONENT_KINDS
     - MARKER_COMPONENT_KINDS
     - LEGACY_PHOTONIC_TEST_BLOCK_KINDS
+    - SIMULATION_COMPONENT_KINDS
     - {
         "MZI + CPW module",
         "Chip outline",
@@ -748,6 +815,10 @@ PHOTONIC_COMPONENT_KINDS = (
 )
 
 DEFAULT_COMPONENT_VALUES["Photonic test block"] = {
+    "include_ebeam_fields": True,
+    "ebeam_field_size": 520.0,
+    "ebeam_edge_clearance": 10.0,
+    "parameter_text_height": 12.0,
     "photonic_component_kind": "Straight",
     "photonic_base_params": dict(DEFAULT_COMPONENT_VALUES["Straight"]),
     "device_label_prefix": "Straight",
@@ -774,6 +845,15 @@ CHOICE_PARAMETERS.update({"lattice":["triangular","square"],"hole_shape":["circu
 
 CHOICE_PARAMETERS.update({"slab_shape":["rectangle","ellipse","hexagon"],"device_type":["bulk crystal","line-defect waveguide"],"mask_tone":["positive: holes only","negative: slab minus holes"]})
 
+CHOICE_PARAMETERS.update({
+    "port geometry": ["line", "surface"],
+    "monitor geometry": ["line", "surface"],
+    "plane normal": ["X", "Y", "Z"],
+    "dir": ["Bidirectional", "Forward", "Backward"],
+    "pos": ["Left", "Right", "Top", "Bottom"],
+    "z reference": ["top of SiO2 cladding", "top of stack", "device top"],
+})
+
 COMPONENT_DISPLAY_NAMES={
     "1x2 MMI":"1×2 Multimode Interferometer (MMI)",
     "Cascaded MMI":"Cascaded 1×2 MMI splitter tree",
@@ -791,6 +871,13 @@ COMPONENT_DISPLAY_NAMES={
     "Photonic test block":"Photonic component parameter-scan test block",
     "RF test block":"RF component parameter-scan test block",
     "4-inch wafer outline":"4-inch (100 mm) wafer outline with primary flat",
+    "FDTD port":"Ansys standard FDTD port — waveguide",
+    "Fiber-axis FDTD port":"Ansys standard FDTD port — fiber axis",
+    "Fiber geometry":"Ansys fiber geometry group — core + cladding",
+    "Fiber port":"Legacy combined fiber object",
+    "Power monitor":"Power monitor",
+    "Mode expansion monitor":"Mode expansion monitor",
+    "Field profile monitor":"Field profile monitor",
 }
 
 
@@ -816,4 +903,4 @@ def load_component_specs() -> dict[str, dict[str, list[Any]]]:
 
 COMPONENT_SPECS = load_component_specs()
 
-NATIVE_APP_VERSION = "V1"
+NATIVE_APP_VERSION = "V1.1"

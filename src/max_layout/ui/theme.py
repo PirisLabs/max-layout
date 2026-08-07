@@ -119,6 +119,7 @@ class DarkPopupEventFilter(QObject):
         return False
 
 LAYER_COLORS = {
+    0: QColor("#f472b6"),
     1: QColor("#40c8ff"),
     2: QColor("#ff9f43"),
     3: QColor("#ffe66d"),
