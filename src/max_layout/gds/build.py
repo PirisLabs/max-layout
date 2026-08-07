@@ -12,7 +12,7 @@ import numpy as np
 
 from ..backend import backend
 from ..constants import DEFAULT_COMPONENT_VALUES, DEFAULT_DATATYPE, EBEAM_LAYER, GC_COMPOSITE_KINDS, GC_LAYER, MARKER_COMPONENT_KINDS, MARKER_LAYER, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, SIMULATION_COMPONENT_KINDS
-from ..gds.couplers import add_parent_focusing_gc, add_routed_parent_gc, add_three_euler_inward_gc
+from ..gds.couplers import add_parent_focusing_gc, add_routed_parent_gc, add_soi_grating_coupler, add_three_euler_inward_gc
 from ..gds.ebeam import add_ebeam_field_outline, add_ebeam_parameter_text, add_write_field_number, multipass_field_layout
 from ..gds.primitives import add_rect, copy_cell_polygons_to_top
 from ..geometry.euler import grating_route_bend_angle, mmi_gc_fanout_local_points
@@ -487,6 +487,9 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             top, standalone_gc_params, start, orientation, float(p["wg_width"]),
             PHOTONIC_LAYER, DEFAULT_DATATYPE, f"GC_{uid}",
         )
+        return
+    if kind == "GC-SOI":
+        add_soi_grating_coupler(top, p, start, orientation)
         return
     if kind == "MMI split-combine cascade":
         count=max(1,int(p.get("cascade_count",3)));d=float(p.get("interconnect_length",5.0));width=float(p["wg_width"]);m=mmi_total_length(p)
@@ -1527,6 +1530,11 @@ def _canonicalize_component_layers(component: dict[str, Any]) -> None:
         params["datatype"] = DEFAULT_DATATYPE
         params["waveguide_layer"] = PHOTONIC_LAYER
         params["waveguide_datatype"] = DEFAULT_DATATYPE
+    elif kind == "GC-SOI":
+        params["slab_layer"] = PHOTONIC_LAYER
+        params["slab_datatype"] = DEFAULT_DATATYPE
+        params["etched_layer"] = GC_LAYER
+        params["etched_datatype"] = DEFAULT_DATATYPE
     elif kind in GC_COMPOSITE_KINDS:
         params["layer"] = PHOTONIC_LAYER
         params["datatype"] = DEFAULT_DATATYPE

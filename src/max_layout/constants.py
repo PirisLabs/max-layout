@@ -133,6 +133,8 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
              'input_taper_length': 10.0,
              'output_taper_length': 10.0,
              'input_length': 6.0,
+             'input_reference_before_taper_um': 2.0,
+             'fdtd_port_clearance_um': 2.0,
              'output_length': 6.0,
              'port_sep': 3.25,
              'taper_power': 1.0,
@@ -732,6 +734,36 @@ DEFAULT_COMPONENT_VALUES["MMI split-combine test block"] = dict(DEFAULT_COMPONEN
 
 DEFAULT_COMPONENT_VALUES["MMI split-combine test block"].update({"mmi_width":7.0,"taper_length_start":8.0,"taper_length_stop":12.0,"taper_length_step":1.0,"taper_width_start":2.5,"taper_width_stop":3.1,"taper_width_step":0.1,"nominal_taper_width":2.7,"device_x_spacing":950.0,"device_y_spacing":950.0,"ebeam_field_size":850.0,"ebeam_edge_clearance":10.0,"include_ebeam_fields":True,"parameter_text_height":10.0})
 
+# Official Ansys Lumerical 3D SOI focusing-grating example.  These names and
+# values intentionally follow the model setup script in grating_coupler_3D.fsp.
+DEFAULT_COMPONENT_VALUES["GC-SOI"] = {
+    "target_length": 25.0,
+    "h_total": 0.22,
+    "etch_depth": 0.10,
+    "duty_cycle": 0.3992,
+    "pitch": 0.6713,
+    "radius": 25.0,
+    "y_span": 15.0,
+    "L_extra": 10.0,
+    "wg_width": 0.5,
+    "wg_length": 10.0,
+    "taper_exponent": 1.15,
+    "fiber_x_from_grating_start_um": 2.74533,
+    "fiber_tox_offset_um": 0.65,
+    "fiber_tilt_deg": 10.0,
+    "fiber_core_diameter_um": 9.0,
+    "fiber_core_index": 1.44427,
+    "fiber_cladding_diameter_um": 50.0,
+    "fiber_cladding_index": 1.43482,
+    "fiber_length_um": 20.0,
+    "fdtd_port_offset_from_waveguide_end_um": 3.0,
+    "slab_layer": PHOTONIC_LAYER,
+    "slab_datatype": DEFAULT_DATATYPE,
+    "etched_layer": GC_LAYER,
+    "etched_datatype": DEFAULT_DATATYPE,
+    "tolerance": 0.0005,
+}
+
 INTEGER_PARAMETERS.add("seg_segment_count")
 
 INTEGER_PARAMETERS.add("cascade_count")
@@ -855,6 +887,7 @@ CHOICE_PARAMETERS.update({
 })
 
 COMPONENT_DISPLAY_NAMES={
+    "GC-SOI":"GC-SOI — official Ansys 3D SOI grating coupler",
     "1x2 MMI":"1×2 Multimode Interferometer (MMI)",
     "Cascaded MMI":"Cascaded 1×2 MMI splitter tree",
     "MMI + Reference":"MMI device with reference waveguide",

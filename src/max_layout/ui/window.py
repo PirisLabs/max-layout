@@ -30,7 +30,7 @@ from ..geometry.shapes import mmi_total_length
 from ..geometry.rf_taper import synchronize_rf_taper_points
 from ..geometry.transforms import scene_to_world_point, transform_points, transformed_local_points, world_to_scene_point
 from ..modules_db import load_native_modules, save_native_modules
-from ..lumerical import write_lumerical_notebook
+from ..lumerical import default_stack, write_lumerical_notebook
 from ..params import resize_component_parameters
 from ..ports import PORT_ALIASES, component_global_ports, component_local_ports, solve_attachment
 from ..ui.dialogs import ArrayDialog, EbeamDialog, ModuleVariablesDialog
@@ -251,7 +251,7 @@ class NativeLayoutWindow(QMainWindow):
                 elif "mzi" in lower:group="MZI"
                 elif "mmi" in lower:group="MMI"
                 elif any(token in lower for token in ("ring", "racetrack", "resonator", "loopback")):group="Resonators"
-                elif "grating" in lower or "edge coupler" in lower:group="Grating couplers"
+                elif kind == "GC-SOI" or "grating" in lower or "edge coupler" in lower:group="Grating couplers"
                 elif any(token in lower for token in ("straight", "taper", "bend", "feedline", "waveguide")):group="Waveguides & bends"
                 else:group="Other photonic"
                 photonic_groups[group].append(kind)
@@ -937,6 +937,7 @@ class NativeLayoutWindow(QMainWindow):
             "Cascaded MMI": ["input", "output"],
             "MMI + Reference": ["left_external", "upper_right", "lower_right", "reference_left_external", "reference_right"],
             "Grating coupler": ["waveguide_point"],
+            "GC-SOI": ["waveguide_point"],
         }.get(kind)
         if not requested_ports:
             return []
@@ -954,10 +955,20 @@ class NativeLayoutWindow(QMainWindow):
             outward = float(port["outward_orientation_deg"]) % 360.0
             center = tuple(map(float, port["center"]))
             port_offset_um = 0.0
-            if kind == "Grating coupler" and port_name == "waveguide_point":
+            if kind in {"Grating coupler", "GC-SOI"} and port_name == "waveguide_point":
                 port_offset_um = max(
                     0.0,
                     float(component.get("params", {}).get("fdtd_port_offset_from_waveguide_end_um", 3.0)),
+                )
+                inward_angle = math.radians(outward + 180.0)
+                center = (
+                    center[0] + port_offset_um * math.cos(inward_angle),
+                    center[1] + port_offset_um * math.sin(inward_angle),
+                )
+            elif kind == "1x2 MMI":
+                port_offset_um = max(
+                    0.0,
+                    float(component.get("params", {}).get("fdtd_port_clearance_um", 2.0)),
                 )
                 inward_angle = math.radians(outward + 180.0)
                 center = (
@@ -982,19 +993,92 @@ class NativeLayoutWindow(QMainWindow):
             next_order += 1
             companions.append(placed)
 
-        if kind == "Grating coupler":
+        if kind == "1x2 MMI":
+            input_port = global_ports.get("left_external")
+            taper_start = global_ports.get("left_straight_end")
+            if input_port and taper_start:
+                outward = float(input_port["outward_orientation_deg"]) % 360.0
+                input_straight_um = max(0.1, float(component.get("params", {}).get("input_length", 6.0)))
+                before_taper_um = min(
+                    max(0.1, float(component.get("params", {}).get("input_reference_before_taper_um", 2.0))),
+                    max(0.1, input_straight_um - 0.1),
+                )
+                toward_input_angle = math.radians(outward)
+                taper_x, taper_y = map(float, taper_start["center"])
+                reference_x = taper_x + before_taper_um * math.cos(toward_input_angle)
+                reference_y = taper_y + before_taper_um * math.sin(toward_input_angle)
+                reference = self.make_component("Power monitor", reference_x, reference_y)
+                reference["orientation_deg"] = outward
+                reference["auto_placed"] = True
+                reference["simulation_parent_uid"] = int(component["uid"])
+                reference["simulation_parent_port"] = "left_external"
+                reference["mmi_input_reference_before_taper_um"] = before_taper_um
+                reference["params"].update(
+                    {
+                        "name": f"uid_{int(component['uid'])}_input_reference",
+                        "monitor geometry": "surface",
+                        "plane normal": "X",
+                        "distance_um": 0.0,
+                        "x span": 0.0,
+                        "y span": 2.5,
+                        "z span": 2.25,
+                    }
+                )
+                companions.append(reference)
+
+            # A Z-normal longitudinal profile through the device center shows
+            # how the launched fundamental mode expands and interferes along
+            # the input taper, MMI body, and output tapers.
+            total_length_um = mmi_total_length(component.get("params", {}))
+            local_center = np.asarray([0.5 * total_length_um, 0.0], dtype=float)
+            device_angle = float(component.get("orientation_deg", 0.0))
+            world_center = np.asarray(
+                [float(component.get("x", 0.0)), float(component.get("y", 0.0))],
+                dtype=float,
+            ) + np.asarray(
+                [
+                    local_center[0] * math.cos(math.radians(device_angle)),
+                    local_center[0] * math.sin(math.radians(device_angle)),
+                ]
+            )
+            profile = self.make_component("Field profile monitor", float(world_center[0]), float(world_center[1]))
+            profile["orientation_deg"] = device_angle
+            profile["auto_placed"] = True
+            profile["simulation_parent_uid"] = int(component["uid"])
+            profile["simulation_parent_port"] = "mmi_longitudinal_field"
+            profile["params"].update(
+                {
+                    "name": f"uid_{int(component['uid'])}_mmi_field",
+                    "monitor geometry": "surface",
+                    "plane normal": "Z",
+                    "z reference": "device center",
+                    "distance_um": 0.0,
+                    "x span": total_length_um,
+                    "y span": max(float(component.get("params", {}).get("mmi_width", 6.0)) + 2.0, float(component.get("params", {}).get("port_sep", 3.25)) + 4.0),
+                    "z span": 0.0,
+                }
+            )
+            companions.append(profile)
+
+        if kind in {"Grating coupler", "GC-SOI"}:
             # Place the fiber on the grating side: straight lead + complete
             # taper length + the user-controlled offset beyond that taper.
             grating_params = component.get("params", {})
-            taper_offset_um = max(
-                0.0,
-                float(grating_params.get("fiber_offset_after_taper_um", grating_params.get("fiber_offset_from_flare_um", 5.0))),
-            )
-            local_x = (
-                float(grating_params.get("wg_length", 5.0))
-                + float(grating_params.get("taper_L", 22.0))
-                + taper_offset_um
-            )
+            if kind == "GC-SOI":
+                taper_offset_um = max(0.0, float(grating_params.get("fiber_x_from_grating_start_um", 2.74533)))
+                local_x = float(grating_params.get("wg_length", 10.0)) + float(grating_params.get("radius", 25.0)) + taper_offset_um
+                fiber_angle_deg = float(grating_params.get("fiber_tilt_deg", 10.0))
+            else:
+                taper_offset_um = max(
+                    0.0,
+                    float(grating_params.get("fiber_offset_after_taper_um", grating_params.get("fiber_offset_from_flare_um", 5.0))),
+                )
+                local_x = (
+                    float(grating_params.get("wg_length", 5.0))
+                    + float(grating_params.get("taper_L", 22.0))
+                    + taper_offset_um
+                )
+                fiber_angle_deg = 7.0
             angle = math.radians(float(component.get("orientation_deg", 0.0)))
             fiber_x = float(component.get("x", 0.0)) + local_x * math.cos(angle)
             fiber_y = float(component.get("y", 0.0)) + local_x * math.sin(angle)
@@ -1006,15 +1090,30 @@ class NativeLayoutWindow(QMainWindow):
             fiber["params"].update(
                 {
                     "name": f"uid_{int(component['uid'])}_fiber",
-                    "angle theta": 7.0,
+                    "angle theta": fiber_angle_deg,
                     "angle phi": 0.0,
                     "distance_um": 0.0,
                     "z reference": "top of SiO2 cladding",
+                    "core diameter_um": float(grating_params.get("fiber_core_diameter_um", 9.0)),
+                    "core index": float(grating_params.get("fiber_core_index", 1.44427)),
+                    "cladding diameter_um": float(grating_params.get("fiber_cladding_diameter_um", 50.0)),
+                    "cladding index": float(grating_params.get("fiber_cladding_index", 1.43482)),
+                    "fiber length_um": float(grating_params.get("fiber_length_um", 20.0)),
                 }
             )
             companions.append(fiber)
 
-            fiber_port = self.make_component("Fiber-axis FDTD port", fiber_x, fiber_y)
+            port_local_x = local_x
+            port_distance_um = 0.0
+            if kind == "GC-SOI":
+                tox_offset_um = float(grating_params.get("fiber_tox_offset_um", 0.65))
+                port_local_x += tox_offset_um * math.sin(math.radians(fiber_angle_deg))
+                # Official model: TOX center + 0.65 cos(theta), with the port
+                # measured here from the 0.70 um TOX top.
+                port_distance_um = tox_offset_um * math.cos(math.radians(fiber_angle_deg)) - 0.35
+            fiber_port_x = float(component.get("x", 0.0)) + port_local_x * math.cos(angle)
+            fiber_port_y = float(component.get("y", 0.0)) + port_local_x * math.sin(angle)
+            fiber_port = self.make_component("Fiber-axis FDTD port", fiber_port_x, fiber_port_y)
             fiber_port["orientation_deg"] = float(component.get("orientation_deg", 0.0))
             fiber_port["auto_placed"] = True
             fiber_port["simulation_parent_uid"] = int(component["uid"])
@@ -1025,10 +1124,11 @@ class NativeLayoutWindow(QMainWindow):
                     # Match the official Ansys grating model: fiber is the
                     # first/source port and waveguide is the second/receiver.
                     "order": next_order - 1,
-                    "angle theta": 7.0,
+                    "dir": "Backward",
+                    "angle theta": fiber_angle_deg,
                     "angle phi": 0.0,
-                    "rotation offset_um": 4.0 * 9.0 * math.tan(math.radians(7.0)),
-                    "distance_um": 0.0,
+                    "rotation offset_um": 4.0 * float(grating_params.get("fiber_core_diameter_um", 9.0)) * math.tan(math.radians(fiber_angle_deg)),
+                    "distance_um": port_distance_um,
                     "z reference": "top of stack",
                 }
             )
@@ -1057,7 +1157,7 @@ class NativeLayoutWindow(QMainWindow):
                     outward = float(port["outward_orientation_deg"]) % 360.0
                     center_x, center_y = map(float, port["center"])
                     port_offset_um = 0.0
-                    if str(component.get("kind", "")) == "Grating coupler" and str(parent_port_name) == "waveguide_point":
+                    if str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"} and str(parent_port_name) == "waveguide_point":
                         port_offset_um = max(
                             0.0,
                             float(component.get("params", {}).get("fdtd_port_offset_from_waveguide_end_um", 3.0)),
@@ -1065,30 +1165,102 @@ class NativeLayoutWindow(QMainWindow):
                         inward_angle = math.radians(outward + 180.0)
                         center_x += port_offset_um * math.cos(inward_angle)
                         center_y += port_offset_um * math.sin(inward_angle)
+                    elif (
+                        str(component.get("kind", "")) == "1x2 MMI"
+                        and companion.get("kind") == "FDTD port"
+                    ):
+                        port_offset_um = max(
+                            0.0,
+                            float(component.get("params", {}).get("fdtd_port_clearance_um", 2.0)),
+                        )
+                        inward_angle = math.radians(outward + 180.0)
+                        center_x += port_offset_um * math.cos(inward_angle)
+                        center_y += port_offset_um * math.sin(inward_angle)
+                    if (
+                        str(component.get("kind", "")) == "1x2 MMI"
+                        and str(parent_port_name) == "left_external"
+                        and companion.get("kind") == "Power monitor"
+                    ):
+                        taper_start = global_ports.get("left_straight_end")
+                        input_straight_um = max(
+                            0.1, float(component.get("params", {}).get("input_length", 6.0))
+                        )
+                        before_taper_um = min(
+                            max(
+                                0.1,
+                                float(component.get("params", {}).get("input_reference_before_taper_um", 2.0)),
+                            ),
+                            max(0.1, input_straight_um - 0.1),
+                        )
+                        if taper_start:
+                            center_x, center_y = map(float, taper_start["center"])
+                        toward_input_angle = math.radians(outward)
+                        center_x += before_taper_um * math.cos(toward_input_angle)
+                        center_y += before_taper_um * math.sin(toward_input_angle)
+                        port_offset_um = before_taper_um
                     companion["x"], companion["y"] = center_x, center_y
                     companion["orientation_deg"] = outward
                     companion["waveguide_end_offset_um"] = port_offset_um
-            if str(component.get("kind", "")) == "Grating coupler" and companion.get("kind") in {"Fiber geometry", "Fiber-axis FDTD port"}:
+            if str(component.get("kind", "")) == "1x2 MMI" and companion.get("simulation_parent_port") == "mmi_longitudinal_field":
+                total_length_um = mmi_total_length(component.get("params", {}))
+                angle_rad = math.radians(float(component.get("orientation_deg", 0.0)))
+                companion["x"] = float(component.get("x", 0.0)) + 0.5 * total_length_um * math.cos(angle_rad)
+                companion["y"] = float(component.get("y", 0.0)) + 0.5 * total_length_um * math.sin(angle_rad)
+                companion["orientation_deg"] = float(component.get("orientation_deg", 0.0))
+                companion.setdefault("params", {}).update(
+                    {
+                        "x span": total_length_um,
+                        "y span": max(float(component.get("params", {}).get("mmi_width", 6.0)) + 2.0, float(component.get("params", {}).get("port_sep", 3.25)) + 4.0),
+                        "z reference": "device center",
+                    }
+                )
+            if str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"} and companion.get("kind") in {"Fiber geometry", "Fiber-axis FDTD port"}:
                 params = component.get("params", {})
-                offset_um = max(
-                    0.0,
-                    float(params.get("fiber_offset_after_taper_um", params.get("fiber_offset_from_flare_um", 5.0))),
-                )
-                local_x = (
-                    float(params.get("wg_length", 5.0))
-                    + float(params.get("taper_L", 22.0))
-                    + offset_um
-                )
+                is_soi = str(component.get("kind", "")) == "GC-SOI"
+                if is_soi:
+                    offset_um = max(0.0, float(params.get("fiber_x_from_grating_start_um", 2.74533)))
+                    local_x = float(params.get("wg_length", 10.0)) + float(params.get("radius", 25.0)) + offset_um
+                    theta_deg = float(params.get("fiber_tilt_deg", 10.0))
+                    if companion.get("kind") == "Fiber-axis FDTD port":
+                        tox_offset_um = float(params.get("fiber_tox_offset_um", 0.65))
+                        local_x += tox_offset_um * math.sin(math.radians(theta_deg))
+                else:
+                    offset_um = max(
+                        0.0,
+                        float(params.get("fiber_offset_after_taper_um", params.get("fiber_offset_from_flare_um", 5.0))),
+                    )
+                    local_x = (
+                        float(params.get("wg_length", 5.0))
+                        + float(params.get("taper_L", 22.0))
+                        + offset_um
+                    )
+                    theta_deg = 7.0
                 angle = math.radians(float(component.get("orientation_deg", 0.0)))
                 companion["x"] = float(component.get("x", 0.0)) + local_x * math.cos(angle)
                 companion["y"] = float(component.get("y", 0.0)) + local_x * math.sin(angle)
                 companion["orientation_deg"] = float(component.get("orientation_deg", 0.0))
                 companion["grating_taper_end_offset_um"] = offset_um
+                companion.setdefault("params", {})["angle theta"] = theta_deg
                 if companion.get("kind") == "Fiber geometry":
                     # Migrate automatic fibers created before the SiO2-specific
                     # vertical reference was introduced. Manual fibers retain
                     # their independently selected reference.
                     companion.setdefault("params", {})["z reference"] = "top of SiO2 cladding"
+                    companion["params"]["distance_um"] = 0.0
+                    if is_soi:
+                        companion["params"].update(
+                            {
+                                "core diameter_um": float(params.get("fiber_core_diameter_um", 9.0)),
+                                "core index": float(params.get("fiber_core_index", 1.44427)),
+                                "cladding diameter_um": float(params.get("fiber_cladding_diameter_um", 50.0)),
+                                "cladding index": float(params.get("fiber_cladding_index", 1.43482)),
+                                "fiber length_um": float(params.get("fiber_length_um", 20.0)),
+                            }
+                        )
+                elif is_soi:
+                    tox_offset_um = float(params.get("fiber_tox_offset_um", 0.65))
+                    companion["params"]["distance_um"] = tox_offset_um * math.cos(math.radians(theta_deg)) - 0.35
+                    companion["params"]["rotation offset_um"] = 4.0 * float(params.get("fiber_core_diameter_um", 9.0)) * math.tan(math.radians(theta_deg))
         return True
 
     def configure_test_block_sweeps(self, component: dict[str, Any]) -> bool:
@@ -1698,7 +1870,7 @@ class NativeLayoutWindow(QMainWindow):
             parameter_label = (
                 "Fiber offset after taper toward grating (µm)" if key == "fiber_offset_after_taper_um"
                 else "FDTD port offset from waveguide end (µm)" if key == "fdtd_port_offset_from_waveguide_end_um"
-                else "Grating straight waveguide length (µm)" if key == "wg_length" and component.get("kind") == "Grating coupler"
+                else "Grating straight waveguide length (µm)" if key == "wg_length" and component.get("kind") in {"Grating coupler", "GC-SOI"}
                 else "GC straight lead length (µm)" if key == "gc_wg_length"
                 else "CPW taper model" if key == "cpw_profile"
                 else key
@@ -1836,7 +2008,7 @@ class NativeLayoutWindow(QMainWindow):
             return RF_LAYER
         if kind in MARKER_COMPONENT_KINDS:
             return MARKER_LAYER
-        if kind == "Grating coupler":
+        if kind in {"Grating coupler", "GC-SOI"}:
             return GC_LAYER
         if kind in {"Chip outline", "4-inch wafer outline"}:
             return int(component.get("params", {}).get("layer", 100))
@@ -3374,7 +3546,23 @@ class NativeLayoutWindow(QMainWindow):
         if clicked_component is None:
             selected = self.selected_components()
             clicked_component = selected[0] if selected else None
-        saved = clicked_component.get("lumerical_export_settings", {}) if clicked_component else {}
+        settings_component = clicked_component
+        if clicked_component and clicked_component.get("kind") in SIMULATION_COMPONENT_KINDS:
+            parent_uid = clicked_component.get("simulation_parent_uid")
+            settings_component = next(
+                (component for component in self.components if int(component.get("uid", -1)) == int(parent_uid)),
+                clicked_component,
+            ) if parent_uid is not None else clicked_component
+        saved = settings_component.get("lumerical_export_settings", {}) if settings_component else {}
+        if settings_component and settings_component.get("kind") == "GC-SOI" and not saved:
+            saved = {
+                "stack_preset": "SOI grating coupler (Ansys)",
+                "material_stack": default_stack("SOI grating coupler (Ansys)"),
+                "wavelength_start_um": 1.50,
+                "wavelength_stop_um": 1.60,
+                "resource_mode": "GPU",
+                "dimension": "3D",
+            }
         dialog = LumericalExportDialog(
             self.components,
             self.lumerical_scope_options(clicked_component),
@@ -3411,8 +3599,8 @@ class NativeLayoutWindow(QMainWindow):
             return
 
         snapshot = self.snapshot()
-        if clicked_component is not None:
-            clicked_component["lumerical_export_settings"] = safe_json_copy(configuration)
+        if settings_component is not None:
+            settings_component["lumerical_export_settings"] = safe_json_copy(configuration)
         self.commit_interaction_snapshot(snapshot)
         self.rebuild_scene(preserve_selection=True)
         message = f"Exported self-contained Lumerical notebook: {path}"
@@ -4375,7 +4563,7 @@ ENDFLOW
         elif clicked_layer == EBEAM_LAYER:
             add("E-beam write fields", field_keys)
 
-        if kind == "Grating coupler":
+        if kind in {"Grating coupler", "GC-SOI"}:
             add("Grating coupler", gc_keys)
         elif kind in {"Straight", "Taper", "S-bend", "Euler bend"}:
             add(kind, tuple(p.keys()))

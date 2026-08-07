@@ -375,6 +375,16 @@ class ThreeDModelPreview(QWidget):
                 continue
             row, row_z0, row_z1 = matching[0]
             etch_depth = min(row_z1 - row_z0, max(0.0, float(row.get("etch_depth_um", row_z1 - row_z0))))
+            film_top = row_z1 - etch_depth
+            if (
+                str(row.get("slab_extent", "full")).strip().lower() == "geometry"
+                and film_top > row_z0
+            ):
+                projected_slab_top = [raw((float(point[0]), float(point[1]), film_top)) for point in points]
+                projected_slab_bottom = [raw((float(point[0]), float(point[1]), row_z0)) for point in points]
+                all_points.extend(projected_slab_top)
+                all_points.extend(projected_slab_bottom)
+                polygon_rows.append((projected_slab_top, projected_slab_bottom, row))
             if etch_depth <= 0.0:
                 continue
             patterned_z0 = row_z1 - etch_depth
@@ -432,6 +442,8 @@ class ThreeDModelPreview(QWidget):
                 etch_depth = min(row_z1 - row_z0, max(0.0, float(row.get("etch_depth_um", row_z1 - row_z0))))
                 film_top = row_z1 - etch_depth
                 if film_top <= row_z0:
+                    continue
+                if str(row.get("slab_extent", "full")).strip().lower() == "geometry":
                     continue
                 top_face = [screen(raw((x0, y0, film_top))), screen(raw((x1, y0, film_top))),
                             screen(raw((x1, y1, film_top))), screen(raw((x0, y1, film_top)))]
@@ -821,7 +833,7 @@ class LumericalExportDialog(QDialog):
         controls.addWidget(add_button)
         controls.addWidget(remove_button)
         layout.addLayout(controls)
-        self.stack_table = QTableWidget(0, 8)
+        self.stack_table = QTableWidget(0, 10)
         self.stack_table.setHorizontalHeaderLabels(
             [
                 "Layer name",
@@ -831,6 +843,8 @@ class LumericalExportDialog(QDialog):
                 "Sidewall angle (°)",
                 "Layer type",
                 "GDS layers",
+                "Unetched slab extent",
+                "Mesh factor × λ/n",
                 "Conformal fill",
             ]
         )
@@ -838,7 +852,7 @@ class LumericalExportDialog(QDialog):
         self.stack_table.setMinimumHeight(430)
         self.stack_table.verticalHeader().setDefaultSectionSize(48)
         self.stack_table.horizontalHeader().setMinimumSectionSize(120)
-        for column, width in enumerate((205, 290, 165, 165, 180, 215, 135, 145)):
+        for column, width in enumerate((205, 290, 165, 165, 180, 215, 135, 205, 165, 145)):
             self.stack_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
             self.stack_table.setColumnWidth(column, width)
         self.stack_table.horizontalHeader().setStretchLastSection(True)
@@ -847,6 +861,8 @@ class LumericalExportDialog(QDialog):
             "Rows are ordered bottom-to-top. Full-film rows become simulation slabs. Exported cross-section rows use the selected "
             "layout polygons, etch depth, and waveguide sidewall angle. 90° is vertical; below 90° is wider at the bottom. "
             "Etch depth 0 keeps a full unetched film; etch depth equal to thickness is a full etch. A thickness of 0 means the layer is absent. "
+            "For a partially etched cross-section, Unetched slab extent can keep the slab across the full FDTD plane or only beneath the selected GDS geometry. "
+            "Mesh factor × λ/n makes the notebook calculate the layer mesh from the shortest simulated wavelength and that material's dispersive index. For example, 0.5 means 0.5 × λ₀/n; 0 uses Lumerical's automatic mesh. "
             "Conformal fill extends a background/cladding layer down into the etched openings of the patterned layer below. "
             "Air is available as a material. Very large first/last background thicknesses are allowed and are cropped by the draggable FDTD domain so those media extend through the PML."
         )
@@ -921,7 +937,30 @@ class LumericalExportDialog(QDialog):
         layer_entry.setToolTip("Every listed GDS layer receives this patterned material at the same vertical position.")
         layer_entry.setMinimumSize(115, 38)
         self.stack_table.setCellWidget(row, 6, layer_entry)
-        self.stack_table.setItem(row, 7, _checked_item(bool(data.get("conformal", False))))
+        slab_extent = QComboBox()
+        slab_extent.addItems(["Full FDTD plane", "Under geometry"])
+        slab_extent.setCurrentText(
+            "Under geometry"
+            if str(data.get("slab_extent", "full")).strip().lower() == "geometry"
+            else "Full FDTD plane"
+        )
+        slab_extent.setMinimumSize(180, 38)
+        slab_extent.setToolTip(
+            "Controls the lateral extent of the unetched slab below a partially etched exported cross-section."
+        )
+        self.stack_table.setCellWidget(row, 7, slab_extent)
+        mesh_factor = QDoubleSpinBox()
+        mesh_factor.setRange(0.0, 1000.0)
+        mesh_factor.setDecimals(6)
+        mesh_factor.setSingleStep(0.05)
+        mesh_factor.setSpecialValueText("Automatic")
+        mesh_factor.setValue(max(0.0, float(data.get("mesh_factor", 0.1))))
+        mesh_factor.setMinimumSize(155, 38)
+        mesh_factor.setToolTip(
+            "Isotropic mesh step as a factor of λ₀/n at the shortest simulated wavelength. For anisotropic media, n is the largest index component."
+        )
+        self.stack_table.setCellWidget(row, 8, mesh_factor)
+        self.stack_table.setItem(row, 9, _checked_item(bool(data.get("conformal", False))))
         if hasattr(self, "cross_section_preview"):
             self._connect_stack_preview_signals()
             self._refresh_previews()
@@ -1021,7 +1060,11 @@ class LumericalExportDialog(QDialog):
                     "sidewall_angle_deg": float(self.stack_table.cellWidget(row, 4).value()),
                     "role": "geometry" if self.stack_table.cellWidget(row, 5).currentText() == "Exported cross-section" else "background",
                     "gds_layers": gds_layers or [0],
-                    "conformal": self.stack_table.item(row, 7).checkState() == Qt.CheckState.Checked,
+                    "slab_extent": "geometry"
+                    if self.stack_table.cellWidget(row, 7).currentText() == "Under geometry"
+                    else "full",
+                    "mesh_factor": float(self.stack_table.cellWidget(row, 8).value()),
+                    "conformal": self.stack_table.item(row, 9).checkState() == Qt.CheckState.Checked,
                 }
             )
         return stack
@@ -1154,12 +1197,12 @@ class LumericalExportDialog(QDialog):
 
     def _connect_stack_preview_signals(self) -> None:
         for row in range(self.stack_table.rowCount()):
-            for column in (1, 5):
+            for column in (1, 5, 7):
                 widget = self.stack_table.cellWidget(row, column)
                 if isinstance(widget, QComboBox) and not widget.property("preview_connected"):
                     widget.currentTextChanged.connect(self._refresh_previews)
                     widget.setProperty("preview_connected", True)
-            for column in (2, 3, 4):
+            for column in (2, 3, 4, 8):
                 widget = self.stack_table.cellWidget(row, column)
                 if isinstance(widget, QDoubleSpinBox) and not widget.property("preview_connected"):
                     widget.valueChanged.connect(self._refresh_previews)

@@ -20,6 +20,7 @@ PORT_ALIASES: dict[str, dict[str, str]] = {
     "S-bend": {"input": "left", "output": "right"},
     "Euler bend": {"input": "start", "output": "end"},
     "Grating coupler": {"waveguide": "waveguide_point"},
+    "GC-SOI": {"waveguide": "waveguide_point"},
     "1x2 MMI": {"input": "left_external", "upper": "upper_right", "lower": "lower_right"},
     "Cascaded MMI": {"input": "input", "output": "output"},
     "MMI split-combine cascade": {"input": "input_gc_waveguide", "output": "output_gc_waveguide", "reference_input": "reference_input_gc_waveguide", "reference_output": "reference_output_gc_waveguide"},
@@ -64,7 +65,7 @@ def component_local_ports(component: dict[str, Any]) -> dict[str, dict[str, Any]
     elif kind == "Euler bend":
         endpoint = euler_output_local(p, mirrored)
         add("start", (0.0, 0.0), 180.0); add("end", endpoint, ms * float(p["bend_angle_deg"]))
-    elif kind == "Grating coupler":
+    elif kind in {"Grating coupler", "GC-SOI"}:
         add("waveguide_point", (0.0, 0.0), 180.0)
     elif kind == "1x2 MMI":
         x1=float(p["input_length"]); x2=x1+float(p["input_taper_length"]); x3=x2+float(p["mmi_length"]); L=mmi_total_length(p); sep=ms*float(p["port_sep"])/2.0

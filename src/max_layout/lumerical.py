@@ -50,6 +50,13 @@ STACK_PRESETS: dict[str, list[dict[str, Any]]] = {
         {"name": "Al2O3", "material": "Al2O3", "thickness_um": 0.0, "role": "geometry", "gds_layer": 1},
         {"name": "Metal", "material": "Al (Aluminium) - Palik", "thickness_um": 0.0, "role": "geometry", "gds_layers": [4, 5]},
     ],
+    "SOI grating coupler (Ansys)": [
+        {"name": "Si substrate", "material": "Si (Silicon) - Palik", "thickness_um": 3.0, "role": "background", "gds_layer": 0, "mesh_factor": 0.1},
+        {"name": "SiO2 BOX", "material": "SiO2 (Glass) - Palik", "thickness_um": 1.0, "role": "background", "gds_layer": 0, "mesh_factor": 0.1},
+        {"name": "GC-SOI residual slab", "material": "Si (Silicon) - Palik", "thickness_um": 0.12, "etch_depth_um": 0.12, "sidewall_angle_deg": 90.0, "role": "geometry", "gds_layers": [1], "slab_extent": "geometry", "mesh_factor": 0.1},
+        {"name": "GC-SOI upper silicon", "material": "Si (Silicon) - Palik", "thickness_um": 0.10, "etch_depth_um": 0.10, "sidewall_angle_deg": 90.0, "role": "geometry", "gds_layers": [2], "slab_extent": "geometry", "mesh_factor": 0.1},
+        {"name": "SiO2 TOX", "material": "SiO2 (Glass) - Palik", "thickness_um": 0.48, "role": "background", "gds_layer": 0, "conformal": True, "mesh_factor": 0.1},
+    ],
     "Al2O3 on SiO2": [
         {"name": "Si substrate", "material": "Si (Silicon) - Palik", "thickness_um": 2.0, "role": "background", "gds_layer": 0},
         {"name": "SiO2", "material": "SiO2 (Glass) - Palik", "thickness_um": 2.0, "role": "background", "gds_layer": 0},
@@ -204,6 +211,10 @@ def _standalone_monitor(component: dict[str, Any]) -> dict[str, Any]:
             "component_uid": int(component.get("uid", 0)),
         }
     )
+    if component.get("simulation_parent_uid") is not None:
+        params["parent_component_uid"] = int(component["simulation_parent_uid"])
+    if component.get("simulation_parent_port") is not None:
+        params["parent_port_name"] = str(component["simulation_parent_port"])
     return params
 
 
@@ -493,6 +504,9 @@ for _old_name in {
     "grating_response.png",
     "grating_farfield.png",
     "grating_analysis.npz",
+    "mmi_splitting_ratio.png",
+    "mmi_field_distribution.png",
+    "mmi_analysis.npz",
 }:
     for _old_path in (
         os.path.join(REMOTE_WORK, _old_name),
@@ -655,11 +669,43 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
         fdtd.setlayer(name, "process", "background")
         fdtd.setlayer(name, "background material", material)
 
+    def matching_geometry_keys(row):
+        target_layers = {int(value) for value in row.get("gds_layers", [row.get("gds_layer", 1)])}
+        return [
+            key for key in geometry_by_layer
+            if int(key.split(":", 1)[0]) in target_layers
+        ]
+
+    def add_patterned_layers(name_prefix, row, z_min_um, z_max_um, sidewall_angle_deg):
+        if z_max_um <= z_min_um:
+            return 0
+        matching_keys = matching_geometry_keys(row)
+        for key_index, layer_key in enumerate(matching_keys, start=1):
+            process_name = f"{name_prefix} {key_index} ({layer_key})"
+            fdtd.addlayer(process_name)
+            fdtd.setlayer(process_name, "layer number", layer_key)
+            fdtd.setlayer(process_name, "start position", z_min_um * UM)
+            fdtd.setlayer(process_name, "thickness", (z_max_um - z_min_um) * UM)
+            fdtd.setlayer(process_name, "process", "grow")
+            fdtd.setlayer(process_name, "pattern material", row["material"])
+            fdtd.setlayer(process_name, "sidewall angle", sidewall_angle_deg)
+        return len(matching_keys)
+
     def conformal_start(row_number, default_z_min_um):
         """Extend a cladding down through the etched portion of the patterned layer below."""
+        consecutive_geometry = []
         for previous_row, previous_z0, previous_z1 in reversed(z_ranges[: row_number - 1]):
             if str(previous_row.get("role", "background")) != "geometry":
+                if consecutive_geometry:
+                    break
                 continue
+            consecutive_geometry.append((previous_row, previous_z0, previous_z1))
+        if len(consecutive_geometry) > 1:
+            # A multi-mask vertical device (for example the official SOI
+            # residual-slab + upper-silicon pair) is one physical film.  Its
+            # conformal oxide fills beside both masks down to the device base.
+            return min(default_z_min_um, min(item[1] for item in consecutive_geometry))
+        for previous_row, previous_z0, previous_z1 in consecutive_geometry:
             previous_thickness = previous_z1 - previous_z0
             previous_etch = min(
                 previous_thickness,
@@ -689,28 +735,82 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
         thickness_um = z1 - z0
         etch_depth_um = min(thickness_um, max(0.0, float(row.get("etch_depth_um", thickness_um))))
         if etch_depth_um < thickness_um:
-            add_background(f"{base_name} unetched film", row["material"], z0, z1 - etch_depth_um)
+            slab_extent = str(row.get("slab_extent", "full")).strip().lower()
+            if slab_extent == "geometry":
+                slab_count = add_patterned_layers(
+                    f"{base_name} footprint slab",
+                    row,
+                    z0,
+                    z1 - etch_depth_um,
+                    90.0,
+                )
+                if slab_count:
+                    print("Limited unetched slab %s to the exported geometry footprint." % row["name"])
+                else:
+                    print(
+                        "Warning: %s requested a geometry-limited slab but no matching GDS polygons were found."
+                        % row["name"]
+                    )
+            else:
+                add_background(f"{base_name} unetched film", row["material"], z0, z1 - etch_depth_um)
         if etch_depth_um <= 0.0:
             continue
 
         target_layers = {int(value) for value in row.get("gds_layers", [row.get("gds_layer", 1)])}
-        matching_keys = [
-            key for key in geometry_by_layer
-            if int(key.split(":", 1)[0]) in target_layers
-        ]
+        matching_keys = matching_geometry_keys(row)
         if not matching_keys:
             print(f'Warning: {row["name"]} has no polygons on GDS layers {sorted(target_layers)}.')
             continue
         sidewall_angle_deg = min(179.999, max(0.001, float(row.get("sidewall_angle_deg", 90.0))))
-        for key_index, layer_key in enumerate(matching_keys, start=1):
-            process_name = f"{base_name} pattern {key_index} ({layer_key})"
-            fdtd.addlayer(process_name)
-            fdtd.setlayer(process_name, "layer number", layer_key)
-            fdtd.setlayer(process_name, "start position", (z1 - etch_depth_um) * UM)
-            fdtd.setlayer(process_name, "thickness", etch_depth_um * UM)
-            fdtd.setlayer(process_name, "process", "grow")
-            fdtd.setlayer(process_name, "pattern material", row["material"])
-            fdtd.setlayer(process_name, "sidewall angle", sidewall_angle_deg)
+        add_patterned_layers(
+            f"{base_name} pattern",
+            row,
+            z1 - etch_depth_um,
+            z1,
+            sidewall_angle_deg,
+        )
+
+
+def _add_layer_mesh_overrides(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_z_max_um):
+    """Resolve dispersive material indices and apply wavelength-scaled layer meshes."""
+    wavelength_min_um = min(
+        float(SETTINGS.get("wavelength_start_um", 1.25)),
+        float(SETTINGS.get("wavelength_stop_um", 1.35)),
+    )
+    frequency_hz = 299792458.0 / (wavelength_min_um * UM)
+    for row_index, (row, z0, z1) in enumerate(z_ranges, start=1):
+        mesh_factor = max(0.0, float(row.get("mesh_factor", 0.1)))
+        mesh_z0 = max(float(z0), float(simulation_z_min_um))
+        mesh_z1 = min(float(z1), float(simulation_z_max_um))
+        if mesh_factor <= 0.0 or mesh_z1 <= mesh_z0:
+            continue
+        material = str(row.get("material", ""))
+        material_index = np.asarray(fdtd.getindex(material, frequency_hz))
+        finite_indices = np.abs(material_index[np.isfinite(material_index)])
+        if finite_indices.size == 0 or float(np.max(finite_indices)) <= 0.0:
+            raise RuntimeError("Could not determine a finite refractive index for mesh layer " + material)
+        # The maximum component is deliberately used for anisotropic media so
+        # no crystal axis receives a coarser-than-requested optical mesh.
+        maximum_index = float(np.max(finite_indices))
+        mesh_step_um = mesh_factor * wavelength_min_um / maximum_index
+        fdtd.addmesh()
+        fdtd.set("name", "mesh %02d %s" % (row_index, str(row.get("name", "layer"))))
+        fdtd.set("x min", float(bounds[0]) * UM)
+        fdtd.set("x max", float(bounds[2]) * UM)
+        fdtd.set("y min", float(bounds[1]) * UM)
+        fdtd.set("y max", float(bounds[3]) * UM)
+        fdtd.set("z min", mesh_z0 * UM)
+        fdtd.set("z max", mesh_z1 * UM)
+        fdtd.set("override x mesh", True)
+        fdtd.set("override y mesh", True)
+        fdtd.set("override z mesh", True)
+        fdtd.set("dx", mesh_step_um * UM)
+        fdtd.set("dy", mesh_step_um * UM)
+        fdtd.set("dz", mesh_step_um * UM)
+        print(
+            "Layer mesh override %s: factor %.6g x lambda0/n, |n|max %.6g, %.6g um isotropic step."
+            % (row.get("name", "layer"), mesh_factor, maximum_index, mesh_step_um)
+        )
 
 
 def _polygon_cross_section(vertices, axis_index, coordinate_um, transverse_um):
@@ -1009,7 +1109,8 @@ def _add_monitors(fdtd, z_center_um, device_top_um):
             plane_normal = min(((abs(x_span), "X"), (abs(y_span), "Y"), (abs(z_span), "Z")))[1]
         axis = {"X": "x-axis", "Y": "y-axis", "Z": "z-axis"}[plane_normal]
         if axis == "z-axis":
-            z_um = device_top_um + distance_um
+            z_reference = str(monitor.get("z reference", "device top")).strip().lower()
+            z_um = (z_center_um if z_reference == "device center" else device_top_um) + distance_um
         else:
             x_um += distance_um * np.cos(np.deg2rad(actual))
             y_um += distance_um * np.sin(np.deg2rad(actual))
@@ -1230,6 +1331,7 @@ def build_simulation():
         _add_material_stack(
             fdtd, z_ranges, bounds, simulation_z_min_um, simulation_z_max_um, pml_geometry_overlap_um
         )
+        _add_layer_mesh_overrides(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_z_max_um)
         if SETTINGS.get("include_ports", True):
             _add_waveguide_boundary_extensions(fdtd, z_ranges, bounds, boundary_clearance_um, pml_geometry_overlap_um)
     # Port eigensolvers must see the requested wavelength range before their
@@ -1329,10 +1431,17 @@ def _draw_process_projection(axis, coordinate_index, coordinate_label):
         etch_depth = min(thickness, max(0.0, float(row.get("etch_depth_um", thickness))))
         patterned_z0 = float(z1 - etch_depth)
         if patterned_z0 > z0:
-            axis.add_patch(Rectangle(
-                (coordinate_min, z0), coordinate_max - coordinate_min, patterned_z0 - z0,
-                facecolor=color, edgecolor="#475569", linewidth=0.5, alpha=0.48,
-            ))
+            if str(row.get("slab_extent", "full")).strip().lower() == "geometry":
+                for interval_min, interval_max in _projection_intervals(coordinate_index, row):
+                    axis.add_patch(Rectangle(
+                        (interval_min, z0), interval_max - interval_min, patterned_z0 - z0,
+                        facecolor=color, edgecolor="#475569", linewidth=0.5, alpha=0.48,
+                    ))
+            else:
+                axis.add_patch(Rectangle(
+                    (coordinate_min, z0), coordinate_max - coordinate_min, patterned_z0 - z0,
+                    facecolor=color, edgecolor="#475569", linewidth=0.5, alpha=0.48,
+                ))
         if etch_depth <= 0.0:
             continue
 
@@ -1561,6 +1670,14 @@ if GRATING_ANALYSIS:
     print("Grating excitation direction: Backward along the tilted Z-axis fiber port")
     print("Grating excitation mode: mode 1")
     print("Grating receiver port: FDTD::ports::" + str(GRATING_ANALYSIS["waveguide_port_name"]))
+elif MMI_ANALYSIS:
+    fdtd.switchtolayout()
+    fdtd.select("FDTD::ports")
+    fdtd.set("source port", str(MMI_ANALYSIS["input_port_name"]))
+    fdtd.set("source mode", "mode 1")
+    print("MMI excitation source: FDTD::ports::" + str(MMI_ANALYSIS["input_port_name"]))
+    print("MMI excitation mode: mode 1")
+    print("MMI output ports:", ", ".join(map(str, MMI_ANALYSIS["output_port_names"])))
 
 _project_name = os.path.basename(str(SETTINGS.get("project_file", "exported_component.fsp")))
 if not _project_name.lower().endswith(".fsp"):
@@ -1660,6 +1777,7 @@ with open(REMOTE_RESULTS_JSON, "w", encoding="utf-8") as stream:
             "exported_components": EXPORTED_COMPONENTS,
             "material_stack": MATERIAL_STACK,
             "grating_analysis": GRATING_ANALYSIS,
+            "mmi_analysis": MMI_ANALYSIS,
         },
         stream,
         indent=2,
@@ -1855,6 +1973,213 @@ else:
 '''
 
 
+_MMI_ANALYSIS_REMOTE = r'''# Mode-1 input to the two MMI output waveguides.
+import matplotlib.pyplot as plt
+
+if not MMI_ANALYSIS:
+    print("No supported 1x2 MMI was exported; splitting-ratio analysis is not required.")
+elif not SETTINGS.get("run_after_build", False):
+    print("MMI analysis is ready but unsolved. Enable run_after_build and rerun from the solve section.")
+else:
+    input_port_name = str(MMI_ANALYSIS["input_port_name"])
+    input_reference_monitor_name = str(MMI_ANALYSIS["input_reference_monitor_name"])
+    output_port_names = list(map(str, MMI_ANALYSIS["output_port_names"]))
+    output_labels = list(map(str, MMI_ANALYSIS["output_labels"]))
+
+    def _port_transmission(port_name):
+        port_path = "::model::FDTD::ports::" + port_name
+        try:
+            T_data = fdtd.getresult(port_path, "T")
+        except Exception as exc:
+            raise RuntimeError(
+                "MMI output port %r has no T result. Confirm that it is inside the FDTD region and rerun the solve. %s"
+                % (port_name, exc)
+            ) from None
+        wavelength = np.squeeze(np.asarray(T_data["lambda"], dtype=float)).ravel()
+        power = np.abs(np.squeeze(np.asarray(T_data["T"]))).ravel()
+        if power.size != wavelength.size:
+            wavelength_axes = [axis for axis, size in enumerate(np.asarray(T_data["T"]).shape) if size == wavelength.size]
+            if not wavelength_axes:
+                raise RuntimeError("Could not align MMI port %s T data with wavelength" % port_name)
+            values = np.moveaxis(np.asarray(T_data["T"]), wavelength_axes[0], 0)
+            power = np.abs(values.reshape(wavelength.size, -1)[:, 0])
+        order = np.argsort(wavelength)
+        return wavelength[order], power[order]
+
+    def _reference_transmission(monitor_name):
+        try:
+            T_data = fdtd.getresult("::model::" + monitor_name, "T")
+        except Exception as exc:
+            raise RuntimeError(
+                "MMI input reference monitor %r has no T result. %s" % (monitor_name, exc)
+            ) from None
+        wavelength = np.squeeze(np.asarray(T_data["lambda"], dtype=float)).ravel()
+        power = np.abs(np.squeeze(np.asarray(T_data["T"]))).ravel()
+        order = np.argsort(wavelength)
+        return wavelength[order], power[order]
+
+    wavelength_m, output_1_power = _port_transmission(output_port_names[0])
+    wavelength_2_m, output_2_power = _port_transmission(output_port_names[1])
+    input_wavelength_m, input_power = _reference_transmission(input_reference_monitor_name)
+    if wavelength_2_m.size != wavelength_m.size or not np.allclose(wavelength_2_m, wavelength_m, rtol=1e-9, atol=1e-15):
+        output_2_power = np.interp(wavelength_m, wavelength_2_m, output_2_power)
+    if input_wavelength_m.size != wavelength_m.size or not np.allclose(input_wavelength_m, wavelength_m, rtol=1e-9, atol=1e-15):
+        input_power = np.interp(wavelength_m, input_wavelength_m, input_power)
+
+    total_output_power = output_1_power + output_2_power
+    safe_total = np.maximum(total_output_power, 1e-15)
+    safe_input = np.maximum(input_power, 1e-15)
+    output_1_ratio = output_1_power / safe_total
+    output_2_ratio = output_2_power / safe_total
+    output_1_over_input = output_1_power / safe_input
+    output_2_over_input = output_2_power / safe_input
+    total_output_over_input = total_output_power / safe_input
+    imbalance_db = 10.0 * np.log10(
+        np.maximum(output_1_power, 1e-15) / np.maximum(output_2_power, 1e-15)
+    )
+    output_1_db = 10.0 * np.log10(np.maximum(output_1_over_input, 1e-15))
+    output_2_db = 10.0 * np.log10(np.maximum(output_2_over_input, 1e-15))
+
+    target_wavelength_m = 0.5 * (
+        float(SETTINGS.get("wavelength_start_um", 1.25))
+        + float(SETTINGS.get("wavelength_stop_um", 1.35))
+    ) * 1e-6
+    target_index = int(np.argmin(np.abs(wavelength_m - target_wavelength_m)))
+    print(
+        "MMI split at %.3f nm: Pin %.6g, %s %.3f%%, %s %.3f%%, symmetry error %.4f dB, total/Pin %.3f%%"
+        % (
+            wavelength_m[target_index] * 1e9,
+            input_power[target_index],
+            output_labels[0], output_1_ratio[target_index] * 100.0,
+            output_labels[1], output_2_ratio[target_index] * 100.0,
+            imbalance_db[target_index], total_output_over_input[target_index] * 100.0,
+        )
+    )
+    symmetry_error_percent = abs(output_1_ratio[target_index] - 0.5) * 100.0
+    symmetry_tolerance_percent = float(MMI_ANALYSIS.get("symmetry_tolerance_percent", 1.0))
+    if symmetry_error_percent <= symmetry_tolerance_percent:
+        print("Verified symmetric 50/50 MMI within %.3f percentage points." % symmetry_error_percent)
+    else:
+        print(
+            "WARNING: symmetric MMI differs from 50/50 by %.3f percentage points; check mesh and port placement."
+            % symmetry_error_percent
+        )
+
+    figure, axes = plt.subplots(2, 1, figsize=(8.8, 7.2), sharex=True)
+    axes[0].plot(wavelength_m * 1e9, output_1_ratio * 100.0, lw=2.0, label=output_labels[0])
+    axes[0].plot(wavelength_m * 1e9, output_2_ratio * 100.0, lw=2.0, label=output_labels[1])
+    axes[0].axhline(50.0, color="#64748b", ls="--", lw=1.0, label="ideal 50/50")
+    axes[0].set_ylabel("normalized output power [%]")
+    axes[0].set_title("MMI splitting ratio — mode 1 input")
+    axes[0].set_ylim(0.0, 100.0)
+    axes[0].grid(alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(wavelength_m * 1e9, output_1_db, lw=2.0, label=output_labels[0])
+    axes[1].plot(wavelength_m * 1e9, output_2_db, lw=2.0, label=output_labels[1])
+    axes[1].set_xlabel("wavelength [nm]")
+    axes[1].set_ylabel("output / measured input [dB]")
+    axes[1].grid(alpha=0.3)
+    axes[1].legend()
+    figure.tight_layout()
+
+    mmi_png = os.path.join(REMOTE_WORK, "mmi_splitting_ratio.png")
+    figure.savefig(mmi_png, dpi=170, bbox_inches="tight")
+    plt.close(figure)
+
+    # Longitudinal mode-1 field at the center wavelength.  The source is the
+    # input port's selected fundamental mode, so this is the actual field as it
+    # expands and interferes through the complete MMI.
+    field_monitor_name = str(MMI_ANALYSIS["field_monitor_name"])
+    try:
+        field_result = fdtd.getresult("::model::" + field_monitor_name, "E")
+    except Exception as exc:
+        raise RuntimeError(
+            "MMI field monitor %r has no E result. Confirm that the Z-normal monitor lies inside the FDTD region. %s"
+            % (field_monitor_name, exc)
+        ) from None
+    field_x_m = np.squeeze(np.asarray(field_result["x"], dtype=float)).ravel()
+    field_y_m = np.squeeze(np.asarray(field_result["y"], dtype=float)).ravel()
+    field_frequency_hz = np.squeeze(np.asarray(field_result.get("f", []), dtype=float)).ravel()
+    if field_frequency_hz.size:
+        target_frequency_hz = 299792458.0 / target_wavelength_m
+        field_frequency_index = int(np.argmin(np.abs(field_frequency_hz - target_frequency_hz)))
+    else:
+        field_frequency_index = 0
+
+    def _field_plane(component_name):
+        values = np.asarray(field_result.get(component_name, 0.0))
+        if field_frequency_hz.size and values.ndim:
+            frequency_axes = [axis for axis, size in enumerate(values.shape) if size == field_frequency_hz.size]
+            if frequency_axes:
+                values = np.take(values, field_frequency_index, axis=frequency_axes[-1])
+        values = np.squeeze(values)
+        if values.shape == (field_y_m.size, field_x_m.size):
+            values = values.T
+        if values.shape != (field_x_m.size, field_y_m.size):
+            values = values.reshape(field_x_m.size, field_y_m.size)
+        return values
+
+    field_intensity = (
+        np.abs(_field_plane("Ex")) ** 2
+        + np.abs(_field_plane("Ey")) ** 2
+        + np.abs(_field_plane("Ez")) ** 2
+    )
+    field_peak = max(float(np.nanmax(field_intensity)), 1e-30)
+    field_intensity_normalized = field_intensity / field_peak
+    field_wavelength_m = (
+        299792458.0 / field_frequency_hz[field_frequency_index]
+        if field_frequency_hz.size else target_wavelength_m
+    )
+    field_figure, field_axis = plt.subplots(figsize=(11.0, 4.8))
+    field_image = field_axis.pcolormesh(
+        field_x_m * 1e6,
+        field_y_m * 1e6,
+        field_intensity_normalized.T,
+        shading="auto",
+        cmap="inferno",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    field_axis.set_aspect("equal", adjustable="box")
+    field_axis.set_xlabel("x [um]")
+    field_axis.set_ylabel("y [um]")
+    field_axis.set_title("MMI fundamental-mode field |E|² at %.3f nm" % (field_wavelength_m * 1e9))
+    field_figure.colorbar(field_image, ax=field_axis, label="normalized |E|²")
+    field_figure.tight_layout()
+    mmi_field_png = os.path.join(REMOTE_WORK, "mmi_field_distribution.png")
+    field_figure.savefig(mmi_field_png, dpi=180, bbox_inches="tight")
+    plt.close(field_figure)
+
+    mmi_npz = os.path.join(REMOTE_WORK, "mmi_analysis.npz")
+    np.savez_compressed(
+        mmi_npz,
+        wavelength_m=wavelength_m,
+        output_1_power=output_1_power,
+        output_2_power=output_2_power,
+        input_power=input_power,
+        output_1_ratio=output_1_ratio,
+        output_2_ratio=output_2_ratio,
+        output_1_over_input=output_1_over_input,
+        output_2_over_input=output_2_over_input,
+        total_output_over_input=total_output_over_input,
+        imbalance_db=imbalance_db,
+        total_output_power=total_output_power,
+        target_wavelength_m=np.asarray([target_wavelength_m]),
+        field_x_m=field_x_m,
+        field_y_m=field_y_m,
+        field_intensity_normalized=field_intensity_normalized,
+        field_wavelength_m=np.asarray([field_wavelength_m]),
+    )
+    for required_path in (mmi_png, mmi_field_png, mmi_npz):
+        if not os.path.isfile(required_path) or os.path.getsize(required_path) <= 0:
+            raise RuntimeError("Required MMI artifact was not created: " + required_path)
+    print("Saved MMI splitting plot:", mmi_png)
+    print("Saved MMI longitudinal field plot:", mmi_field_png)
+    print("Saved MMI analysis:", mmi_npz)
+'''
+
+
 _FETCH_RESULTS_CELL = r'''# Fetch every verified artifact before closing Lumerical or returning the HPC Packs.
 REMOTE_ARTIFACTS = [
     REMOTE_PROJECT_FILE,
@@ -1870,6 +2195,14 @@ if GRATING_ANALYSIS and SETTINGS.get("run_after_build", False):
     ])
 elif GRATING_ANALYSIS:
     print("Grating plots were not requested because automatic solving is disabled.")
+if MMI_ANALYSIS and SETTINGS.get("run_after_build", False):
+    REMOTE_ARTIFACTS.extend([
+        REMOTE_WORK + "/mmi_splitting_ratio.png",
+        REMOTE_WORK + "/mmi_field_distribution.png",
+        REMOTE_WORK + "/mmi_analysis.npz",
+    ])
+elif MMI_ANALYSIS:
+    print("MMI splitting-ratio plots were not requested because automatic solving is disabled.")
 
 _artifact_expression = "{path: bool(os.path.isfile(path) and os.path.getsize(path) > 0) for path in %r}" % REMOTE_ARTIFACTS
 REMOTE_ARTIFACT_STATUS = lam.get(_artifact_expression)
@@ -1924,7 +2257,7 @@ def generate_lumerical_notebook(
     _synchronize_fiber_port_parameters(ports, fiber_geometries, warnings)
 
     grating_analysis: dict[str, Any] | None = None
-    grating_components = [component for component in components if str(component.get("kind", "")) == "Grating coupler"]
+    grating_components = [component for component in components if str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"}]
     if grating_components:
         grating = grating_components[0]
         grating_uid = int(grating.get("uid", 0))
@@ -2028,6 +2361,107 @@ def generate_lumerical_notebook(
                     "z reference": str(fiber_port.get("z reference", "device top")),
                     "frequency_points": 50,
                 }
+
+    mmi_analysis: dict[str, Any] | None = None
+    mmi_components = [
+        component for component in components
+        if str(component.get("kind", "")) == "1x2 MMI"
+    ]
+    if mmi_components and grating_analysis:
+        warnings.append(
+            "MMI splitting analysis was skipped because this export also contains a grating analysis; "
+            "each analysis requires a different source port. Export the MMI component separately."
+        )
+    elif mmi_components:
+        mmi = mmi_components[0]
+        mmi_uid = int(mmi.get("uid", 0))
+        if len(mmi_components) > 1:
+            warnings.append("Multiple 1x2 MMIs were exported; splitting analysis uses the first one only.")
+        matching_ports = [
+            port for port in ports
+            if bool(port.get("enabled", True))
+            and int(port.get("parent_component_uid", -1)) == mmi_uid
+        ]
+        by_parent_name = {
+            str(port.get("parent_port_name", "")): port
+            for port in matching_ports
+            if str(port.get("parent_port_name", ""))
+        }
+        required_names = ("left_external", "upper_right", "lower_right")
+        missing_names = [name for name in required_names if name not in by_parent_name]
+        if missing_names:
+            warnings.append(
+                "MMI splitting analysis was not added because these MMI FDTD ports are missing: "
+                + ", ".join(missing_names)
+                + ". Add or refresh the component simulation setup before exporting."
+            )
+        else:
+            input_port = by_parent_name["left_external"]
+            upper_port = by_parent_name["upper_right"]
+            lower_port = by_parent_name["lower_right"]
+            reference_monitors = [
+                monitor for monitor in monitors
+                if int(monitor.get("parent_component_uid", -1)) == mmi_uid
+                and str(monitor.get("parent_port_name", "")) == "left_external"
+                and str(monitor.get("monitor_kind", "")) == "Power monitor"
+            ]
+            if not reference_monitors:
+                warnings.append(
+                    "MMI splitting analysis was not added because the input reference power monitor is missing. "
+                    "Refresh the MMI simulation setup to place it 2 um before the input taper."
+                )
+            else:
+                reference_monitor = reference_monitors[0]
+                field_monitors = [
+                    monitor for monitor in monitors
+                    if int(monitor.get("parent_component_uid", -1)) == mmi_uid
+                    and str(monitor.get("parent_port_name", "")) == "mmi_longitudinal_field"
+                    and str(monitor.get("monitor_kind", "")) == "Field profile monitor"
+                ]
+                if field_monitors:
+                    field_monitor = field_monitors[0]
+                else:
+                    mmi_geometry = [
+                        item for item in geometry
+                        if int(item.get("component_uid", -1)) == mmi_uid
+                    ]
+                    points = np.vstack([np.asarray(item["vertices_um"], dtype=float) for item in mmi_geometry])
+                    low, high = points.min(axis=0), points.max(axis=0)
+                    field_monitor = {
+                        "name": f"uid_{mmi_uid}_mmi_field",
+                        "monitor_kind": "Field profile monitor",
+                        "monitor geometry": "surface",
+                        "plane normal": "Z",
+                        "z reference": "device center",
+                        "distance_um": 0.0,
+                        "center": [float(0.5 * (low[0] + high[0])), float(0.5 * (low[1] + high[1]))],
+                        "orientation_deg": float(mmi.get("orientation_deg", 0.0)),
+                        "x span": float(high[0] - low[0]),
+                        "y span": float(high[1] - low[1]),
+                        "z span": 0.0,
+                        "parent_component_uid": mmi_uid,
+                        "parent_port_name": "mmi_longitudinal_field",
+                    }
+                    monitors.append(field_monitor)
+                    warnings.append("Added the MMI longitudinal field-profile monitor to this notebook export.")
+                mmi_analysis = {
+                    "component_uid": mmi_uid,
+                    "input_port_name": str(input_port.get("name", "mmi_input")),
+                    "input_mode": "mode 1",
+                    "input_reference_monitor_name": str(reference_monitor.get("name", "mmi_input_reference")),
+                    "field_monitor_name": str(field_monitor.get("name", f"uid_{mmi_uid}_mmi_field")),
+                    "input_reference_before_taper_um": float(
+                        mmi.get("params", {}).get("input_reference_before_taper_um", 2.0)
+                    ),
+                    "output_port_names": [
+                        str(upper_port.get("name", "mmi_upper")),
+                        str(lower_port.get("name", "mmi_lower")),
+                    ],
+                    "output_labels": ["upper output", "lower output"],
+                    "ideal_split_percent": [50.0, 50.0],
+                    "symmetry_tolerance_percent": 1.0,
+                    "frequency_points": int(configuration.get("frequency_points", 50)),
+                }
     stack = deepcopy(configuration.get("material_stack") or default_stack())
     for row in stack:
         row["thickness_um"] = max(0.0, float(row.get("thickness_um", 0.0)))
@@ -2041,6 +2475,12 @@ def generate_lumerical_notebook(
         row.pop("gds_layer", None)
         row["role"] = "geometry" if str(row.get("role", "background")).lower() == "geometry" else "background"
         row["conformal"] = bool(row.get("conformal", False)) and row["role"] == "background"
+        row["slab_extent"] = (
+            "geometry"
+            if str(row.get("slab_extent", "full")).strip().lower() == "geometry"
+            else "full"
+        )
+        row["mesh_factor"] = max(0.0, float(row.get("mesh_factor", 0.1)))
         if row["thickness_um"] > 0 and not str(row.get("material", "")).strip():
             warnings.append(f"Active stack layer {row.get('name', '')!r} has no material name.")
 
@@ -2125,6 +2565,7 @@ def generate_lumerical_notebook(
         f"PORTS_JSON = {pprint.pformat(ports_json, width=120, sort_dicts=False)}\n"
         f"MONITORS = {pprint.pformat(monitors, width=120, sort_dicts=False)}\n"
         f"GRATING_ANALYSIS = {pprint.pformat(grating_analysis, width=120, sort_dicts=False)}\n"
+        f"MMI_ANALYSIS = {pprint.pformat(mmi_analysis, width=120, sort_dicts=False)}\n"
         f"EXPORT_WARNINGS = {pprint.pformat(warnings, width=120)}\n"
         "for warning in EXPORT_WARNINGS:\n"
         "    print('Export note:', warning)\n"
@@ -2146,6 +2587,7 @@ def generate_lumerical_notebook(
         "    + 'PORTS_JSON = ' + repr(PORTS_JSON) + '\\n'\n"
         "    + 'MONITORS = ' + repr(MONITORS) + '\\n'\n"
         "    + 'GRATING_ANALYSIS = ' + repr(GRATING_ANALYSIS) + '\\n'\n"
+        "    + 'MMI_ANALYSIS = ' + repr(MMI_ANALYSIS) + '\\n'\n"
         "    + 'EXPORT_WARNINGS = ' + repr(EXPORT_WARNINGS) + '\\n'\n"
         ")\n"
         "run_remote_checked(_remote_payload + REMOTE_MODEL_BUILDER, 'Build verified 3D model', timeout=1800)\n"
@@ -2210,6 +2652,14 @@ def generate_lumerical_notebook(
         "    lam.show(REMOTE_WORK + '/grating_response.png', width=1000)\n"
         "    lam.show(REMOTE_WORK + '/grating_farfield.png', width=900)\n"
     )
+    mmi_analysis_cell = (
+        "# Plot the symmetric MMI splitting ratio and longitudinal fundamental-mode field.\n"
+        f"REMOTE_MMI_ANALYSIS = {repr(_MMI_ANALYSIS_REMOTE)}\n"
+        "run_remote_checked(REMOTE_MMI_ANALYSIS, 'MMI splitting-ratio analysis', timeout=1800)\n"
+        "if SETTINGS.get('run_after_build', False):\n"
+        "    lam.show(REMOTE_WORK + '/mmi_splitting_ratio.png', width=1000)\n"
+        "    lam.show(REMOTE_WORK + '/mmi_field_distribution.png', width=1100)\n"
+    )
     active_count = sum(float(row.get("thickness_um", 0.0)) > 0 for row in stack)
     exported_component_text = ", ".join(
         f"{item['kind']} (UID {item['uid']})" for item in exported_components
@@ -2236,6 +2686,8 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
 - A material thickness of **0 µm means that material is absent**.
 - Etch depth **0 µm** keeps an unetched film; etch depth equal to film thickness creates a fully etched patterned layer.
 - Exported cross-section rows use Lumerical Layer Builder, including the selected waveguide sidewall angle (90° is vertical).
+- A partially etched cross-section can keep its unetched slab across the full FDTD plane or restrict it to the selected GDS geometry footprint.
+- Each stack row has a dimensionless mesh factor. The default **0.1** produces an isotropic step of `0.1 × λ₀/nmax` at the shortest simulated wavelength; anisotropic media use their largest index component.
 - Surface monitors carry explicit x/y/z spans; their normal-axis span is zero (Z is the into-page axis in the layout view).
 - Ports are manual simulation-only objects from the left **Ports & monitors** library. No component, including a grating coupler, creates a default port automatically.
 - `PORTS_JSON` uses the exact compact-model structure and field names from the reviewed Lumerical JSON examples: `name`, `dir`, `loc`, `pos`, and `order`.
@@ -2246,6 +2698,7 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
 - The FDTD boundary keeps at least λ/4 clearance from ordinary device features. Bottom and top background films extend through their PMLs, and each manually placed lateral waveguide port receives a cross-section-matched continuation through its PML, following the official Ansys example.
 - `LiNbO3` is created as a frequency- and temperature-dependent anisotropic sampled material using the Zelmon/Moretti model and the selected X/Y/Z crystal cut.
 - Grating-coupler exports follow the official Ansys 3D example: the tilted Z-axis fiber FDTD port is the Backward source and the waveguide FDTD port is the receiver. They plot coupling efficiency in dB versus wavelength and the 3D far field in polar coordinates.
+- A 1×2 MMI export launches mode 1 from its input port, measures input power 2 µm before the input taper, plots both output powers relative to that measured input, and plots the normalized longitudinal |E|² distribution through the complete MMI.
 - GPU and CPU modes are selectable through `SETTINGS['resource_mode']`; GPU is the default for every 3D export.
 - Run the final release cell even after an interrupted simulation so the FDTD licence and roamed HPC Packs are returned.
 """
@@ -2275,6 +2728,14 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
                     _notebook_cell("code", grating_analysis_cell),
                 ]
                 if grating_analysis
+                else []
+            ),
+            *(
+                [
+                    _notebook_cell("markdown", "## 9 · Symmetric MMI splitting ratio and field distribution\n\nMode 1 is launched from the input FDTD port. A power monitor 2 µm before the input taper measures the actual incident power, the two output-port powers are reported relative to that reference, and a Z-normal monitor plots normalized |E|² along the complete MMI length. The expected split is 50/50.\n"),
+                    _notebook_cell("code", mmi_analysis_cell),
+                ]
+                if mmi_analysis
                 else []
             ),
             _notebook_cell("markdown", "## 10 · Save numerical results before releasing licences\n"),

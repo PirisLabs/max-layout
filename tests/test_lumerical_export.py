@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 
 from max_layout.constants import DEFAULT_COMPONENT_VALUES
-from max_layout.gds.build import resolve_and_build
+from max_layout.gds.build import component_geometry_arrays, resolve_and_build
 from max_layout import lumerical
 from max_layout.lumerical import generate_lumerical_notebook, seed_simulation_ports
 
@@ -48,6 +48,59 @@ def assignment_value(notebook: dict, name: str):
 
 
 class LumericalExportTests(unittest.TestCase):
+    def test_official_soi_grating_component_and_stack_defaults(self) -> None:
+        grating = component("GC-SOI")
+        params = grating["params"]
+        self.assertEqual(params["pitch"], 0.6713)
+        self.assertEqual(params["duty_cycle"], 0.3992)
+        self.assertEqual(params["target_length"], 25.0)
+        self.assertEqual(params["h_total"], 0.22)
+        self.assertEqual(params["etch_depth"], 0.10)
+        self.assertEqual(params["fiber_tilt_deg"], 10.0)
+        self.assertEqual(params["fiber_x_from_grating_start_um"], 2.74533)
+        polygons, _ = component_geometry_arrays(grating)
+        self.assertEqual(len(polygons), 47)
+        self.assertEqual({(layer, datatype) for _points, layer, datatype in polygons}, {(1, 0), (2, 0)})
+        all_points = np.vstack([points for points, _layer, _datatype in polygons])
+        self.assertAlmostEqual(float(all_points[:, 0].min()), 0.0)
+        self.assertAlmostEqual(float(all_points[:, 0].max()), 70.91271704, places=6)
+
+        stack = lumerical.default_stack("SOI grating coupler (Ansys)")
+        self.assertEqual([row["thickness_um"] for row in stack], [3.0, 1.0, 0.12, 0.10, 0.48])
+        self.assertEqual(stack[2]["gds_layers"], [1])
+        self.assertEqual(stack[3]["gds_layers"], [2])
+        self.assertTrue(stack[4]["conformal"])
+        self.assertTrue(all(row["mesh_factor"] == 0.1 for row in stack))
+
+    def test_mmi_export_includes_longitudinal_fundamental_field_plot(self) -> None:
+        mmi = component("1x2 MMI")
+        items = [mmi]
+        for uid, parent_name, x, y, name in (
+            (2, "left_external", 2.0, 0.0, "mmi_input"),
+            (3, "upper_right", 55.0, 1.625, "mmi_upper"),
+            (4, "lower_right", 55.0, -1.625, "mmi_lower"),
+        ):
+            port = component("FDTD port", uid=uid)
+            port.update({"x": x, "y": y, "simulation_parent_uid": 1, "simulation_parent_port": parent_name})
+            port["params"]["name"] = name
+            items.append(port)
+        reference = component("Power monitor", uid=5)
+        reference.update({"x": 4.0, "simulation_parent_uid": 1, "simulation_parent_port": "left_external"})
+        reference["params"]["name"] = "mmi_input_reference"
+        items.append(reference)
+
+        notebook, warnings = generate_lumerical_notebook(items, {"included_layers": [[1, 0]]})
+        analysis = assignment_value(notebook, "MMI_ANALYSIS")
+        self.assertEqual(analysis["field_monitor_name"], "uid_1_mmi_field")
+        monitors = assignment_value(notebook, "MONITORS")
+        field_monitor = next(monitor for monitor in monitors if monitor["name"] == "uid_1_mmi_field")
+        self.assertEqual(field_monitor["plane normal"], "Z")
+        self.assertEqual(field_monitor["z reference"], "device center")
+        self.assertTrue(any("longitudinal field-profile monitor" in warning for warning in warnings))
+        source = cell_source_containing(notebook, "REMOTE_MMI_ANALYSIS =")
+        self.assertIn("mmi_field_distribution.png", source)
+        self.assertIn("field_intensity_normalized", source)
+
     def test_air_and_separate_official_fiber_objects_are_available(self) -> None:
         self.assertIn("Air", lumerical.MATERIAL_CHOICES)
         self.assertIn("Fiber geometry", DEFAULT_COMPONENT_VALUES)
@@ -112,7 +165,7 @@ class LumericalExportTests(unittest.TestCase):
                 "include_ports": True,
                 "material_stack": [
                     {"name": "BOX", "material": "SiO2 (Glass) - Palik", "thickness_um": 2.0, "role": "background", "gds_layer": 0},
-                    {"name": "Exported cross-section", "material": "LiNbO3", "thickness_um": 0.6, "etch_depth_um": 0.3, "sidewall_angle_deg": 82.0, "role": "geometry", "gds_layer": 1},
+                    {"name": "Exported cross-section", "material": "LiNbO3", "thickness_um": 0.6, "etch_depth_um": 0.3, "sidewall_angle_deg": 82.0, "slab_extent": "geometry", "mesh_factor": 0.5, "role": "geometry", "gds_layer": 1},
                     {"name": "SiO2 top cladding", "material": "SiO2 (Glass) - Palik", "thickness_um": 1.0, "role": "background", "gds_layer": 0, "conformal": True},
                     {"name": "Absent metal", "material": "Au (Gold) - CRC", "thickness_um": 0.0, "role": "geometry", "gds_layer": 4},
                 ],
@@ -161,6 +214,14 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("_add_waveguide_boundary_extensions", build_source)
         self.assertIn("Extended waveguide at port", build_source)
         self.assertIn('SETTINGS.get("pml_geometry_overlap_um", 1.0)', build_source)
+        self.assertIn("_add_layer_mesh_overrides", build_source)
+        self.assertIn('fdtd.set("override x mesh", True)', build_source)
+        self.assertIn('fdtd.set("dx", mesh_step_um * UM)', build_source)
+        self.assertIn("fdtd.getindex(material, frequency_hz)", build_source)
+        self.assertIn("mesh_factor * wavelength_min_um / maximum_index", build_source)
+        self.assertIn("maximum component is deliberately used for anisotropic media", build_source)
+        self.assertIn('slab_extent == "geometry"', build_source)
+        self.assertIn("Limited unetched slab", build_source)
         self.assertIn("simulation_z_min_um - pml_geometry_overlap_um", build_source)
         self.assertIn("simulation_z_max_um + pml_geometry_overlap_um", build_source)
         self.assertIn("bounds[axis_index] - pml_geometry_overlap_um", build_source)
@@ -177,6 +238,8 @@ class LumericalExportTests(unittest.TestCase):
         payload = cell_source_containing(notebook, "MATERIAL_STACK =")
         self.assertIn("'dimension': '3D'", payload)
         self.assertIn("'sidewall_angle_deg': 82.0", payload)
+        self.assertIn("'slab_extent': 'geometry'", payload)
+        self.assertIn("'mesh_factor': 0.5", payload)
         self.assertIn("'conformal': True", payload)
         self.assertIn("GRATING_ANALYSIS =", payload)
         analysis = assignment_value(notebook, "GRATING_ANALYSIS")
@@ -241,6 +304,59 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("file=_ml_sys.stdout", connection_source)
         self.assertIn("Lumerical solver log:", connection_source)
         self.assertIn("lam.show(GEOMETRY_PROJECTIONS_FILE", projection_source)
+
+    def test_symmetric_mmi_uses_pre_taper_input_reference_and_two_outputs(self) -> None:
+        mmi = component("1x2 MMI")
+        mmi["params"]["add_grating_couplers"] = False
+        mmi["params"]["input_reference_before_taper_um"] = 2.0
+        self.assertEqual(mmi["params"]["fdtd_port_clearance_um"], 2.0)
+
+        input_port = component("FDTD port", uid=2)
+        input_port["params"].update({"name": "mmi_input", "order": 1, "pos": "Left"})
+        input_port["simulation_parent_uid"] = 1
+        input_port["simulation_parent_port"] = "left_external"
+
+        upper_port = component("FDTD port", uid=3)
+        upper_port["params"].update({"name": "mmi_upper", "order": 2, "pos": "Right"})
+        upper_port["simulation_parent_uid"] = 1
+        upper_port["simulation_parent_port"] = "upper_right"
+
+        lower_port = component("FDTD port", uid=4)
+        lower_port["params"].update({"name": "mmi_lower", "order": 3, "pos": "Right"})
+        lower_port["simulation_parent_uid"] = 1
+        lower_port["simulation_parent_port"] = "lower_right"
+
+        reference = component("Power monitor", uid=5)
+        reference["params"]["name"] = "mmi_input_reference"
+        reference["simulation_parent_uid"] = 1
+        reference["simulation_parent_port"] = "left_external"
+
+        notebook, warnings = generate_lumerical_notebook(
+            [mmi, input_port, upper_port, lower_port, reference],
+            {"included_layers": [[1, 0]], "include_ports": True, "run_after_build": True},
+        )
+        self.assertFalse(any("MMI splitting analysis was not added" in warning for warning in warnings))
+        analysis = assignment_value(notebook, "MMI_ANALYSIS")
+        self.assertEqual(analysis["input_port_name"], "mmi_input")
+        self.assertEqual(analysis["input_reference_monitor_name"], "mmi_input_reference")
+        self.assertEqual(analysis["input_reference_before_taper_um"], 2.0)
+        self.assertEqual(analysis["output_port_names"], ["mmi_upper", "mmi_lower"])
+        self.assertEqual(analysis["ideal_split_percent"], [50.0, 50.0])
+
+        resource_source = cell_source_containing(notebook, "REMOTE_RESOURCE_AND_SAVE")
+        self.assertIn('fdtd.set("source port", str(MMI_ANALYSIS["input_port_name"]))', resource_source)
+        mmi_source = cell_source_containing(notebook, "REMOTE_MMI_ANALYSIS")
+        self.assertIn('input_reference_monitor_name = str(MMI_ANALYSIS["input_reference_monitor_name"])', mmi_source)
+        self.assertIn("output_1_over_input", mmi_source)
+        self.assertIn("ideal 50/50", mmi_source)
+        self.assertIn("Verified symmetric 50/50 MMI", mmi_source)
+        fetch_source = cell_source_containing(notebook, "REMOTE_ARTIFACTS")
+        self.assertIn("mmi_splitting_ratio.png", fetch_source)
+        self.assertIn("mmi_analysis.npz", fetch_source)
+
+        for index, cell in enumerate(notebook["cells"]):
+            if cell["cell_type"] == "code":
+                compile("".join(cell["source"]), f"<mmi notebook cell {index}>", "exec")
 
     def test_standalone_library_ports_and_monitors_export_but_never_enter_gds(self) -> None:
         straight = component("Straight")

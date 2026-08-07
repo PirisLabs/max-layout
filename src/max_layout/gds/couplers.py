@@ -98,6 +98,95 @@ def add_parent_focusing_gc(
         top.add(*remaining)
 
 
+def add_soi_grating_coupler(
+    top: gdstk.Cell,
+    p: dict[str, Any],
+    waveguide_center: tuple[float, float],
+    orientation_deg: float,
+) -> None:
+    """Draw the official Ansys 3D SOI focusing-grating geometry.
+
+    Layer 1 is the 120 nm residual silicon footprint and layer 2 is the
+    additional 100 nm silicon.  With the matching stack preset this reproduces
+    the example's 220 nm device layer and 100 nm partial etch.
+    """
+    pitch = float(p.get("pitch", 0.6713))
+    target_length = float(p.get("target_length", 25.0))
+    duty_cycle = float(p.get("duty_cycle", 0.3992))
+    radius = float(p.get("radius", 25.0))
+    y_span = float(p.get("y_span", 15.0))
+    extra_length = float(p.get("L_extra", 10.0))
+    wg_width = float(p.get("wg_width", 0.5))
+    wg_length = float(p.get("wg_length", 10.0))
+    taper_exponent = float(p.get("taper_exponent", 1.15))
+    slab_layer = int(p.get("slab_layer", PHOTONIC_LAYER))
+    slab_datatype = int(p.get("slab_datatype", DEFAULT_DATATYPE))
+    etched_layer = int(p.get("etched_layer", GC_LAYER))
+    etched_datatype = int(p.get("etched_datatype", DEFAULT_DATATYPE))
+    tolerance = max(1e-5, float(p.get("tolerance", 0.0005)))
+    if min(pitch, target_length, radius, y_span, wg_width, wg_length) <= 0:
+        raise ValueError("GC-SOI dimensions and pitch must be positive.")
+    if not 0.0 < duty_cycle < 1.0:
+        raise ValueError("GC-SOI duty cycle must be between 0 and 1.")
+    if y_span >= 2.0 * radius:
+        raise ValueError("GC-SOI y span must be smaller than twice its radius.")
+
+    period_count = int(np.ceil(target_length / pitch))
+    tooth_width = duty_cycle * pitch
+    gap_width = pitch - tooth_width
+    grating_length = period_count * pitch + gap_width
+    half_angle = float(np.arcsin(0.5 * y_span / radius))
+    taper_length = radius * float(np.cos(half_angle))
+    focus = np.array([wg_length, 0.0], dtype=float)
+
+    def transformed(points: np.ndarray, layer: int, datatype: int) -> gdstk.Polygon:
+        return gdstk.Polygon(
+            transform_points(points, waveguide_center, orientation_deg),
+            layer=layer,
+            datatype=datatype,
+        )
+
+    def annular(inner: float, outer: float, layer: int, datatype: int) -> gdstk.Polygon:
+        arc_length = max(outer, 1.0) * 2.0 * half_angle
+        samples = max(32, min(2048, int(np.ceil(arc_length / max(0.02, np.sqrt(tolerance))))))
+        angles = np.linspace(-half_angle, half_angle, samples)
+        outer_points = focus + np.column_stack((outer * np.cos(angles), outer * np.sin(angles)))
+        inner_points = focus + np.column_stack((inner * np.cos(angles[::-1]), inner * np.sin(angles[::-1])))
+        return transformed(np.vstack((outer_points, inner_points)), layer, datatype)
+
+    waveguide = np.array(
+        [[0.0, -wg_width / 2.0], [wg_length, -wg_width / 2.0],
+         [wg_length, wg_width / 2.0], [0.0, wg_width / 2.0]],
+        dtype=float,
+    )
+    taper_samples = max(81, int(np.ceil(taper_length / 0.1)) + 1)
+    taper_x = np.linspace(0.0, taper_length, taper_samples)
+    half_width = y_span / 2.0 - (y_span / 2.0 - wg_width / 2.0) * (
+        (taper_length - taper_x) / taper_length
+    ) ** taper_exponent
+    taper = np.vstack(
+        (
+            np.column_stack((wg_length + taper_x, -half_width)),
+            np.column_stack((wg_length + taper_x[::-1], half_width[::-1])),
+        )
+    )
+
+    # Both vertical silicon portions exist under the unetched waveguide,
+    # nonlinear taper, input sector, and final output sector.
+    for layer, datatype in ((slab_layer, slab_datatype), (etched_layer, etched_datatype)):
+        top.add(transformed(waveguide, layer, datatype))
+        top.add(transformed(taper, layer, datatype))
+        top.add(annular(taper_length, radius, layer, datatype))
+        top.add(annular(radius + grating_length, radius + grating_length + extra_length, layer, datatype))
+
+    # The residual slab is continuous beneath every etched grating period.
+    top.add(annular(radius, radius + grating_length, slab_layer, slab_datatype))
+    for index in range(period_count):
+        inner = radius + index * pitch + gap_width
+        outer = radius + (index + 1) * pitch
+        top.add(annular(inner, outer, etched_layer, etched_datatype))
+
+
 def add_routed_parent_gc(
     top: gdstk.Cell,
     p: dict[str, Any],
