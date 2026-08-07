@@ -117,6 +117,7 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                      'N': 30,
                      'alpha_t': 25.0,
                      'taper_L': 22.0,
+                     'L_extra': 10.0,
                      'wg_width': 1.2,
                      'wg_length': 5.0,
                      'fiber_offset_after_taper_um': 5.0,

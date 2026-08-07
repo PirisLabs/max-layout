@@ -56,6 +56,7 @@ def make_focusing_gc_gds(
     cell_name="FOCUSING_GC",
     gds_file="focusing_gc.gds",
     tolerance=0.0005,
+    L_extra=0.0,
 ):
     """
     Generate a focusing grating coupler.
@@ -110,6 +111,9 @@ def make_focusing_gc_gds(
 
     if wg_width <= 0:
         raise ValueError("wg_width must be positive.")
+
+    if L_extra < 0:
+        raise ValueError("L_extra cannot be negative.")
 
     alpha_rad = np.deg2rad(alpha_t)
     orientation_rad = np.deg2rad(orientation_deg)
@@ -241,6 +245,21 @@ def make_focusing_gc_gds(
 
         radius = outer_radius
 
+    # Optional solid terminal sector, matching the thick output arc in the
+    # official Ansys SOI focusing-grating geometry.
+    if L_extra > 0.0:
+        output_sector = gdstk.ellipse(
+            center=tuple(focus_local),
+            radius=radius + float(L_extra),
+            inner_radius=radius,
+            initial_angle=-alpha_rad / 2,
+            final_angle=alpha_rad / 2,
+            layer=layer,
+            datatype=datatype,
+            tolerance=tolerance,
+        )
+        cell.add(output_sector)
+
     # ── Rotate and translate complete grating coupler ────────────────────────
     #
     # Rotation occurs around the local external waveguide end at (0, 0).
@@ -318,6 +337,7 @@ def make_focusing_gc_gds(
         "tooth_widths": tooth_widths,
 
         "grating_length": float(np.sum(pitch_array)),
+        "L_extra": float(L_extra),
         "taper_radius": float(taper_L),
         "first_tooth_inner_radius": float(tooth_inner_radii[0]),
         "last_tooth_outer_radius": float(tooth_outer_radii[-1]),

@@ -84,6 +84,33 @@ def _anchored_stack_ranges(stack: list[dict[str, Any]]) -> list[tuple[dict[str, 
     return [value for value in ranges if value is not None]
 
 
+def _conformal_fill_start(
+    stack_ranges: list[tuple[dict[str, Any], float, float]],
+    row_index: int,
+    default_z0: float,
+) -> float:
+    """Mirror the notebook's conformal-fill depth in the editor previews."""
+    consecutive_geometry: list[tuple[dict[str, Any], float, float]] = []
+    for previous in reversed(stack_ranges[:row_index]):
+        previous_row, _previous_z0, _previous_z1 = previous
+        if str(previous_row.get("role", "background")) != "geometry":
+            if consecutive_geometry:
+                break
+            continue
+        consecutive_geometry.append(previous)
+    if len(consecutive_geometry) > 1:
+        return min(default_z0, min(previous_z0 for _row, previous_z0, _z1 in consecutive_geometry))
+    if consecutive_geometry:
+        previous_row, previous_z0, previous_z1 = consecutive_geometry[0]
+        thickness = previous_z1 - previous_z0
+        etch_depth = min(
+            thickness,
+            max(0.0, float(previous_row.get("etch_depth_um", thickness))),
+        )
+        return min(default_z0, previous_z1 - etch_depth)
+    return default_z0
+
+
 def _stack_reference_z(
     params: dict[str, Any],
     stack_ranges: list[tuple[dict[str, Any], float, float]],
@@ -174,10 +201,15 @@ class CrossSectionDomainPreview(QWidget):
         painter.drawRect(self._plot_rect)
         painter.save()
         painter.setClipRect(self._plot_rect)
-        for row, row_z0, row_z1 in state["stack_ranges"]:
+        for row_index, (row, row_z0, row_z1) in enumerate(state["stack_ranges"]):
             # Draw the material geometry at its fixed stack coordinates. The
             # independently moving red FDTD box may cut through these media.
-            clipped_z0, clipped_z1 = row_z0, row_z1
+            clipped_z0 = (
+                _conformal_fill_start(state["stack_ranges"], row_index, row_z0)
+                if bool(row.get("conformal", False))
+                else row_z0
+            )
+            clipped_z1 = row_z1
             if clipped_z1 <= clipped_z0:
                 continue
             role = str(row.get("role", "background"))
@@ -405,31 +437,44 @@ class ThreeDModelPreview(QWidget):
                 0.5 * (self.height() - fitted_height) + (point.y() - min_y) * scale + self.pan.y(),
             )
 
+        def draw_background_box(
+            row: dict[str, Any],
+            row_z0: float,
+            row_z1: float,
+            side_alpha: int = 58,
+            top_alpha: int = 82,
+        ) -> None:
+            clipped_top = min(z1, row_z1)
+            clipped_bottom = max(z0, row_z0)
+            if clipped_top <= clipped_bottom:
+                return
+            top_face = [screen(raw((x0, y0, clipped_top))), screen(raw((x1, y0, clipped_top))),
+                        screen(raw((x1, y1, clipped_top))), screen(raw((x0, y1, clipped_top)))]
+            bottom_face = [screen(raw((x0, y0, clipped_bottom))), screen(raw((x1, y0, clipped_bottom))),
+                           screen(raw((x1, y1, clipped_bottom))), screen(raw((x0, y1, clipped_bottom)))]
+            material = str(row.get("material", ""))
+            painter.setPen(QPen(QColor("#64748b"), 0.7))
+            painter.setBrush(QBrush(_material_color(material, side_alpha)))
+            for edge_index in range(4):
+                next_index = (edge_index + 1) % 4
+                painter.drawPolygon(QPolygonF([
+                    bottom_face[edge_index], bottom_face[next_index],
+                    top_face[next_index], top_face[edge_index],
+                ]))
+            painter.setBrush(QBrush(_material_color(material, top_alpha)))
+            painter.drawPolygon(QPolygonF(top_face))
+
         if self.show_stack:
             for row, row_z0, row_z1 in state["stack_ranges"]:
                 if str(row.get("role", "background")) != "background":
                     continue
                 if int(row.get("_preview_id", -1)) in self.hidden_stack_rows:
                     continue
-                clipped_top = min(z1, row_z1)
-                clipped_bottom = max(z0, row_z0)
-                if clipped_top <= clipped_bottom:
+                # Draw conformal claddings after the device so the preview
+                # visibly shows that they cover every tooth and output sector.
+                if bool(row.get("conformal", False)):
                     continue
-                top_face = [screen(raw((x0, y0, clipped_top))), screen(raw((x1, y0, clipped_top))),
-                            screen(raw((x1, y1, clipped_top))), screen(raw((x0, y1, clipped_top)))]
-                bottom_face = [screen(raw((x0, y0, clipped_bottom))), screen(raw((x1, y0, clipped_bottom))),
-                               screen(raw((x1, y1, clipped_bottom))), screen(raw((x0, y1, clipped_bottom)))]
-                material = str(row.get("material", ""))
-                painter.setPen(QPen(QColor("#64748b"), 0.7))
-                painter.setBrush(QBrush(_material_color(material, 58)))
-                for edge_index in range(4):
-                    next_index = (edge_index + 1) % 4
-                    painter.drawPolygon(QPolygonF([
-                        bottom_face[edge_index], bottom_face[next_index],
-                        top_face[next_index], top_face[edge_index],
-                    ]))
-                painter.setBrush(QBrush(_material_color(material, 82)))
-                painter.drawPolygon(QPolygonF(top_face))
+                draw_background_box(row, row_z0, row_z1)
 
         if self.show_device:
             # A partially etched geometry row also contains its fixed
@@ -475,6 +520,15 @@ class ThreeDModelPreview(QWidget):
                     ]))
                 painter.setBrush(QBrush(_material_color(material, 210)))
                 painter.drawPolygon(QPolygonF(top_screen))
+
+        if self.show_stack:
+            for row_index, (row, row_z0, row_z1) in enumerate(state["stack_ranges"]):
+                if str(row.get("role", "background")) != "background" or not bool(row.get("conformal", False)):
+                    continue
+                if int(row.get("_preview_id", -1)) in self.hidden_stack_rows:
+                    continue
+                fill_z0 = _conformal_fill_start(state["stack_ranges"], row_index, row_z0)
+                draw_background_box(row, fill_z0, row_z1, side_alpha=48, top_alpha=68)
 
         geometry_tops = [row_z1 for row, _, row_z1 in state["stack_ranges"] if str(row.get("role", "background")) == "geometry"]
         device_top = max(geometry_tops, default=0.0)

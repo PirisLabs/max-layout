@@ -56,6 +56,7 @@ STACK_PRESETS: dict[str, list[dict[str, Any]]] = {
         {"name": "GC-SOI residual slab", "material": "Si (Silicon) - Palik", "thickness_um": 0.12, "etch_depth_um": 0.12, "sidewall_angle_deg": 90.0, "role": "geometry", "gds_layers": [1], "slab_extent": "geometry", "mesh_factor": 0.1},
         {"name": "GC-SOI upper silicon", "material": "Si (Silicon) - Palik", "thickness_um": 0.10, "etch_depth_um": 0.10, "sidewall_angle_deg": 90.0, "role": "geometry", "gds_layers": [2], "slab_extent": "geometry", "mesh_factor": 0.1},
         {"name": "SiO2 TOX", "material": "SiO2 (Glass) - Palik", "thickness_um": 0.48, "role": "background", "gds_layer": 0, "conformal": True, "mesh_factor": 0.1},
+        {"name": "Top air", "material": "Air", "thickness_um": 1.0, "role": "background", "gds_layer": 0, "mesh_factor": 0.1},
     ],
     "Al2O3 on SiO2": [
         {"name": "Si substrate", "material": "Si (Silicon) - Palik", "thickness_um": 2.0, "role": "background", "gds_layer": 0},
@@ -502,7 +503,7 @@ for _old_name in {
     "max_layout_results.npz",
     "max_layout_results.json",
     "grating_response.png",
-    "grating_farfield.png",
+    "grating_field_distribution.png",
     "grating_analysis.npz",
     "mmi_splitting_ratio.png",
     "mmi_field_distribution.png",
@@ -1145,21 +1146,18 @@ def _add_monitors(fdtd, z_center_um, device_top_um):
             fdtd.set("mode selection", str(monitor.get("mode", "fundamental TE mode")))
 
 
-def _add_grating_analysis_monitor(fdtd, device_top_um, stack_top_um, silica_cladding_top_um):
-    """Add the upward near-field plane used for response and far-field projection."""
+def _add_grating_analysis_monitor(fdtd, device_center_um):
+    """Add a Z-normal field plane through the complete grating device layer."""
     if not GRATING_ANALYSIS:
         return
-    fdtd.addpower()
-    fdtd.set("name", str(GRATING_ANALYSIS["monitor_name"]))
+    fdtd.addprofile()
+    fdtd.set("name", str(GRATING_ANALYSIS["field_monitor_name"]))
     fdtd.set("monitor type", "2D Z-normal")
-    fdtd.set("x", float(GRATING_ANALYSIS["center_um"][0]) * UM)
-    fdtd.set("y", float(GRATING_ANALYSIS["center_um"][1]) * UM)
-    reference_z_um = _vertical_reference_um(
-        GRATING_ANALYSIS, device_top_um, stack_top_um, silica_cladding_top_um
-    )
-    fdtd.set("z", (reference_z_um + float(GRATING_ANALYSIS.get("z_offset_um", 0.25))) * UM)
-    fdtd.set("x span", float(GRATING_ANALYSIS["x_span_um"]) * UM)
-    fdtd.set("y span", float(GRATING_ANALYSIS["y_span_um"]) * UM)
+    fdtd.set("x", float(GRATING_ANALYSIS["field_center_um"][0]) * UM)
+    fdtd.set("y", float(GRATING_ANALYSIS["field_center_um"][1]) * UM)
+    fdtd.set("z", float(device_center_um) * UM)
+    fdtd.set("x span", float(GRATING_ANALYSIS["field_x_span_um"]) * UM)
+    fdtd.set("y span", float(GRATING_ANALYSIS["field_y_span_um"]) * UM)
 
 
 def build_simulation():
@@ -1236,7 +1234,10 @@ def build_simulation():
         z_min_um = z_ranges[0][1]
         z_max_um = z_ranges[-1][2]
         geometry_ranges = [(z0, z1) for row, z0, z1 in z_ranges if row.get("role") == "geometry"]
-        device_z_um = sum(geometry_ranges[0]) / 2.0 if geometry_ranges else (z_min_um + z_max_um) / 2.0
+        device_z_um = (
+            0.5 * (min(z0 for z0, _z1 in geometry_ranges) + max(z1 for _z0, z1 in geometry_ranges))
+            if geometry_ranges else (z_min_um + z_max_um) / 2.0
+        )
         device_top_um = max((z1 for z0, z1 in geometry_ranges), default=device_z_um)
     stack_top_um = z_max_um
     silica_cladding_top_um = _silica_cladding_top_um(z_ranges, device_top_um)
@@ -1288,13 +1289,6 @@ def build_simulation():
             z_span_um = max(0.0, float(monitor.get("z span", monitor.get("z_span_um", 2.0))))
         z_extent_min_um = min(z_extent_min_um, device_z_um - 0.5 * z_span_um)
         z_extent_max_um = max(z_extent_max_um, device_z_um + 0.5 * z_span_um)
-    if GRATING_ANALYSIS:
-        analysis_z_um = _vertical_reference_um(
-            GRATING_ANALYSIS, device_top_um, stack_top_um, silica_cladding_top_um
-        ) + float(GRATING_ANALYSIS.get("z_offset_um", 0.25))
-        z_extent_min_um = min(z_extent_min_um, analysis_z_um)
-        z_extent_max_um = max(z_extent_max_um, analysis_z_um)
-
     legacy_z_padding = float(SETTINGS.get("z_padding_um", 1.0))
     requested_z_min_padding = float(domain_padding.get("z_min", legacy_z_padding))
     requested_z_max_padding = float(domain_padding.get("z_max", legacy_z_padding))
@@ -1345,7 +1339,7 @@ def build_simulation():
             fdtd.select("FDTD::ports")
             fdtd.set("monitor frequency points", int(SETTINGS.get("frequency_points", 50)))
     _add_monitors(fdtd, device_z_um, device_top_um)
-    _add_grating_analysis_monitor(fdtd, device_top_um, stack_top_um, silica_cladding_top_um)
+    _add_grating_analysis_monitor(fdtd, device_z_um)
     fdtd.setglobalmonitor("use source limits", True)
     fdtd.setglobalmonitor("frequency points", int(SETTINGS.get("frequency_points", 50)))
     model_bounds_um = [
@@ -1791,16 +1785,15 @@ print("Saved result summary:", REMOTE_RESULTS_JSON)
 '''
 
 
-_GRATING_ANALYSIS_REMOTE = r'''# Waveguide-in grating response and natural upward radiation pattern.
+_GRATING_ANALYSIS_REMOTE = r'''# Fiber-to-waveguide coupling and longitudinal grating field distribution.
 import matplotlib.pyplot as plt
-import matplotlib.tri as mtri
 
 if not GRATING_ANALYSIS:
     print("No grating coupler was exported; grating analysis is not required.")
 elif not SETTINGS.get("run_after_build", False):
     print("Grating analysis is ready but unsolved. Set SETTINGS['run_after_build'] = True and rerun from section 6.")
 else:
-    monitor_name = str(GRATING_ANALYSIS["monitor_name"])
+    field_monitor_name = str(GRATING_ANALYSIS["field_monitor_name"])
     waveguide_port_name = str(GRATING_ANALYSIS["waveguide_port_name"])
 
     def _one_mode_spectrum(dataset, value_key):
@@ -1850,17 +1843,10 @@ else:
     fiber_coupling = fiber_coupling[order]
     fiber_coupling_db = 10.0 * np.log10(np.maximum(fiber_coupling, 1e-15))
 
-    upward_response = fdtd.getresult(monitor_name, "T")
-    upward_wavelengths_m = np.squeeze(np.asarray(upward_response["lambda"])).ravel()
-    upward_power = np.abs(np.squeeze(np.asarray(upward_response["T"])).ravel())
-    upward_order = np.argsort(upward_wavelengths_m)
-    upward_wavelengths_m = upward_wavelengths_m[upward_order]
-    upward_power = upward_power[upward_order]
     wavelength_target_m = 0.5 * (
         float(SETTINGS.get("wavelength_start_um", 1.25))
         + float(SETTINGS.get("wavelength_stop_um", 1.35))
     ) * 1e-6
-    frequency_index = int(np.argmin(np.abs(upward_wavelengths_m - wavelength_target_m))) + 1
 
     response_png = os.path.join(REMOTE_WORK, "grating_response.png")
     plt.figure(figsize=(8.5, 4.6))
@@ -1878,97 +1864,87 @@ else:
         "wavelength_m": wavelengths_m,
         "fiber_coupling": fiber_coupling,
         "fiber_coupling_db": fiber_coupling_db,
-        "upward_wavelength_m": upward_wavelengths_m,
-        "upward_power": upward_power,
         "target_wavelength_m": np.asarray([wavelength_target_m]),
     }
-    farfield_png = os.path.join(REMOTE_WORK, "grating_farfield.png")
+
+    # The fiber port launches mode 1; this monitor records the actual field as
+    # it propagates through the waveguide, taper, grating teeth, and output.
     try:
-        resolution = 361
-        farfield = np.abs(np.squeeze(np.asarray(
-            fdtd.farfield3d(monitor_name, frequency_index, resolution, resolution, 1, 1, 1, 1)
-        )))
-        ux = np.squeeze(np.asarray(
-            fdtd.farfieldux(monitor_name, frequency_index, resolution, resolution, 1)
-        )).ravel()
-        uy = np.squeeze(np.asarray(
-            fdtd.farfielduy(monitor_name, frequency_index, resolution, resolution, 1)
-        )).ravel()
-        ux_grid, uy_grid = np.meshgrid(ux, uy, indexing="xy")
-        if farfield.shape != ux_grid.shape and farfield.T.shape == ux_grid.shape:
-            farfield = farfield.T
-        radial = np.sqrt(ux_grid**2 + uy_grid**2)
-        valid = radial <= 1.0
-        projected = np.where(valid, farfield, np.nan)
-        peak_flat = int(np.nanargmax(projected))
-        peak_row, peak_col = np.unravel_index(peak_flat, projected.shape)
-        ux_peak = float(ux_grid[peak_row, peak_col])
-        uy_peak = float(uy_grid[peak_row, peak_col])
-        theta_peak_deg = float(np.degrees(np.arcsin(np.clip(np.hypot(ux_peak, uy_peak), 0.0, 1.0))))
-        phi_peak_deg = float(np.degrees(np.arctan2(uy_peak, ux_peak)))
-        print("Natural grating exit: theta = %.3f deg from +Z, phi = %.3f deg" % (theta_peak_deg, phi_peak_deg))
-
-        normalized = projected / np.nanmax(projected)
-        theta_grid_rad = np.arcsin(np.clip(radial, 0.0, 1.0))
-        theta_grid_deg = np.degrees(theta_grid_rad)
-        phi_grid_rad = np.arctan2(uy_grid, ux_grid)
-
-        # Plot the full upper hemisphere in true polar coordinates: azimuth phi
-        # is the angular coordinate and elevation from +Z, theta, is the radius.
-        plot_stride = max(1, resolution // 180)
-        plot_valid = valid[::plot_stride, ::plot_stride]
-        plot_phi = phi_grid_rad[::plot_stride, ::plot_stride][plot_valid]
-        plot_theta = theta_grid_deg[::plot_stride, ::plot_stride][plot_valid]
-        plot_intensity = normalized[::plot_stride, ::plot_stride][plot_valid]
-        triangulation = mtri.Triangulation(plot_phi, plot_theta)
-        seam_triangles = np.ptp(plot_phi[triangulation.triangles], axis=1) > np.pi
-        triangulation.set_mask(seam_triangles)
-
-        fig, axis = plt.subplots(figsize=(8.0, 7.2), subplot_kw={"projection": "polar"})
-        levels = np.linspace(0.0, 1.0, 41)
-        image = axis.tricontourf(triangulation, plot_intensity, levels=levels, cmap="magma")
-        axis.plot(np.radians(phi_peak_deg), theta_peak_deg,
-                  marker="x", ms=10, mew=2, color="cyan", label="natural peak")
-        axis.set_theta_zero_location("N")
-        axis.set_theta_direction(-1)
-        axis.set_rlim(0.0, 90.0)
-        axis.set_rticks([0, 15, 30, 45, 60, 75, 90])
-        axis.set_rlabel_position(135)
-        axis.set_xlabel("azimuth φ; radius θ from +Z [deg]", labelpad=18)
-        axis.set_title("Natural grating radiation pattern at %.1f nm" % (wavelength_target_m / 1e-9))
-        axis.legend(loc="upper right", bbox_to_anchor=(1.22, 1.10))
-        fig.colorbar(image, ax=axis, label="normalized intensity")
-        fig.tight_layout()
-        fig.savefig(farfield_png, dpi=170, bbox_inches="tight")
-        plt.close(fig)
-        analysis_arrays.update({
-            "farfield_intensity": farfield,
-            "ux": ux,
-            "uy": uy,
-            "theta_deg": theta_grid_deg,
-            "phi_deg": np.degrees(phi_grid_rad),
-            "theta_peak_deg": np.asarray([theta_peak_deg]),
-            "phi_peak_deg": np.asarray([phi_peak_deg]),
-        })
+        field_result = fdtd.getresult("::model::" + field_monitor_name, "E")
     except Exception as exc:
-        warning = "Far-field projection unavailable: " + str(exc)[:240]
-        print(warning)
-        fig, axis = plt.subplots(figsize=(7.2, 4.2))
-        axis.axis("off")
-        axis.text(0.5, 0.55, "Far-field projection unavailable", ha="center", va="center", fontsize=15, fontweight="bold")
-        axis.text(0.5, 0.40, str(exc)[:220], ha="center", va="center", fontsize=9, wrap=True)
-        fig.tight_layout()
-        fig.savefig(farfield_png, dpi=170, bbox_inches="tight")
-        plt.close(fig)
-        analysis_arrays["farfield_error"] = np.asarray([str(exc)[:500]])
+        raise RuntimeError(
+            "The longitudinal grating field monitor %r has no E result. Confirm that it lies inside the FDTD region. %s"
+            % (field_monitor_name, exc)
+        ) from None
+    field_x_m = np.squeeze(np.asarray(field_result["x"], dtype=float)).ravel()
+    field_y_m = np.squeeze(np.asarray(field_result["y"], dtype=float)).ravel()
+    field_frequency_hz = np.squeeze(np.asarray(field_result["f"], dtype=float)).ravel()
+    target_frequency_hz = 299792458.0 / wavelength_target_m
+    field_frequency_index = int(np.argmin(np.abs(field_frequency_hz - target_frequency_hz)))
+
+    def _field_plane(component_name):
+        values = np.asarray(field_result[component_name])
+        frequency_axes = [axis for axis, size in enumerate(values.shape) if size == field_frequency_hz.size]
+        if frequency_axes:
+            values = np.take(values, field_frequency_index, axis=frequency_axes[-1])
+        values = np.squeeze(values)
+        if values.shape == (field_y_m.size, field_x_m.size):
+            values = values.T
+        if values.shape != (field_x_m.size, field_y_m.size):
+            values = values.reshape(field_x_m.size, field_y_m.size)
+        return values
+
+    field_intensity = (
+        np.abs(_field_plane("Ex")) ** 2
+        + np.abs(_field_plane("Ey")) ** 2
+        + np.abs(_field_plane("Ez")) ** 2
+    )
+    field_intensity_normalized = field_intensity / max(float(np.nanmax(field_intensity)), 1e-30)
+    field_wavelength_m = 299792458.0 / field_frequency_hz[field_frequency_index]
+    field_png = os.path.join(REMOTE_WORK, "grating_field_distribution.png")
+    figure, axis = plt.subplots(figsize=(12.0, 5.4))
+    image = axis.pcolormesh(
+        field_x_m * 1e6,
+        field_y_m * 1e6,
+        field_intensity_normalized.T,
+        shading="auto",
+        cmap="inferno",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    for polygon in GEOMETRY:
+        if int(polygon.get("component_uid", -1)) != int(GRATING_ANALYSIS["component_uid"]):
+            continue
+        outline = np.asarray(polygon["vertices_um"], dtype=float)
+        axis.plot(
+            np.r_[outline[:, 0], outline[0, 0]],
+            np.r_[outline[:, 1], outline[0, 1]],
+            color="white",
+            alpha=0.24,
+            linewidth=0.45,
+        )
+    axis.set_aspect("equal", adjustable="box")
+    axis.set_xlabel("x [um]")
+    axis.set_ylabel("y [um]")
+    axis.set_title("Grating coupler longitudinal field |E|² at %.3f nm" % (field_wavelength_m * 1e9))
+    figure.colorbar(image, ax=axis, label="normalized |E|²")
+    figure.tight_layout()
+    figure.savefig(field_png, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+    analysis_arrays.update({
+        "field_x_m": field_x_m,
+        "field_y_m": field_y_m,
+        "field_intensity_normalized": field_intensity_normalized,
+        "field_wavelength_m": np.asarray([field_wavelength_m]),
+    })
 
     grating_npz = os.path.join(REMOTE_WORK, "grating_analysis.npz")
     np.savez_compressed(grating_npz, **analysis_arrays)
-    for required_path in (response_png, farfield_png, grating_npz):
-        if not os.path.isfile(required_path):
+    for required_path in (response_png, field_png, grating_npz):
+        if not os.path.isfile(required_path) or os.path.getsize(required_path) <= 0:
             raise RuntimeError("Required grating artifact was not created: " + required_path)
     print("Saved grating response:", response_png)
-    print("Saved grating far field:", farfield_png)
+    print("Saved grating longitudinal field:", field_png)
     print("Saved grating analysis:", grating_npz)
 '''
 
@@ -2190,7 +2166,7 @@ REMOTE_ARTIFACTS = [
 if GRATING_ANALYSIS and SETTINGS.get("run_after_build", False):
     REMOTE_ARTIFACTS.extend([
         REMOTE_WORK + "/grating_response.png",
-        REMOTE_WORK + "/grating_farfield.png",
+        REMOTE_WORK + "/grating_field_distribution.png",
         REMOTE_WORK + "/grating_analysis.npz",
     ])
 elif GRATING_ANALYSIS:
@@ -2310,22 +2286,17 @@ def generate_lumerical_notebook(
             points = np.vstack([np.asarray(item["vertices_um"], dtype=float) for item in grating_polygons])
             minimum, maximum = points.min(axis=0), points.max(axis=0)
             xy_margin_um = max(0.5, float(configuration.get("xy_padding_um", 1.0)))
-            z_clearance_um = max(0.1, float(configuration.get("z_padding_um", 1.0)))
             waveguide_receiver_port = deepcopy(waveguide_ports[0])
-            exit_center = [float(0.5 * (minimum[0] + maximum[0])), float(0.5 * (minimum[1] + maximum[1]))]
-            exit_x_span = float(maximum[0] - minimum[0] + 2.0 * xy_margin_um)
-            exit_y_span = float(maximum[1] - minimum[1] + 2.0 * xy_margin_um)
-            grating_center = np.asarray(exit_center, dtype=float)
+            field_center = [float(0.5 * (minimum[0] + maximum[0])), float(0.5 * (minimum[1] + maximum[1]))]
+            field_x_span = float(maximum[0] - minimum[0] + 2.0 * xy_margin_um)
+            field_y_span = float(maximum[1] - minimum[1] + 2.0 * xy_margin_um)
+            grating_center = np.asarray(field_center, dtype=float)
             fiber_port = min(
                 fiber_ports,
                 key=lambda port: float(
                     np.linalg.norm(np.asarray(port.get("center", (0.0, 0.0)), dtype=float) - grating_center)
                 ),
             )
-            exit_center = [float(value) for value in fiber_port.get("center", exit_center)]
-            fiber_span = max(1.0, float(fiber_port.get("span_um", 20.0)))
-            exit_x_span = fiber_span
-            exit_y_span = fiber_span
             fiber_port_name = str(fiber_port.get("name", "fiber"))
             fiber_geometry = min(
                 fiber_geometries,
@@ -2353,12 +2324,10 @@ def generate_lumerical_notebook(
                     "waveguide_port_name": str(waveguide_receiver_port.get("name", f"gc_receiver_uid_{grating_uid}")),
                     "fiber_port_name": fiber_port_name,
                     "fiber_geometry_name": str(fiber_geometry.get("name", "fiber")),
-                    "monitor_name": f"grating_up_uid_{grating_uid}",
-                    "center_um": exit_center,
-                    "x_span_um": exit_x_span,
-                    "y_span_um": exit_y_span,
-                    "z_offset_um": float(min(0.25, 0.5 * z_clearance_um)),
-                    "z reference": str(fiber_port.get("z reference", "device top")),
+                    "field_monitor_name": f"grating_field_uid_{grating_uid}",
+                    "field_center_um": field_center,
+                    "field_x_span_um": field_x_span,
+                    "field_y_span_um": field_y_span,
                     "frequency_points": 50,
                 }
 
@@ -2645,12 +2614,12 @@ def generate_lumerical_notebook(
         "run_remote_checked(REMOTE_RESULTS_SAVER, 'Save project and numerical result bundle', timeout=1800)\n"
     )
     grating_analysis_cell = (
-        "# Plot the grating response and its natural far-field radiation before saving/fetching results.\n"
+        "# Plot coupling efficiency and the longitudinal device-layer field before saving/fetching results.\n"
         f"REMOTE_GRATING_ANALYSIS = {repr(_GRATING_ANALYSIS_REMOTE)}\n"
-        "run_remote_checked(REMOTE_GRATING_ANALYSIS, 'Grating response and far-field analysis', timeout=1800)\n"
+        "run_remote_checked(REMOTE_GRATING_ANALYSIS, 'Grating coupling and longitudinal-field analysis', timeout=1800)\n"
         "if SETTINGS.get('run_after_build', False):\n"
         "    lam.show(REMOTE_WORK + '/grating_response.png', width=1000)\n"
-        "    lam.show(REMOTE_WORK + '/grating_farfield.png', width=900)\n"
+        "    lam.show(REMOTE_WORK + '/grating_field_distribution.png', width=1100)\n"
     )
     mmi_analysis_cell = (
         "# Plot the symmetric MMI splitting ratio and longitudinal fundamental-mode field.\n"
@@ -2697,7 +2666,7 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
 - A conformal cladding row fills etched openings in the patterned layer immediately below it and then covers the device.
 - The FDTD boundary keeps at least λ/4 clearance from ordinary device features. Bottom and top background films extend through their PMLs, and each manually placed lateral waveguide port receives a cross-section-matched continuation through its PML, following the official Ansys example.
 - `LiNbO3` is created as a frequency- and temperature-dependent anisotropic sampled material using the Zelmon/Moretti model and the selected X/Y/Z crystal cut.
-- Grating-coupler exports follow the official Ansys 3D example: the tilted Z-axis fiber FDTD port is the Backward source and the waveguide FDTD port is the receiver. They plot coupling efficiency in dB versus wavelength and the 3D far field in polar coordinates.
+- Grating-coupler exports use the tilted Z-axis fiber FDTD port as the Backward source and the waveguide FDTD port as the receiver. They plot coupling efficiency in dB versus wavelength and normalized longitudinal |E|² through the waveguide, taper, complete grating, and output section.
 - A 1×2 MMI export launches mode 1 from its input port, measures input power 2 µm before the input taper, plots both output powers relative to that measured input, and plots the normalized longitudinal |E|² distribution through the complete MMI.
 - GPU and CPU modes are selectable through `SETTINGS['resource_mode']`; GPU is the default for every 3D export.
 - Run the final release cell even after an interrupted simulation so the FDTD licence and roamed HPC Packs are returned.
@@ -2724,7 +2693,7 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
             _notebook_cell("code", solve_cell),
             *(
                 [
-                    _notebook_cell("markdown", "## 9 · Grating coupling efficiency and far-field radiation\n\nFollowing the official Ansys 3D grating example, the tilted fiber-side Z port injects Backward toward the chip and the waveguide FDTD port receives the coupled power. The upward monitor is also projected to a polar far-field plot.\n"),
+                    _notebook_cell("markdown", "## 9 · Grating coupling efficiency and longitudinal field\n\nThe tilted fiber-side Z port injects Backward toward the chip and the waveguide FDTD port receives the coupled power. A Z-normal field monitor through the device center plots normalized |E|² across the waveguide, taper, complete grating, and output section.\n"),
                     _notebook_cell("code", grating_analysis_cell),
                 ]
                 if grating_analysis

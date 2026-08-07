@@ -53,6 +53,7 @@ def add_parent_focusing_gc(
         cell_name=cell_name,
         gds_file=None,
         tolerance=float(p.get("gc_tolerance", p.get("tolerance", 0.0005))),
+        L_extra=float(p.get("gc_L_extra", p.get("L_extra", 0.0))),
     )
 
     connector_local = np.array(

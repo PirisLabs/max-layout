@@ -1129,7 +1129,7 @@ class NativeLayoutWindow(QMainWindow):
                     "angle phi": 0.0,
                     "rotation offset_um": 4.0 * float(grating_params.get("fiber_core_diameter_um", 9.0)) * math.tan(math.radians(fiber_angle_deg)),
                     "distance_um": port_distance_um,
-                    "z reference": "top of stack",
+                    "z reference": "top of SiO2 cladding" if kind == "GC-SOI" else "top of stack",
                 }
             )
             for companion in companions:
@@ -1259,6 +1259,7 @@ class NativeLayoutWindow(QMainWindow):
                         )
                 elif is_soi:
                     tox_offset_um = float(params.get("fiber_tox_offset_um", 0.65))
+                    companion["params"]["z reference"] = "top of SiO2 cladding"
                     companion["params"]["distance_um"] = tox_offset_um * math.cos(math.radians(theta_deg)) - 0.35
                     companion["params"]["rotation offset_um"] = 4.0 * float(params.get("fiber_core_diameter_um", 9.0)) * math.tan(math.radians(theta_deg))
         return True
@@ -1508,7 +1509,7 @@ class NativeLayoutWindow(QMainWindow):
             "Taper":["length","width_start","width_end"],
             "S-bend":["length","offset","width"],
             "Euler bend":["radius","bend_angle_deg","width","euler_fraction"],
-            "Grating coupler":["pitch","fill_factor","N","alpha_t","taper_L","wg_width","wg_length"],
+            "Grating coupler":["pitch","fill_factor","N","alpha_t","taper_L","L_extra","wg_width","wg_length"],
             "1x2 MMI":["mmi_length","mmi_width","taper_width","wg_width","port_sep","input_taper_length","output_taper_length"],
             "Cascaded MMI":["N_levels","mmi_length","mmi_width","taper_width","wg_width","s_bend_length","output_gc_spacing"],
             "MMI + Reference":["mmi_length","mmi_width","taper_width","wg_width","reference_dy","reference_branch"],
@@ -4525,7 +4526,7 @@ ENDFLOW
                 groups.append((name, available))
 
         gc_keys = (
-            "pitch", "fill_factor", "N", "alpha_t", "taper_L", "wg_width", "wg_length",
+            "pitch", "fill_factor", "N", "alpha_t", "taper_L", "L_extra", "wg_width", "wg_length",
             "gc_pitch", "gc_fill_factor", "gc_N", "gc_alpha_t", "gc_taper_L", "gc_wg_length",
         )
         mmi_keys = (
