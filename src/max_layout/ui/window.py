@@ -852,7 +852,20 @@ class NativeLayoutWindow(QMainWindow):
                 synchronize_rf_taper_points(component)
                 if component.get("kind") == "Fiber geometry" and bool(component.get("auto_placed", False)):
                     component.setdefault("params", {})["z reference"] = "top of SiO2 cladding"
+                if component.get("kind") == "GC-SOI":
+                    params = component.setdefault("params", {})
+                    if abs(float(params.get("tolerance", 0.005)) - 0.0005) <= 1e-12:
+                        params["tolerance"] = 0.005
+                    if abs(float(params.get("fdtd_port_offset_from_waveguide_end_um", 2.0)) - 3.0) <= 1e-12:
+                        params["fdtd_port_offset_from_waveguide_end_um"] = 2.0
+                elif component.get("kind") == "Grating coupler":
+                    params = component.setdefault("params", {})
+                    if abs(float(params.get("fdtd_port_offset_from_waveguide_end_um", 2.0)) - 3.0) <= 1e-12:
+                        params["fdtd_port_offset_from_waveguide_end_um"] = 2.0
             self.components = components
+            for component in self.components:
+                if component.get("kind") in {"Grating coupler", "GC-SOI"}:
+                    self.synchronize_automatic_simulation_companions(component)
             self.next_uid = int(data.get("next_uid", max([int(c.get("uid", 0)) for c in components] + [0]) + 1))
             self.next_group_id = int(data.get("next_group_id", 1))
             self.next_array_id = int(data.get("next_array_id", 1))
@@ -958,7 +971,9 @@ class NativeLayoutWindow(QMainWindow):
             if kind in {"Grating coupler", "GC-SOI"} and port_name == "waveguide_point":
                 port_offset_um = max(
                     0.0,
-                    float(component.get("params", {}).get("fdtd_port_offset_from_waveguide_end_um", 3.0)),
+                    float(component.get("params", {}).get(
+                        "fdtd_port_offset_from_waveguide_end_um", 2.0
+                    )),
                 )
                 inward_angle = math.radians(outward + 180.0)
                 center = (
@@ -1160,7 +1175,9 @@ class NativeLayoutWindow(QMainWindow):
                     if str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"} and str(parent_port_name) == "waveguide_point":
                         port_offset_um = max(
                             0.0,
-                            float(component.get("params", {}).get("fdtd_port_offset_from_waveguide_end_um", 3.0)),
+                            float(component.get("params", {}).get(
+                                "fdtd_port_offset_from_waveguide_end_um", 2.0
+                            )),
                         )
                         inward_angle = math.radians(outward + 180.0)
                         center_x += port_offset_um * math.cos(inward_angle)
@@ -1816,7 +1833,7 @@ class NativeLayoutWindow(QMainWindow):
                 component["params"]["fiber_offset_after_taper_um"] = float(component["params"].pop("fiber_offset_from_flare_um", 5.0))
             else:
                 component["params"].pop("fiber_offset_from_flare_um", None)
-            component["params"].setdefault("fdtd_port_offset_from_waveguide_end_um", 3.0)
+            component["params"].setdefault("fdtd_port_offset_from_waveguide_end_um", 2.0)
         for key, value in (
             ("x", component.get("x", 0.0)),
             ("y", component.get("y", 0.0)),
@@ -1871,6 +1888,7 @@ class NativeLayoutWindow(QMainWindow):
             parameter_label = (
                 "Fiber offset after taper toward grating (µm)" if key == "fiber_offset_after_taper_um"
                 else "FDTD port offset from waveguide end (µm)" if key == "fdtd_port_offset_from_waveguide_end_um"
+                else "GDS curve tolerance (µm)" if key == "tolerance" and component.get("kind") in {"Grating coupler", "GC-SOI"}
                 else "Grating straight waveguide length (µm)" if key == "wg_length" and component.get("kind") in {"Grating coupler", "GC-SOI"}
                 else "GC straight lead length (µm)" if key == "gc_wg_length"
                 else "CPW taper model" if key == "cpw_profile"

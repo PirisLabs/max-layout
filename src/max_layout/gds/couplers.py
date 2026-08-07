@@ -124,7 +124,13 @@ def add_soi_grating_coupler(
     slab_datatype = int(p.get("slab_datatype", DEFAULT_DATATYPE))
     etched_layer = int(p.get("etched_layer", GC_LAYER))
     etched_datatype = int(p.get("etched_datatype", DEFAULT_DATATYPE))
-    tolerance = max(1e-5, float(p.get("tolerance", 0.0005)))
+    requested_tolerance = float(p.get("tolerance", 0.005))
+    # Layouts saved before the 5 nm GC-SOI default contain the former
+    # 0.5 nm value explicitly.  Upgrade that legacy default at build time so
+    # old projects and newly created components generate the same geometry.
+    if np.isclose(requested_tolerance, 0.0005, rtol=0.0, atol=1e-12):
+        requested_tolerance = 0.005
+    tolerance = max(1e-5, requested_tolerance)
     if min(pitch, target_length, radius, y_span, wg_width, wg_length) <= 0:
         raise ValueError("GC-SOI dimensions and pitch must be positive.")
     if not 0.0 < duty_cycle < 1.0:

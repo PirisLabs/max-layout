@@ -121,7 +121,7 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                      'wg_width': 1.2,
                      'wg_length': 5.0,
                      'fiber_offset_after_taper_um': 5.0,
-                     'fdtd_port_offset_from_waveguide_end_um': 3.0,
+                     'fdtd_port_offset_from_waveguide_end_um': 2.0,
                      'layer': 2,
                      'datatype': 0,
                      'tolerance': 0.0005,
@@ -757,12 +757,13 @@ DEFAULT_COMPONENT_VALUES["GC-SOI"] = {
     "fiber_cladding_diameter_um": 50.0,
     "fiber_cladding_index": 1.43482,
     "fiber_length_um": 20.0,
-    "fdtd_port_offset_from_waveguide_end_um": 3.0,
+    "fdtd_port_offset_from_waveguide_end_um": 2.0,
     "slab_layer": PHOTONIC_LAYER,
     "slab_datatype": DEFAULT_DATATYPE,
     "etched_layer": GC_LAYER,
     "etched_datatype": DEFAULT_DATATYPE,
-    "tolerance": 0.0005,
+    # GDS curve tolerance in micrometres: 0.005 um = 5 nm.
+    "tolerance": 0.005,
 }
 
 INTEGER_PARAMETERS.add("seg_segment_count")

@@ -1008,7 +1008,7 @@ class LumericalExportDialog(QDialog):
         mesh_factor.setDecimals(6)
         mesh_factor.setSingleStep(0.05)
         mesh_factor.setSpecialValueText("Automatic")
-        mesh_factor.setValue(max(0.0, float(data.get("mesh_factor", 0.1))))
+        mesh_factor.setValue(max(0.0, float(data.get("mesh_factor", 0.2))))
         mesh_factor.setMinimumSize(155, 38)
         mesh_factor.setToolTip(
             "Isotropic mesh step as a factor of λ₀/n at the shortest simulated wavelength. For anisotropic media, n is the largest index component."
