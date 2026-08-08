@@ -122,6 +122,7 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                      'wg_width': 1.2,
                      'wg_length': 5.0,
                      'fiber_offset_after_taper_um': 5.0,
+                     'fiber_power_monitor_below_source_um': 0.1,
                      'fdtd_port_offset_from_waveguide_end_um': 2.0,
                      'layer': 2,
                      'datatype': 0,
@@ -759,6 +760,7 @@ DEFAULT_COMPONENT_VALUES["GC-SOI"] = {
     "fiber_cladding_diameter_um": 50.0,
     "fiber_cladding_index": 1.43482,
     "fiber_length_um": 20.0,
+    "fiber_power_monitor_below_source_um": 0.1,
     "fdtd_port_offset_from_waveguide_end_um": 2.0,
     "slab_layer": PHOTONIC_LAYER,
     "slab_datatype": DEFAULT_DATATYPE,
@@ -801,6 +803,7 @@ DEFAULT_COMPONENT_VALUES.update(
             "port geometry": "surface", "plane normal": "Z", "distance_um": 0.0, "z reference": "top of stack",
             "span_um": 20.0, "z_span_um": 0.0, "mode": "fundamental mode",
             "angle theta": 7.0, "angle phi": 0.0,
+            "align to fiber axis": True,
             "rotation offset_um": 4.420244193,
         },
         "Fiber geometry": {
@@ -834,6 +837,8 @@ DEFAULT_COMPONENT_VALUES.update(
 )
 
 INTEGER_PARAMETERS.add("order")
+
+BOOL_PARAMETERS.add("align to fiber axis")
 
 PHOTONIC_COMPONENT_KINDS = (
     set(DEFAULT_COMPONENT_VALUES)

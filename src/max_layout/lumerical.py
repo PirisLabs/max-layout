@@ -315,47 +315,130 @@ def _collect_export_data(
     return geometry, ports, fiber_geometries, monitors, bbox, warnings + [f"Layout origin moved by ({origin[0]:.6g}, {origin[1]:.6g}) µm for simulation."]
 
 
+def _stack_vertical_levels(stack: list[dict[str, Any]]) -> tuple[float, float, float]:
+    """Return device top, stack top, and upper-silica top using notebook conventions."""
+    active = [row for row in stack if float(row.get("thickness_um", 0.0)) > 0.0]
+    if not active:
+        return 0.0, 0.0, 0.0
+    anchor_index = next(
+        (index for index, row in enumerate(active) if str(row.get("role", "background")).lower() == "geometry"),
+        len(active) // 2,
+    )
+    anchor_thickness = float(active[anchor_index].get("thickness_um", 0.0))
+    ranges: list[tuple[dict[str, Any], float, float] | None] = [None] * len(active)
+    ranges[anchor_index] = (active[anchor_index], -0.5 * anchor_thickness, 0.5 * anchor_thickness)
+    cursor = -0.5 * anchor_thickness
+    for index in range(anchor_index - 1, -1, -1):
+        thickness = float(active[index].get("thickness_um", 0.0))
+        ranges[index] = (active[index], cursor - thickness, cursor)
+        cursor -= thickness
+    cursor = 0.5 * anchor_thickness
+    for index in range(anchor_index + 1, len(active)):
+        thickness = float(active[index].get("thickness_um", 0.0))
+        ranges[index] = (active[index], cursor, cursor + thickness)
+        cursor += thickness
+    resolved = [entry for entry in ranges if entry is not None]
+    geometry_tops = [
+        z1 for row, _z0, z1 in resolved
+        if str(row.get("role", "background")).lower() == "geometry"
+    ]
+    device_top = max(geometry_tops, default=0.0)
+    stack_top = resolved[-1][2]
+    silica_rows = []
+    for row, _z0, z1 in resolved:
+        label = (str(row.get("name", "")) + " " + str(row.get("material", ""))).lower()
+        if ("sio2" in label or "silica" in label or "glass" in label) and z1 >= device_top - 1e-12:
+            silica_rows.append((bool(row.get("conformal", False)), float(z1)))
+    conformal_tops = [z1 for conformal, z1 in silica_rows if conformal]
+    silica_top = max(conformal_tops or [z1 for _conformal, z1 in silica_rows] or [device_top])
+    return float(device_top), float(stack_top), float(silica_top)
+
+
+def _item_vertical_reference(item: dict[str, Any], levels: tuple[float, float, float]) -> float:
+    device_top, stack_top, silica_top = levels
+    reference = str(item.get("z reference", "device top")).strip().lower()
+    if reference in {"top of sio2 cladding", "top of silica cladding", "top cladding"}:
+        return silica_top
+    if reference == "top of stack":
+        return stack_top
+    return device_top
+
+
 def _synchronize_fiber_port_parameters(
     ports: list[dict[str, Any]],
     fiber_geometries: list[dict[str, Any]],
+    monitors: list[dict[str, Any]],
     warnings: list[str],
+    material_stack: list[dict[str, Any]],
 ) -> None:
-    """Make each Z-normal fiber port follow its matching fiber, as in the Ansys 3D example.
+    """Place tilted source/measurement planes on the matching fiber axis.
 
-    The official grating-coupler model treats the fiber geometry as the source
-    of truth for theta and derives the FDTD port rotation offset from that
-    angle and the fiber core diameter.  Matching by simulation parent first
-    preserves independent manually placed fiber assemblies.
+    A fiber's editor center is its bottom-center contact point on the cladding.
+    A source or monitor at another Z plane therefore needs a lateral shift of
+    ``delta_z * tan(theta)`` to remain concentric with the tilted core.
     """
-    for port in ports:
-        if str(port.get("plane normal", "X")).upper() != "Z" or not fiber_geometries:
-            continue
-        parent_uid = int(port.get("parent_component_uid", -1))
+    levels = _stack_vertical_levels(material_stack)
+
+    def matching_fiber(item: dict[str, Any]) -> dict[str, Any] | None:
+        if not fiber_geometries:
+            return None
+        parent_uid = int(item.get("parent_component_uid", -1))
         matching = [
             fiber for fiber in fiber_geometries
             if int(fiber.get("parent_component_uid", -2)) == parent_uid
         ]
         candidates = matching or fiber_geometries
-        port_center = np.asarray(port.get("center", (0.0, 0.0)), dtype=float)
-        fiber = min(
+        item_center = np.asarray(item.get("center", (0.0, 0.0)), dtype=float)
+        return min(
             candidates,
-            key=lambda item: float(
-                np.linalg.norm(np.asarray(item.get("center", (0.0, 0.0)), dtype=float) - port_center)
+            key=lambda fiber: float(
+                np.linalg.norm(np.asarray(fiber.get("center", (0.0, 0.0)), dtype=float) - item_center)
             ),
         )
+
+    def align_plane(item: dict[str, Any], fiber: dict[str, Any]) -> None:
+        theta_deg = float(fiber.get("angle theta", item.get("angle theta", 7.0)))
+        phi_deg = float(fiber.get("angle phi", item.get("angle phi", 0.0)))
+        item["angle theta"] = theta_deg
+        item["angle phi"] = phi_deg
+        if not bool(item.get("align to fiber axis", True)):
+            return
+        fiber_bottom_z = _item_vertical_reference(fiber, levels) + float(fiber.get("distance_um", 0.0))
+        plane_z = _item_vertical_reference(item, levels) + float(item.get("distance_um", 0.0))
+        axial_height_um = plane_z - fiber_bottom_z
+        lateral_um = axial_height_um * math.tan(math.radians(theta_deg))
+        phi_rad = math.radians(phi_deg)
+        bottom_center = np.asarray(fiber.get("center", (0.0, 0.0)), dtype=float)
+        axis_center = bottom_center + lateral_um * np.asarray([math.cos(phi_rad), math.sin(phi_rad)])
+        item["center"] = [float(axis_center[0]), float(axis_center[1])]
+        item["fiber bottom center_um"] = [float(bottom_center[0]), float(bottom_center[1])]
+        item["fiber axis height_um"] = float(axial_height_um)
+
+    for port in ports:
+        if str(port.get("plane normal", "X")).upper() != "Z":
+            continue
+        fiber = matching_fiber(port)
+        if fiber is None:
+            continue
         theta_deg = float(fiber.get("angle theta", port.get("angle theta", 7.0)))
         phi_deg = float(fiber.get("angle phi", port.get("angle phi", 0.0)))
         previous_theta = float(port.get("angle theta", theta_deg))
         previous_phi = float(port.get("angle phi", phi_deg))
         core_diameter_um = max(1e-6, float(fiber.get("core diameter_um", 9.0)))
-        port["angle theta"] = theta_deg
-        port["angle phi"] = phi_deg
+        align_plane(port, fiber)
         port["rotation offset_um"] = 4.0 * core_diameter_um * math.tan(math.radians(theta_deg))
         if abs(previous_theta - theta_deg) > 1e-9 or abs(previous_phi - phi_deg) > 1e-9:
             warnings.append(
                 "Fiber-axis port %s was synchronized to fiber %s: theta %.6g°, phi %.6g°."
                 % (port.get("name", ""), fiber.get("name", ""), theta_deg, phi_deg)
             )
+
+    for monitor in monitors:
+        if str(monitor.get("plane normal", "X")).upper() != "Z" or not bool(monitor.get("align to fiber axis", False)):
+            continue
+        fiber = matching_fiber(monitor)
+        if fiber is not None:
+            align_plane(monitor, fiber)
 
 
 def _notebook_cell(cell_type: str, source: str) -> dict[str, Any]:
@@ -652,6 +735,12 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
     """Build films and tapered cross-sections with Lumerical's Layer Builder."""
     fdtd.addlayerbuilder()
     fdtd.set("name", "Max Layout material stack")
+    # Lower mesh-order values win in material overlaps.  Keep the solver's
+    # air background outside the Layer Builder, reserve orders 1 and 2 for the
+    # fiber core/cladding, then give all silicon grow layers order 3.  Layer
+    # Builder background layers are therefore order 5; their list order below
+    # resolves the remaining priority as top cladding > BOX > substrate.
+    fdtd.set("base mesh order", 3)
     fdtd.set("process name", "Max Layout export")
     fdtd.set("GDS sidewall angle position reference", "middle")
     fdtd.set("x", 0.5 * (bounds[0] + bounds[2]) * UM)
@@ -722,6 +811,12 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
     for row_index, (row, z0, z1) in enumerate(z_ranges, start=1):
         base_name = f'{row_index:02d} {row["name"]}'
         if row.get("role") != "geometry":
+            # Air is the FDTD background (n=1), not an overlapping geometry.
+            # Omitting an explicit air process layer prevents it from winning
+            # a same-order Layer Builder overlap with the conformal cladding.
+            if str(row.get("material", "")).strip().lower() == "air":
+                print("Using FDTD background index 1 for %s; no overlapping air layer was created." % row["name"])
+                continue
             background_z0 = conformal_start(row_index, z0) if bool(row.get("conformal", False)) else z0
             background_z1 = z1
             if row_index == 1:
@@ -947,7 +1042,7 @@ def _add_fiber_geometries(fdtd, device_top_um, stack_top_um, silica_cladding_top
         if name in used_names:
             name = f"uid_{fiber.get('component_uid', 0)}_{name}"
         used_names.add(name)
-        x_um, y_um = map(float, fiber.get("center", (0.0, 0.0)))
+        bottom_x_um, bottom_y_um = map(float, fiber.get("center", (0.0, 0.0)))
         theta_deg = float(fiber.get("angle theta", 10.0))
         phi_deg = float(fiber.get("angle phi", 0.0))
         core_diameter_um = max(1e-6, float(fiber.get("core diameter_um", 9.0)))
@@ -960,6 +1055,12 @@ def _add_fiber_geometries(fdtd, device_top_um, stack_top_um, silica_cladding_top
         # Match the official fiber group's meaning of "z span": its requested
         # vertical span is preserved after tilting the cylinder.
         center_z_um = reference_z_um + bottom_gap_um + 0.5 * fiber_length_um
+        # The exported/editor center is the physical bottom-center where the
+        # fiber touches the cladding. The scripted cylinders rotate around
+        # their midpoint, so move the structure-group midpoint laterally.
+        midpoint_shift_um = 0.5 * fiber_length_um * np.tan(np.deg2rad(theta_deg))
+        x_um = bottom_x_um + midpoint_shift_um * np.cos(np.deg2rad(phi_deg))
+        y_um = bottom_y_um + midpoint_shift_um * np.sin(np.deg2rad(phi_deg))
 
         fdtd.addstructuregroup()
         fdtd.set("name", name)
@@ -981,9 +1082,16 @@ def _add_fiber_geometries(fdtd, device_top_um, stack_top_um, silica_cladding_top
         fdtd.adduserprop("theta", 0, theta_deg)
         fdtd.adduserprop("core index", 0, float(fiber.get("core index", 1.44427)))
         fdtd.adduserprop("cladding index", 0, float(fiber.get("cladding index", 1.43482)))
+        # Keep both overlap priorities visible on the fiber group instead of
+        # burying a legacy mesh-order value in its setup script.
+        fdtd.adduserprop("core mesh order", 0, 1)
+        fdtd.adduserprop("cladding mesh order", 0, 2)
         fiber_setup_script = r"""
+deleteall;
 core_index = %core index%;
 cladding_index = %cladding index%;
+core_mesh_order = %core mesh order%;
+cladding_mesh_order = %cladding mesh order%;
 core_radius = %core diameter%/2.0;
 cladding_radius = %cladding diameter%/2.0;
 theta_rad = theta*pi/180.0;
@@ -996,7 +1104,7 @@ set("index",cladding_index);
 set("override color opacity from material database",1);
 set("alpha",0.03);
 set("override mesh order from material database",1);
-set("mesh order",3);
+set("mesh order",cladding_mesh_order);
 set("x",0.0);
 set("y",0.0);
 set("z",0.0);
@@ -1011,7 +1119,7 @@ set("index",core_index);
 set("override color opacity from material database",1);
 set("alpha",0.35);
 set("override mesh order from material database",1);
-set("mesh order",2);
+set("mesh order",core_mesh_order);
 set("x",0.0);
 set("y",0.0);
 set("z",0.0);
@@ -1023,7 +1131,8 @@ set("rotation 1",theta);
         fdtd.runsetup()
         print(
             "Added scripted Ansys fiber property group %s with core/cladding internal offsets (0, 0, 0) um "
-            "(no source or port was created)." % name
+            "and bottom-center contact at (%.6g, %.6g) um (no source or port was created)."
+            % (name, bottom_x_um, bottom_y_um)
         )
 
 
@@ -1104,7 +1213,7 @@ def _add_ports(fdtd, z_center_um, device_top_um, stack_top_um, silica_cladding_t
         print("Updated selected modal data for FDTD port " + name)
 
 
-def _add_monitors(fdtd, z_center_um, device_top_um):
+def _add_monitors(fdtd, z_center_um, device_top_um, stack_top_um, silica_cladding_top_um):
     used_names = set()
     for index, monitor in enumerate(MONITORS, start=1):
         name = str(monitor.get("name") or f"monitor_{index}")
@@ -1125,7 +1234,13 @@ def _add_monitors(fdtd, z_center_um, device_top_um):
         axis = {"X": "x-axis", "Y": "y-axis", "Z": "z-axis"}[plane_normal]
         if axis == "z-axis":
             z_reference = str(monitor.get("z reference", "device top")).strip().lower()
-            z_um = (z_center_um if z_reference == "device center" else device_top_um) + distance_um
+            z_um = (
+                z_center_um
+                if z_reference == "device center"
+                else _vertical_reference_um(
+                    monitor, device_top_um, stack_top_um, silica_cladding_top_um
+                )
+            ) + distance_um
         else:
             x_um += distance_um * np.cos(np.deg2rad(actual))
             y_um += distance_um * np.sin(np.deg2rad(actual))
@@ -1244,6 +1359,7 @@ def build_simulation():
 
     fdtd.addfdtd()
     fdtd.set("dimension", "3D")
+    fdtd.set("background index", 1.0)
     fdtd.set("x", 0.5 * (bounds[0] + bounds[2]) * UM)
     fdtd.set("y", 0.5 * (bounds[1] + bounds[3]) * UM)
     fdtd.set("x span", (bounds[2] - bounds[0]) * UM)
@@ -1281,7 +1397,9 @@ def build_simulation():
             z_span = float(monitor.get("z span", monitor.get("z_span_um", 2.0)))
             plane_normal = min(((abs(x_span), "X"), (abs(y_span), "Y"), (abs(z_span), "Z")))[1]
         if plane_normal == "Z":
-            monitor_z_um = device_top_um + float(monitor.get("distance_um", 0.0))
+            monitor_z_um = _vertical_reference_um(
+                monitor, device_top_um, stack_top_um, silica_cladding_top_um
+            ) + float(monitor.get("distance_um", 0.0))
             z_extent_min_um = min(z_extent_min_um, monitor_z_um)
             z_extent_max_um = max(z_extent_max_um, monitor_z_um)
         z_span_um = 0.0
@@ -1333,6 +1451,11 @@ def build_simulation():
     fdtd.set("auto scale pml parameters", False if GRATING_ANALYSIS else True)
     fdtd.set("simulation time", float(SETTINGS.get("simulation_time_fs", 2000.0)) * 1e-15)
     print("FDTD stability: dt factor %.3g, %s PML" % (dt_stability_factor, pml_profile_name))
+    print(
+        "Material overlap priority: FDTD air background; fiber core mesh order 1; "
+        "fiber cladding 2; grating grow layers 3; top SiO2, BOX, and substrate "
+        "background layers 5 with later process layers taking priority."
+    )
 
     if z_ranges:
         _add_material_stack(
@@ -1351,7 +1474,7 @@ def build_simulation():
         if PORTS:
             fdtd.select("FDTD::ports")
             fdtd.set("monitor frequency points", int(SETTINGS.get("frequency_points", 31)))
-    _add_monitors(fdtd, device_z_um, device_top_um)
+    _add_monitors(fdtd, device_z_um, device_top_um, stack_top_um, silica_cladding_top_um)
     fdtd.setglobalmonitor("use source limits", True)
     fdtd.setglobalmonitor("frequency points", int(SETTINGS.get("frequency_points", 31)))
     model_bounds_um = [
@@ -1848,11 +1971,46 @@ else:
             "The port must be inside the FDTD region and the simulation must finish before plotting. %s"
             % (receiver_port_path, exc)
         ) from None
-    wavelengths_m, fiber_coupling = _one_mode_spectrum(T_data, "T")
-    fiber_coupling = np.abs(fiber_coupling)
-    print("Grating coupling uses the official Ansys definition: T = abs(T_data.T).")
+    wavelengths_m, waveguide_transmission = _one_mode_spectrum(T_data, "T")
+    waveguide_transmission = np.abs(waveguide_transmission)
+    fiber_input_measurement_port_name = GRATING_ANALYSIS.get("fiber_input_measurement_port_name")
+    fiber_input_monitor_name = GRATING_ANALYSIS.get("fiber_input_monitor_name")
+    fiber_input_power = np.ones_like(waveguide_transmission, dtype=float)
+    if fiber_input_measurement_port_name:
+        try:
+            input_path = "::model::FDTD::ports::" + str(fiber_input_measurement_port_name)
+            input_data = fdtd.getresult(input_path, "T")
+            input_wavelengths_m, measured_input = _one_mode_spectrum(input_data, "T")
+            input_order = np.argsort(input_wavelengths_m)
+            fiber_input_power = np.interp(
+                wavelengths_m,
+                input_wavelengths_m[input_order],
+                np.abs(measured_input[input_order]),
+            )
+            print("Measured launched fiber power at tilted receiver port:", fiber_input_measurement_port_name)
+        except Exception as exc:
+            print("Warning: tilted fiber power-measurement port was unavailable; using source-normalized port T:", exc)
+            fiber_input_power = np.ones_like(waveguide_transmission, dtype=float)
+    elif fiber_input_monitor_name:
+        try:
+            input_data = fdtd.getresult(str(fiber_input_monitor_name), "T")
+            input_wavelengths_m, measured_input = _one_mode_spectrum(input_data, "T")
+            input_order = np.argsort(input_wavelengths_m)
+            fiber_input_power = np.interp(
+                wavelengths_m,
+                input_wavelengths_m[input_order],
+                np.abs(measured_input[input_order]),
+            )
+            print("Measured launched fiber power at monitor:", fiber_input_monitor_name)
+        except Exception as exc:
+            print("Warning: fiber input-power monitor was unavailable; using source-normalized port T:", exc)
+            fiber_input_power = np.ones_like(waveguide_transmission, dtype=float)
+    fiber_coupling = waveguide_transmission / np.maximum(fiber_input_power, 1e-15)
+    print("Grating coupling is waveguide-port transmission normalized by measured fiber input power.")
     order = np.argsort(wavelengths_m)
     wavelengths_m = wavelengths_m[order]
+    waveguide_transmission = waveguide_transmission[order]
+    fiber_input_power = fiber_input_power[order]
     fiber_coupling = fiber_coupling[order]
     fiber_coupling_db = 10.0 * np.log10(np.maximum(fiber_coupling, 1e-15))
 
@@ -1863,6 +2021,8 @@ else:
 
     analysis_arrays = {
         "wavelength_m": wavelengths_m,
+        "waveguide_transmission": waveguide_transmission,
+        "fiber_input_power": fiber_input_power,
         "fiber_coupling": fiber_coupling,
         "fiber_coupling_db": fiber_coupling_db,
         "target_wavelength_m": np.asarray([wavelength_target_m]),
@@ -2154,7 +2314,10 @@ def generate_lumerical_notebook(
     geometry, ports, fiber_geometries, monitors, bbox, warnings = _collect_export_data(components, included)
     if not bool(configuration.get("include_ports", True)):
         ports = []
-    _synchronize_fiber_port_parameters(ports, fiber_geometries, warnings)
+    alignment_stack = deepcopy(configuration.get("material_stack") or default_stack())
+    _synchronize_fiber_port_parameters(
+        ports, fiber_geometries, monitors, warnings, alignment_stack
+    )
 
     grating_analysis: dict[str, Any] | None = None
     grating_components = [component for component in components if str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"}]
@@ -2182,6 +2345,18 @@ def generate_lumerical_notebook(
             if bool(port.get("enabled", True))
             and str(port.get("domain", "optical")).lower() == "optical"
             and str(port.get("plane normal", "X")).upper() == "Z"
+            and str(port.get("parent_port_name", "")) != "fiber_input_power"
+            and str(port.get("fiber plane role", "source")).lower() != "input power measurement"
+        ]
+        fiber_measurement_ports = [
+            port for port in ports
+            if bool(port.get("enabled", True))
+            and str(port.get("domain", "optical")).lower() == "optical"
+            and str(port.get("plane normal", "X")).upper() == "Z"
+            and (
+                str(port.get("parent_port_name", "")) == "fiber_input_power"
+                or str(port.get("fiber plane role", "")).lower() == "input power measurement"
+            )
         ]
         matching_fiber_ports = [
             port for port in fiber_ports
@@ -2189,6 +2364,12 @@ def generate_lumerical_notebook(
         ]
         if matching_fiber_ports:
             fiber_ports = matching_fiber_ports
+        matching_measurement_ports = [
+            port for port in fiber_measurement_ports
+            if int(port.get("parent_component_uid", -1)) == grating_uid
+        ]
+        if matching_measurement_ports:
+            fiber_measurement_ports = matching_measurement_ports
         if not grating_polygons:
             warnings.append("Grating analysis was not added because no polygons from the grating coupler were selected.")
         elif not waveguide_ports:
@@ -2230,7 +2411,10 @@ def generate_lumerical_notebook(
             fiber_alignment_error_um = float(
                 np.linalg.norm(
                     np.asarray(fiber_geometry.get("center", (0.0, 0.0)), dtype=float)
-                    - np.asarray(fiber_port.get("center", (0.0, 0.0)), dtype=float)
+                    - np.asarray(
+                        fiber_port.get("fiber bottom center_um", fiber_port.get("center", (0.0, 0.0))),
+                        dtype=float,
+                    )
                 )
             )
             if fiber_alignment_error_um > 0.5 * float(fiber_geometry.get("core diameter_um", 9.0)):
@@ -2239,11 +2423,25 @@ def generate_lumerical_notebook(
                     f"the selected fiber core (top-view separation {fiber_alignment_error_um:.6g} µm)."
                 )
             else:
+                fiber_input_monitors = [
+                    monitor for monitor in monitors
+                    if int(monitor.get("parent_component_uid", -1)) == grating_uid
+                    and str(monitor.get("parent_port_name", "")) == "fiber_input_power"
+                    and str(monitor.get("monitor_kind", "")) == "Power monitor"
+                ]
                 grating_analysis = {
                     "component_uid": grating_uid,
                     "waveguide_port_name": str(waveguide_receiver_port.get("name", f"gc_receiver_uid_{grating_uid}")),
                     "fiber_port_name": fiber_port_name,
                     "fiber_geometry_name": str(fiber_geometry.get("name", "fiber")),
+                    "fiber_input_measurement_port_name": (
+                        str(fiber_measurement_ports[0].get("name", ""))
+                        if fiber_measurement_ports else None
+                    ),
+                    "fiber_input_monitor_name": (
+                        str(fiber_input_monitors[0].get("name", ""))
+                        if fiber_input_monitors else None
+                    ),
                     "frequency_points": int(configuration.get("frequency_points", 31)),
                 }
 

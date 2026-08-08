@@ -134,6 +134,49 @@ def _stack_reference_z(
     return device_top
 
 
+def _fiber_axis_plane_center(
+    component: dict[str, Any],
+    components: list[dict[str, Any]],
+    stack_ranges: list[tuple[dict[str, Any], float, float]],
+    device_top: float,
+    stack_top: float,
+) -> tuple[float, float, float]:
+    """Place a Z-referenced plane at its intersection with a tilted fiber axis."""
+    params = component.get("params", {})
+    reference_z = _stack_reference_z(params, stack_ranges, device_top, stack_top)
+    plane_z = reference_z + float(params.get("distance_um", 0.0))
+    cx, cy = float(component.get("x", 0.0)), float(component.get("y", 0.0))
+    if not bool(params.get("align to fiber axis", False)):
+        return cx, cy, plane_z
+    parent_uid = int(component.get("simulation_parent_uid", -1))
+    fibers = [candidate for candidate in components if str(candidate.get("kind", "")) in {"Fiber geometry", "Fiber port"}]
+    matching = [candidate for candidate in fibers if int(candidate.get("simulation_parent_uid", -2)) == parent_uid]
+    candidates = matching or fibers
+    if not candidates:
+        return cx, cy, plane_z
+    fiber = min(
+        candidates,
+        key=lambda candidate: math.hypot(
+            float(candidate.get("x", 0.0)) - cx,
+            float(candidate.get("y", 0.0)) - cy,
+        ),
+    )
+    fiber_params = fiber.get("params", {})
+    fiber_bottom_z = _stack_reference_z(
+        fiber_params, stack_ranges, device_top, stack_top
+    ) + float(fiber_params.get("distance_um", 0.0))
+    theta = math.radians(float(fiber_params.get("angle theta", params.get("angle theta", 0.0))))
+    phi = math.radians(
+        float(fiber.get("orientation_deg", 0.0)) + float(fiber_params.get("angle phi", 0.0))
+    )
+    lateral = (plane_z - fiber_bottom_z) * math.tan(theta)
+    return (
+        float(fiber.get("x", 0.0)) + lateral * math.cos(phi),
+        float(fiber.get("y", 0.0)) + lateral * math.sin(phi),
+        plane_z,
+    )
+
+
 class CrossSectionDomainPreview(QWidget):
     """Live XZ/YZ process-stack preview with draggable FDTD boundaries."""
 
@@ -554,14 +597,28 @@ class ThreeDModelPreview(QWidget):
                 painter.drawLine(start, stop)
                 painter.setPen(QPen(QColor(14, 116, 144, 110), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 painter.drawLine(start, stop)
-            elif kind in {"FDTD port", "Fiber-axis FDTD port"} and self.show_ports:
+            elif kind in {"FDTD port", "Fiber-axis FDTD port", "Power monitor", "Mode expansion monitor", "Field profile monitor"} and self.show_ports:
                 normal = str(params.get("plane normal", "X")).upper()
-                span = 0.5 * float(params.get("span_um", 2.5))
+                span = 0.5 * float(params.get("span_um", max(params.get("x span", 0.0), params.get("y span", 0.0), 2.5)))
                 if normal == "Z":
-                    reference_z = _stack_reference_z(params, state["stack_ranges"], device_top, stack_top)
-                    port_z = reference_z + float(params.get("distance_um", 0.0))
-                    plane = [screen(raw((cx - span, cy - span, port_z))), screen(raw((cx + span, cy - span, port_z))),
-                             screen(raw((cx + span, cy + span, port_z))), screen(raw((cx - span, cy + span, port_z)))]
+                    cx, cy, port_z = _fiber_axis_plane_center(
+                        component, state["components"], state["stack_ranges"], device_top, stack_top
+                    )
+                    theta = math.radians(float(params.get("angle theta", 0.0)))
+                    phi = math.radians(float(component.get("orientation_deg", 0.0)) + float(params.get("angle phi", 0.0)))
+                    transverse = np.asarray([-math.sin(phi), math.cos(phi), 0.0], dtype=float)
+                    tilted = np.asarray(
+                        [math.cos(theta) * math.cos(phi), math.cos(theta) * math.sin(phi), -math.sin(theta)],
+                        dtype=float,
+                    )
+                    center_3d = np.asarray([cx, cy, port_z], dtype=float)
+                    vertices = [
+                        center_3d - span * transverse - span * tilted,
+                        center_3d + span * transverse - span * tilted,
+                        center_3d + span * transverse + span * tilted,
+                        center_3d - span * transverse + span * tilted,
+                    ]
+                    plane = [screen(raw(tuple(vertex))) for vertex in vertices]
                 else:
                     normal_angle = float(component.get("orientation_deg", 0.0)) + (90.0 if normal == "Y" else 0.0)
                     nearest = int(round(normal_angle / 90.0) * 90) % 360
@@ -574,8 +631,13 @@ class ThreeDModelPreview(QWidget):
                     else:
                         plane = [screen(raw((cx, cy - span, port_z0))), screen(raw((cx, cy + span, port_z0))),
                                  screen(raw((cx, cy + span, port_z1))), screen(raw((cx, cy - span, port_z1)))]
-                painter.setPen(QPen(QColor("#7c3aed"), 1.7))
-                painter.setBrush(QBrush(QColor(124, 58, 237, 42)))
+                is_monitor = (
+                    kind in {"Power monitor", "Mode expansion monitor", "Field profile monitor"}
+                    or component.get("simulation_parent_port") == "fiber_input_power"
+                    or str(params.get("fiber plane role", "")).lower() == "input power measurement"
+                )
+                painter.setPen(QPen(QColor("#059669" if is_monitor else "#7c3aed"), 1.7))
+                painter.setBrush(QBrush(QColor(5, 150, 105, 42) if is_monitor else QColor(124, 58, 237, 42)))
                 painter.drawPolygon(QPolygonF(plane))
 
         corners = {(ix, iy, iz): screen(raw((x, y, z))) for ix, x in enumerate((x0, x1)) for iy, y in enumerate((y0, y1)) for iz, z in enumerate((z0, z1))}

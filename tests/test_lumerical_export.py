@@ -83,6 +83,30 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(stack[5]["material"], "Air")
         self.assertTrue(all(row["mesh_factor"] == 0.0 for row in stack))
 
+    def test_automatic_soi_grating_port_order_matches_ansys_source_receiver_sequence(self) -> None:
+        from max_layout.ui.window import NativeLayoutWindow
+
+        class Factory:
+            make_component = NativeLayoutWindow.make_component
+            automatic_simulation_companions = NativeLayoutWindow.automatic_simulation_companions
+
+            def __init__(self) -> None:
+                self.components = []
+                self.next_uid = 1
+
+        factory = Factory()
+        grating = factory.make_component("GC-SOI", 0.0, 0.0)
+        factory.components.append(grating)
+        companions = factory.automatic_simulation_companions(grating)
+        orders = {
+            item.get("simulation_parent_port", "fiber_source"): int(item["params"]["order"])
+            for item in companions
+            if item["kind"] in {"FDTD port", "Fiber-axis FDTD port"}
+        }
+        self.assertEqual(orders["fiber_source"], 1)
+        self.assertEqual(orders["waveguide_point"], 2)
+        self.assertEqual(orders["fiber_input_power"], 3)
+
     def test_generic_grating_has_editable_terminal_output_arc(self) -> None:
         grating = component("Grating coupler")
         self.assertEqual(grating["params"]["L_extra"], 10.0)
@@ -171,9 +195,9 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(DEFAULT_COMPONENT_VALUES["Fiber geometry"]["core diameter_um"], 9.0)
         self.assertEqual(DEFAULT_COMPONENT_VALUES["Fiber geometry"]["cladding diameter_um"], 50.0)
         self.assertEqual(DEFAULT_COMPONENT_VALUES["Fiber geometry"]["z reference"], "top of SiO2 cladding")
+        self.assertTrue(DEFAULT_COMPONENT_VALUES["Fiber-axis FDTD port"]["align to fiber axis"])
         window_source = Path("src/max_layout/ui/window.py").read_text(encoding="utf-8")
-        self.assertNotIn("port_local_x += tox_offset_um * math.sin", window_source)
-        self.assertIn("fiber and port", window_source)
+        self.assertIn("fiber_input_power", window_source)
 
     def test_legacy_combined_fiber_never_creates_a_port(self) -> None:
         notebook, warnings = generate_lumerical_notebook(
@@ -219,12 +243,30 @@ class LumericalExportTests(unittest.TestCase):
         fiber_port["params"]["name"] = "fiber_out"
         fiber_port["params"]["order"] = 2
         fiber_port["params"]["angle theta"] = 7.0
+        fiber_input_power = component("Fiber-axis FDTD port", uid=6)
+        fiber_input_power.update({"x": 20.0, "simulation_parent_uid": 1, "simulation_parent_port": "fiber_input_power"})
+        fiber_input_power["params"].update(
+            {
+                "name": "fiber_input_power",
+                "order": 3,
+                "dir": "Backward",
+                "fiber plane role": "input power measurement",
+                "plane normal": "Z",
+                "z reference": "top of stack",
+                "distance_um": -0.1,
+                "span_um": 20.0,
+                "z_span_um": 0.0,
+                "angle theta": 10.0,
+                "angle phi": 0.0,
+                "align to fiber axis": True,
+            }
+        )
         waveguide = component("FDTD port", uid=4)
         waveguide["x"] = -27.0
         waveguide["params"]["name"] = "waveguide_in"
         waveguide["params"]["order"] = 1
         notebook, _ = generate_lumerical_notebook(
-            [grating, power_monitor, fiber, fiber_port, waveguide],
+            [grating, power_monitor, fiber, fiber_port, fiber_input_power, waveguide],
             {
                 "included_layers": [[1, 0], [2, 0]],
                 "include_ports": True,
@@ -232,6 +274,7 @@ class LumericalExportTests(unittest.TestCase):
                     {"name": "BOX", "material": "SiO2 (Glass) - Palik", "thickness_um": 2.0, "role": "background", "gds_layer": 0},
                     {"name": "Exported cross-section", "material": "LiNbO3", "thickness_um": 0.6, "etch_depth_um": 0.3, "sidewall_angle_deg": 82.0, "slab_extent": "geometry", "mesh_factor": 0.5, "role": "geometry", "gds_layer": 1},
                     {"name": "SiO2 top cladding", "material": "SiO2 (Glass) - Palik", "thickness_um": 1.0, "role": "background", "gds_layer": 0, "conformal": True},
+                    {"name": "Top air", "material": "Air", "thickness_um": 1.0, "role": "background", "gds_layer": 0},
                     {"name": "Absent metal", "material": "Au (Gold) - CRC", "thickness_um": 0.0, "role": "geometry", "gds_layer": 4},
                 ],
             },
@@ -239,14 +282,23 @@ class LumericalExportTests(unittest.TestCase):
         ports = assignment_value(notebook, "PORTS")
         fiber_ports = [port for port in ports if port.get("plane normal") == "Z"]
         fiber_geometries = assignment_value(notebook, "FIBER_GEOMETRIES")
-        self.assertEqual(len(ports), 2)
+        self.assertEqual(len(ports), 3)
         self.assertFalse(any(port.get("auto_generated_for_grating") for port in ports))
-        self.assertEqual(len(fiber_ports), 1)
+        self.assertEqual(len(fiber_ports), 2)
         self.assertEqual(len(fiber_geometries), 1)
-        self.assertEqual(fiber_ports[0]["name"], "fiber_out")
-        self.assertEqual(fiber_ports[0]["angle theta"], fiber_geometries[0]["angle theta"])
+        source_port = next(port for port in fiber_ports if port["name"] == "fiber_out")
+        self.assertEqual(source_port["angle theta"], fiber_geometries[0]["angle theta"])
         self.assertAlmostEqual(
-            fiber_ports[0]["rotation offset_um"],
+            source_port["center"][0] - fiber_geometries[0]["center"][0],
+            np.tan(np.deg2rad(10.0)),
+        )
+        input_monitor = next(port for port in fiber_ports if port["name"] == "fiber_input_power")
+        self.assertAlmostEqual(
+            input_monitor["center"][0] - fiber_geometries[0]["center"][0],
+            0.9 * np.tan(np.deg2rad(10.0)),
+        )
+        self.assertAlmostEqual(
+            source_port["rotation offset_um"],
             4.0 * fiber_geometries[0]["core diameter_um"] * np.tan(np.deg2rad(10.0)),
         )
         json.dumps(notebook)
@@ -268,11 +320,23 @@ class LumericalExportTests(unittest.TestCase):
         self.assertNotIn('fdtd.set("auto update", True)', build_source)
         self.assertNotIn('fdtd.set("angle theta"', build_source)
         self.assertIn("addlayerbuilder", build_source)
+        self.assertIn('fdtd.set("base mesh order", 3)', build_source)
+        self.assertIn('fdtd.set("background index", 1.0)', build_source)
+        self.assertIn('str(row.get("material", "")).strip().lower() == "air"', build_source)
+        self.assertIn('fdtd.adduserprop("core mesh order", 0, 1)', build_source)
+        self.assertIn('fdtd.adduserprop("cladding mesh order", 0, 2)', build_source)
+        self.assertIn('fiber_setup_script = r"""\ndeleteall;', lumerical._BUILD_CELL)
+        self.assertIn('set("mesh order",core_mesh_order);', build_source)
+        self.assertIn('set("mesh order",cladding_mesh_order);', build_source)
+        self.assertNotIn('set("mesh order",4)', build_source)
+        self.assertIn("Material overlap priority: FDTD air background", build_source)
         self.assertIn('addmaterial("Sampled 3D data")', build_source)
         self.assertIn('"sampled 3d data"', build_source)
         self.assertIn("_silica_cladding_top_um", build_source)
         self.assertIn("fiber, device_top_um, stack_top_um, silica_cladding_top_um", build_source)
         self.assertIn("center_z_um = reference_z_um + bottom_gap_um", build_source)
+        self.assertIn("midpoint_shift_um = 0.5 * fiber_length_um", build_source)
+        self.assertNotIn('fdtd.set("rotation 1", theta_deg)', build_source)
         self.assertIn('"sidewall angle"', build_source)
         self.assertIn("z_extent_max_um = max(z_extent_max_um, device_z_um + 0.5 * z_span_um)", build_source)
         self.assertIn("simulation_z_max_um = z_extent_max_um + z_max_padding", build_source)
@@ -315,6 +379,7 @@ class LumericalExportTests(unittest.TestCase):
         analysis = assignment_value(notebook, "GRATING_ANALYSIS")
         self.assertEqual(analysis["waveguide_port_name"], "waveguide_in")
         self.assertEqual(analysis["fiber_port_name"], "fiber_out")
+        self.assertEqual(analysis["fiber_input_measurement_port_name"], "fiber_input_power")
         self.assertEqual(analysis["frequency_points"], 31)
         settings = assignment_value(notebook, "SETTINGS")
         self.assertEqual(settings["resource_mode"], "GPU")
@@ -348,7 +413,8 @@ class LumericalExportTests(unittest.TestCase):
         self.assertNotIn("field_intensity_normalized", analysis_source)
         self.assertIn('receiver_port_path = "::model::FDTD::ports::" + waveguide_port_name', analysis_source)
         self.assertIn('T_data = fdtd.getresult(receiver_port_path, "T")', analysis_source)
-        self.assertIn('fiber_coupling = np.abs(fiber_coupling)', analysis_source)
+        self.assertIn('input_path = "::model::FDTD::ports::" + str(fiber_input_measurement_port_name)', analysis_source)
+        self.assertIn("fiber_coupling = waveguide_transmission / np.maximum(fiber_input_power", analysis_source)
         self.assertNotIn("np.abs(scattering) ** 2", analysis_source)
         self.assertIn("fiber port to waveguide port", analysis_source)
         self.assertIn("fiber_coupling_db", analysis_source)
