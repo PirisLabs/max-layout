@@ -119,6 +119,17 @@ def _stack_reference_z(
     stack_top: float,
 ) -> float:
     reference = str(params.get("z reference", "device top")).strip().lower()
+    if reference in {"center of sio2 cladding", "center of silica cladding", "cladding center"}:
+        silica_rows = []
+        for row, row_z0, row_z1 in stack_ranges:
+            label = (str(row.get("name", "")) + " " + str(row.get("material", ""))).lower()
+            if ("sio2" in label or "silica" in label or "glass" in label) and row_z1 >= device_top - 1e-12:
+                silica_rows.append((bool(row.get("conformal", False)), float(row_z0), float(row_z1)))
+        candidates = [entry for entry in silica_rows if entry[0]] or silica_rows
+        if candidates:
+            _conformal, row_z0, row_z1 = max(candidates, key=lambda entry: entry[2])
+            return 0.5 * (row_z0 + row_z1)
+        return device_top
     if reference in {"top of sio2 cladding", "top of silica cladding", "top cladding"}:
         silica_rows = []
         for row, _z0, row_z1 in stack_ranges:
@@ -583,16 +594,26 @@ class ThreeDModelPreview(QWidget):
             cx, cy = float(component.get("x", 0.0)), float(component.get("y", 0.0))
             if kind in {"Fiber geometry", "Fiber port"} and self.show_fiber:
                 reference_z = _stack_reference_z(params, state["stack_ranges"], device_top, stack_top)
-                bottom_z = reference_z + float(params.get("distance_um", 0.0))
+                contact_z = reference_z + float(params.get("distance_um", 0.0))
                 length = float(params.get("fiber length_um", 20.0))
                 theta = math.radians(float(params.get("angle theta", 10.0)))
                 phi = math.radians(float(params.get("angle phi", 0.0)) + float(component.get("orientation_deg", 0.0)))
-                dx = length * math.sin(theta) * math.cos(phi)
-                dy = length * math.sin(theta) * math.sin(phi)
-                dz = length * math.cos(theta)
-                fraction = min(1.0, max(0.0, (z1 - bottom_z) / max(1e-9, dz)))
-                start = screen(raw((cx, cy, max(z0, bottom_z))))
-                stop = screen(raw((cx + fraction * dx, cy + fraction * dy, min(z1, bottom_z + fraction * dz))))
+                fiber_z0 = contact_z - 0.5 * length
+                fiber_z1 = contact_z + 0.5 * length
+                visible_z0 = max(z0, fiber_z0)
+                visible_z1 = min(z1, fiber_z1)
+                slope_x = math.tan(theta) * math.cos(phi)
+                slope_y = math.tan(theta) * math.sin(phi)
+                start = screen(raw((
+                    cx + (visible_z0 - contact_z) * slope_x,
+                    cy + (visible_z0 - contact_z) * slope_y,
+                    visible_z0,
+                )))
+                stop = screen(raw((
+                    cx + (visible_z1 - contact_z) * slope_x,
+                    cy + (visible_z1 - contact_z) * slope_y,
+                    visible_z1,
+                )))
                 painter.setPen(QPen(QColor(186, 230, 253, 18), 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 painter.drawLine(start, stop)
                 painter.setPen(QPen(QColor(14, 116, 144, 110), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
@@ -950,7 +971,7 @@ class LumericalExportDialog(QDialog):
         controls.addWidget(add_button)
         controls.addWidget(remove_button)
         layout.addLayout(controls)
-        self.stack_table = QTableWidget(0, 10)
+        self.stack_table = QTableWidget(0, 11)
         self.stack_table.setHorizontalHeaderLabels(
             [
                 "Layer name",
@@ -962,6 +983,7 @@ class LumericalExportDialog(QDialog):
                 "GDS layers",
                 "Unetched slab extent",
                 "Mesh factor × λ/n",
+                "Mesh order",
                 "Conformal fill",
             ]
         )
@@ -969,7 +991,7 @@ class LumericalExportDialog(QDialog):
         self.stack_table.setMinimumHeight(430)
         self.stack_table.verticalHeader().setDefaultSectionSize(48)
         self.stack_table.horizontalHeader().setMinimumSectionSize(120)
-        for column, width in enumerate((205, 290, 165, 165, 180, 215, 135, 205, 165, 145)):
+        for column, width in enumerate((205, 290, 165, 165, 180, 215, 135, 205, 165, 130, 145)):
             self.stack_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
             self.stack_table.setColumnWidth(column, width)
         self.stack_table.horizontalHeader().setStretchLastSection(True)
@@ -980,6 +1002,7 @@ class LumericalExportDialog(QDialog):
             "Etch depth 0 keeps a full unetched film; etch depth equal to thickness is a full etch. A thickness of 0 means the layer is absent. "
             "For a partially etched cross-section, Unetched slab extent can keep the slab across the full FDTD plane or only beneath the selected GDS geometry. "
             "Mesh factor × λ/n makes the notebook calculate the layer mesh from the shortest simulated wavelength and that material's dispersive index. For example, 0.5 means 0.5 × λ₀/n; 0 uses Lumerical's automatic mesh. "
+            "Mesh order controls overlapping-material priority; lower numbers win. "
             "Conformal fill extends a background/cladding layer down into the etched openings of the patterned layer below. "
             "Air is available as a material. Very large first/last background thicknesses are allowed and are cropped by the draggable FDTD domain so those media extend through the PML."
         )
@@ -1077,7 +1100,13 @@ class LumericalExportDialog(QDialog):
             "Isotropic mesh step as a factor of λ₀/n at the shortest simulated wavelength. For anisotropic media, n is the largest index component."
         )
         self.stack_table.setCellWidget(row, 8, mesh_factor)
-        self.stack_table.setItem(row, 9, _checked_item(bool(data.get("conformal", False))))
+        mesh_order = QSpinBox()
+        mesh_order.setRange(1, 1000)
+        mesh_order.setValue(max(1, int(data.get("mesh_order", 3 if bool(data.get("conformal", False)) else 2))))
+        mesh_order.setMinimumSize(115, 38)
+        mesh_order.setToolTip("Lumerical material-overlap priority. Lower mesh-order numbers take priority.")
+        self.stack_table.setCellWidget(row, 9, mesh_order)
+        self.stack_table.setItem(row, 10, _checked_item(bool(data.get("conformal", False))))
         if hasattr(self, "cross_section_preview"):
             self._connect_stack_preview_signals()
             self._refresh_previews()
@@ -1118,7 +1147,14 @@ class LumericalExportDialog(QDialog):
         self.frequency_points.setToolTip("31 samples is the quick grating-coupler default. Increase this only for a final high-resolution spectrum.")
         self.dt_stability = QDoubleSpinBox(); self.dt_stability.setRange(0.1, 0.99); self.dt_stability.setDecimals(3); self.dt_stability.setSingleStep(0.05); self.dt_stability.setValue(float(self.saved.get("dt_stability_factor", 0.99)))
         self.pml_profile = QComboBox(); self.pml_profile.addItems(["Standard", "Stabilized"]); self.pml_profile.setCurrentText(str(self.saved.get("pml_profile", "Standard")).title())
-        self.simulation_time = QDoubleSpinBox(); self.simulation_time.setRange(1, 1e9); self.simulation_time.setDecimals(3); self.simulation_time.setValue(float(self.saved.get("simulation_time_fs", 2000.0)))
+        saved_simulation_time = float(self.saved.get("simulation_time_fs", 10000.0))
+        if "auto_shutoff_min" not in self.saved and abs(saved_simulation_time - 2000.0) < 1e-9:
+            # Migrate the former 2 ps grating default together with the new
+            # explicit convergence threshold so the dialog matches exports.
+            saved_simulation_time = 10000.0
+        self.simulation_time = QDoubleSpinBox(); self.simulation_time.setRange(1, 1e9); self.simulation_time.setDecimals(3); self.simulation_time.setValue(saved_simulation_time)
+        self.auto_shutoff_min = QDoubleSpinBox(); self.auto_shutoff_min.setRange(1e-12, 1.0); self.auto_shutoff_min.setDecimals(12); self.auto_shutoff_min.setSingleStep(1e-6); self.auto_shutoff_min.setValue(float(self.saved.get("auto_shutoff_min", 1e-6)))
+        self.auto_shutoff_min.setToolTip("Stop early only after the remaining field energy falls below this fraction. The grating default is 1e-6.")
         self.pml_geometry_overlap = QDoubleSpinBox(); self.pml_geometry_overlap.setRange(0.0, 1e4); self.pml_geometry_overlap.setDecimals(6); self.pml_geometry_overlap.setSuffix(" µm"); self.pml_geometry_overlap.setValue(float(self.saved.get("pml_geometry_overlap_um", 1.0)))
         self.pml_geometry_overlap.setToolTip("Distance ported waveguides and outer stack media continue beyond each FDTD boundary.")
         self.dimension = QLabel("3D — required for every exported simulation")
@@ -1152,6 +1188,7 @@ class LumericalExportDialog(QDialog):
         form.addRow("Time-step stability factor", self.dt_stability)
         form.addRow("PML profile", self.pml_profile)
         form.addRow("Simulation time (fs)", self.simulation_time)
+        form.addRow("Auto shutoff minimum", self.auto_shutoff_min)
         form.addRow("Geometry overlap beyond FDTD boundary", self.pml_geometry_overlap)
         form.addRow("FDTD dimension", self.dimension)
         form.addRow("Compute resource", self.resource_mode)
@@ -1196,7 +1233,8 @@ class LumericalExportDialog(QDialog):
                     if self.stack_table.cellWidget(row, 7).currentText() == "Under geometry"
                     else "full",
                     "mesh_factor": float(self.stack_table.cellWidget(row, 8).value()),
-                    "conformal": self.stack_table.item(row, 9).checkState() == Qt.CheckState.Checked,
+                    "mesh_order": int(self.stack_table.cellWidget(row, 9).value()),
+                    "conformal": self.stack_table.item(row, 10).checkState() == Qt.CheckState.Checked,
                 }
             )
         return stack
@@ -1580,6 +1618,7 @@ class LumericalExportDialog(QDialog):
             "pml_profile": self.pml_profile.currentText(),
             "pml_geometry_overlap_um": self.pml_geometry_overlap.value(),
             "simulation_time_fs": self.simulation_time.value(),
+            "auto_shutoff_min": self.auto_shutoff_min.value(),
             "dimension": "3D",
             "resource_mode": self.resource_mode.currentText(),
             "tfln_crystal_cut": self.tfln_crystal_cut.currentText(),

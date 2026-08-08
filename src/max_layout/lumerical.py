@@ -53,12 +53,12 @@ STACK_PRESETS: dict[str, list[dict[str, Any]]] = {
     "SOI grating coupler (Ansys)": [
         # The official Ansys file uses FDTD mesh accuracy 2 without layer
         # mesh-override objects.  A factor of zero means Automatic here.
-        {"name": "Si substrate", "material": "Si (Silicon) - Palik", "thickness_um": 3.0, "role": "background", "gds_layer": 0, "mesh_factor": 0.0},
-        {"name": "SiO2 BOX", "material": "SiO2 (Glass) - Palik", "thickness_um": 1.0, "role": "background", "gds_layer": 0, "mesh_factor": 0.0},
-        {"name": "GC-SOI residual slab", "material": "Si (Silicon) - Palik", "thickness_um": 0.12, "etch_depth_um": 0.12, "sidewall_angle_deg": 90.0, "role": "geometry", "gds_layers": [1], "slab_extent": "geometry", "mesh_factor": 0.0},
-        {"name": "GC-SOI upper silicon", "material": "Si (Silicon) - Palik", "thickness_um": 0.10, "etch_depth_um": 0.10, "sidewall_angle_deg": 90.0, "role": "geometry", "gds_layers": [2], "slab_extent": "geometry", "mesh_factor": 0.0},
-        {"name": "SiO2 TOX", "material": "SiO2 (Glass) - Palik", "thickness_um": 0.7, "role": "background", "gds_layer": 0, "conformal": True, "mesh_factor": 0.0},
-        {"name": "Top air", "material": "Air", "thickness_um": 0.7, "role": "background", "gds_layer": 0, "mesh_factor": 0.0},
+        {"name": "Si substrate", "material": "Si (Silicon) - Palik", "thickness_um": 3.0, "role": "background", "gds_layer": 0, "mesh_factor": 0.0, "mesh_order": 2},
+        {"name": "SiO2 BOX", "material": "SiO2 (Glass) - Palik", "thickness_um": 1.0, "role": "background", "gds_layer": 0, "mesh_factor": 0.0, "mesh_order": 2},
+        {"name": "GC-SOI residual slab", "material": "Si (Silicon) - Palik", "thickness_um": 0.12, "etch_depth_um": 0.12, "sidewall_angle_deg": 90.0, "role": "geometry", "gds_layers": [1], "slab_extent": "geometry", "mesh_factor": 0.0, "mesh_order": 2},
+        {"name": "GC-SOI upper silicon", "material": "Si (Silicon) - Palik", "thickness_um": 0.10, "etch_depth_um": 0.10, "sidewall_angle_deg": 90.0, "role": "geometry", "gds_layers": [2], "slab_extent": "geometry", "mesh_factor": 0.0, "mesh_order": 2},
+        {"name": "SiO2 TOX", "material": "SiO2 (Glass) - Palik", "thickness_um": 0.7, "role": "background", "gds_layer": 0, "conformal": True, "mesh_factor": 0.0, "mesh_order": 3},
+        {"name": "Top air", "material": "Air", "thickness_um": 0.7, "role": "background", "gds_layer": 0, "mesh_factor": 0.0, "mesh_order": 1},
     ],
     "Al2O3 on SiO2": [
         {"name": "Si substrate", "material": "Si (Silicon) - Palik", "thickness_um": 2.0, "role": "background", "gds_layer": 0},
@@ -82,6 +82,7 @@ def default_stack(preset: str = "TFLN on SiO2") -> list[dict[str, Any]]:
     stack = deepcopy(STACK_PRESETS.get(preset, STACK_PRESETS["TFLN on SiO2"]))
     for row in stack:
         row.setdefault("mesh_factor", 0.2)
+        row.setdefault("mesh_order", 3 if bool(row.get("conformal", False)) else 2)
     return stack
 
 
@@ -163,7 +164,7 @@ def _standalone_fiber_geometry(component: dict[str, Any]) -> dict[str, Any]:
     """Transform an editor fiber structure into simulation coordinates without creating a source."""
     params = deepcopy(component.get("params", {}))
     if bool(component.get("auto_placed", False)):
-        params["z reference"] = "top of SiO2 cladding"
+        params.setdefault("z reference", "top of SiO2 cladding")
     params["center"] = [0.0, 0.0]
     params["component_uid"] = int(component.get("uid", 0))
     params["component_kind"] = str(component.get("kind", "Fiber geometry"))
@@ -315,11 +316,11 @@ def _collect_export_data(
     return geometry, ports, fiber_geometries, monitors, bbox, warnings + [f"Layout origin moved by ({origin[0]:.6g}, {origin[1]:.6g}) µm for simulation."]
 
 
-def _stack_vertical_levels(stack: list[dict[str, Any]]) -> tuple[float, float, float]:
-    """Return device top, stack top, and upper-silica top using notebook conventions."""
+def _stack_vertical_levels(stack: list[dict[str, Any]]) -> tuple[float, float, float, float]:
+    """Return device top, stack top, and upper-silica top/center."""
     active = [row for row in stack if float(row.get("thickness_um", 0.0)) > 0.0]
     if not active:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
     anchor_index = next(
         (index for index, row in enumerate(active) if str(row.get("role", "background")).lower() == "geometry"),
         len(active) // 2,
@@ -345,18 +346,22 @@ def _stack_vertical_levels(stack: list[dict[str, Any]]) -> tuple[float, float, f
     device_top = max(geometry_tops, default=0.0)
     stack_top = resolved[-1][2]
     silica_rows = []
-    for row, _z0, z1 in resolved:
+    for row, z0, z1 in resolved:
         label = (str(row.get("name", "")) + " " + str(row.get("material", ""))).lower()
         if ("sio2" in label or "silica" in label or "glass" in label) and z1 >= device_top - 1e-12:
-            silica_rows.append((bool(row.get("conformal", False)), float(z1)))
-    conformal_tops = [z1 for conformal, z1 in silica_rows if conformal]
-    silica_top = max(conformal_tops or [z1 for _conformal, z1 in silica_rows] or [device_top])
-    return float(device_top), float(stack_top), float(silica_top)
+            silica_rows.append((bool(row.get("conformal", False)), float(z0), float(z1)))
+    candidates = [entry for entry in silica_rows if entry[0]] or silica_rows
+    selected = max(candidates, key=lambda entry: entry[2]) if candidates else (False, device_top, device_top)
+    silica_top = selected[2]
+    silica_center = 0.5 * (selected[1] + selected[2])
+    return float(device_top), float(stack_top), float(silica_top), float(silica_center)
 
 
-def _item_vertical_reference(item: dict[str, Any], levels: tuple[float, float, float]) -> float:
-    device_top, stack_top, silica_top = levels
+def _item_vertical_reference(item: dict[str, Any], levels: tuple[float, float, float, float]) -> float:
+    device_top, stack_top, silica_top, silica_center = levels
     reference = str(item.get("z reference", "device top")).strip().lower()
+    if reference in {"center of sio2 cladding", "center of silica cladding", "cladding center"}:
+        return silica_center
     if reference in {"top of sio2 cladding", "top of silica cladding", "top cladding"}:
         return silica_top
     if reference == "top of stack":
@@ -579,7 +584,12 @@ print("HPC Packs:", "3 roamed to this session for 24 h" if "SUCCESS" in out else
 '''
 
 
-_BUILD_CELL = r'''UM = 1e-6
+_BUILD_CELL = r'''import os
+import json
+import numpy as np
+import lumapi
+
+UM = 1e-6
 
 os.makedirs(REMOTE_WORK, exist_ok=True)
 REMOTE_FSP_DIR = os.path.join(REMOTE_WORK, "fsp")
@@ -735,12 +745,18 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
     """Build films and tapered cross-sections with Lumerical's Layer Builder."""
     fdtd.addlayerbuilder()
     fdtd.set("name", "Max Layout material stack")
-    # Lower mesh-order values win in material overlaps.  Keep the solver's
-    # air background outside the Layer Builder, reserve orders 1 and 2 for the
-    # fiber core/cladding, then give all silicon grow layers order 3.  Layer
-    # Builder background layers are therefore order 5; their list order below
-    # resolves the remaining priority as top cladding > BOX > substrate.
-    fdtd.set("base mesh order", 3)
+    geometry_mesh_orders = [
+        max(1, int(row.get("mesh_order", 2)))
+        for row, _z0, _z1 in z_ranges
+        if str(row.get("role", "background")) == "geometry"
+    ]
+    layer_builder_mesh_order = min(geometry_mesh_orders, default=2)
+    if any(order != layer_builder_mesh_order for order in geometry_mesh_orders):
+        print(
+            "Warning: Layer Builder grow layers share one mesh order; using the smallest requested value %d."
+            % layer_builder_mesh_order
+        )
+    fdtd.set("base mesh order", layer_builder_mesh_order)
     fdtd.set("process name", "Max Layout export")
     fdtd.set("GDS sidewall angle position reference", "middle")
     fdtd.set("x", 0.5 * (bounds[0] + bounds[2]) * UM)
@@ -754,14 +770,14 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
         # Python dict -> Lumerical struct; Python list -> Lumerical cell array.
         fdtd.set("geometry", geometry_by_layer)
 
-    def add_background(name, material, z_min_um, z_max_um):
+    background_volumes = []
+
+    def add_background(name, material, z_min_um, z_max_um, mesh_order):
         if z_max_um <= z_min_um:
             return
-        fdtd.addlayer(name)
-        fdtd.setlayer(name, "start position", z_min_um * UM)
-        fdtd.setlayer(name, "thickness", (z_max_um - z_min_um) * UM)
-        fdtd.setlayer(name, "process", "background")
-        fdtd.setlayer(name, "background material", material)
+        background_volumes.append(
+            (name, material, float(z_min_um), float(z_max_um), max(1, int(mesh_order)))
+        )
 
     def matching_geometry_keys(row):
         target_layers = {int(value) for value in row.get("gds_layers", [row.get("gds_layer", 1)])}
@@ -823,7 +839,13 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
                 background_z0 = min(background_z0, simulation_z_min_um - pml_geometry_overlap_um)
             if row_index == len(z_ranges):
                 background_z1 = max(background_z1, simulation_z_max_um + pml_geometry_overlap_um)
-            add_background(base_name, row["material"], background_z0, background_z1)
+            add_background(
+                base_name,
+                row["material"],
+                background_z0,
+                background_z1,
+                row.get("mesh_order", 3 if bool(row.get("conformal", False)) else 2),
+            )
             if background_z0 < z0:
                 print(
                     "Conformal cladding {} fills etched openings from z={:.6g} to {:.6g} um".format(
@@ -852,7 +874,13 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
                         % row["name"]
                     )
             else:
-                add_background(f"{base_name} unetched film", row["material"], z0, z1 - etch_depth_um)
+                add_background(
+                    f"{base_name} unetched film",
+                    row["material"],
+                    z0,
+                    z1 - etch_depth_um,
+                    row.get("mesh_order", layer_builder_mesh_order),
+                )
         if etch_depth_um <= 0.0:
             continue
 
@@ -869,6 +897,23 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
             z1,
             sidewall_angle_deg,
         )
+
+    # Layer Builder forces every background process layer to base order + 2.
+    # Create full-film volumes explicitly so the requested substrate, BOX, and
+    # conformal-cladding orders are preserved independently.
+    for name, material, z_min_um, z_max_um, mesh_order in background_volumes:
+        fdtd.addrect()
+        fdtd.set("name", "Max Layout " + name)
+        fdtd.set("material", str(material))
+        fdtd.set("x", 0.5 * (bounds[0] + bounds[2]) * UM)
+        fdtd.set("y", 0.5 * (bounds[1] + bounds[3]) * UM)
+        fdtd.set("x span", (bounds[2] - bounds[0] + 2.0 * pml_geometry_overlap_um) * UM)
+        fdtd.set("y span", (bounds[3] - bounds[1] + 2.0 * pml_geometry_overlap_um) * UM)
+        fdtd.set("z min", z_min_um * UM)
+        fdtd.set("z max", z_max_um * UM)
+        fdtd.set("override mesh order from material database", True)
+        fdtd.set("mesh order", mesh_order)
+        print("Added material volume %s with mesh order %d." % (name, mesh_order))
 
 
 def _add_layer_mesh_overrides(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_z_max_um):
@@ -913,96 +958,6 @@ def _add_layer_mesh_overrides(fdtd, z_ranges, bounds, simulation_z_min_um, simul
         )
 
 
-def _polygon_cross_section(vertices, axis_index, coordinate_um, transverse_um):
-    """Return the polygon interval crossed by a line through a manually placed port."""
-    points = np.asarray(vertices, dtype=float)
-    hits = []
-    for index in range(len(points)):
-        first = points[index]
-        second = points[(index + 1) % len(points)]
-        a = float(first[axis_index])
-        b = float(second[axis_index])
-        if abs(a - b) < 1e-12:
-            if abs(coordinate_um - a) < 1e-9:
-                hits.extend((float(first[1 - axis_index]), float(second[1 - axis_index])))
-            continue
-        if coordinate_um < min(a, b) - 1e-12 or coordinate_um > max(a, b) + 1e-12:
-            continue
-        fraction = (coordinate_um - a) / (b - a)
-        if -1e-12 <= fraction <= 1.0 + 1e-12:
-            hits.append(float(first[1 - axis_index] + fraction * (second[1 - axis_index] - first[1 - axis_index])))
-    hits = sorted(set(round(value, 12) for value in hits))
-    for start, stop in zip(hits[0::2], hits[1::2]):
-        if start - 1e-9 <= transverse_um <= stop + 1e-9:
-            return float(start), float(stop)
-    return None
-
-
-def _add_waveguide_boundary_extensions(fdtd, z_ranges, bounds, boundary_clearance_um, pml_geometry_overlap_um):
-    """Continue each manually ported waveguide through its nearby PML, as in the Ansys example."""
-    for port_index, port in enumerate(PORTS, start=1):
-        if str(port.get("plane normal", "X")).upper() == "Z":
-            continue
-        actual = float(port.get("outward_orientation_deg", 0.0)) % 360.0
-        nearest, axis, _ = _nearest_port_axis(actual)
-        if axis not in {"x-axis", "y-axis"}:
-            continue
-        axis_index = 0 if axis == "x-axis" else 1
-        transverse_index = 1 - axis_index
-        original_center = np.asarray(port.get("center", (0.0, 0.0)), dtype=float)
-        center = original_center.copy()
-        distance_um = float(port.get("distance_um", 0.0))
-        center += distance_um * np.asarray(
-            [np.cos(np.deg2rad(actual)), np.sin(np.deg2rad(actual))], dtype=float
-        )
-        outward_sign = -1.0 if nearest in (180, 270) else 1.0
-        extension_outer = bounds[axis_index] - pml_geometry_overlap_um if outward_sign < 0 else bounds[axis_index + 2] + pml_geometry_overlap_um
-        extension_inner = float(center[axis_index]) - outward_sign * boundary_clearance_um
-        extension_min = min(extension_outer, extension_inner)
-        extension_max = max(extension_outer, extension_inner)
-
-        for row_number, (row, z0, z1) in enumerate(z_ranges, start=1):
-            if str(row.get("role", "background")) != "geometry":
-                continue
-            target_layers = {int(value) for value in row.get("gds_layers", [])}
-            interval = None
-            for inward_sample_um in (0.001, 0.01, 0.05, 0.2):
-                sample_coordinate = float(original_center[axis_index]) - outward_sign * inward_sample_um
-                for polygon in GEOMETRY:
-                    if int(polygon.get("layer", -1)) not in target_layers:
-                        continue
-                    interval = _polygon_cross_section(
-                        polygon["vertices_um"], axis_index, sample_coordinate, float(center[transverse_index])
-                    )
-                    if interval is not None:
-                        break
-                if interval is not None:
-                    break
-            if interval is None or interval[1] <= interval[0]:
-                print("Warning: no exported waveguide cross-section was found for PML extension at port", port.get("name"))
-                continue
-            thickness_um = z1 - z0
-            etch_depth_um = min(thickness_um, max(0.0, float(row.get("etch_depth_um", thickness_um))))
-            if etch_depth_um <= 0.0:
-                continue
-            fdtd.addrect()
-            fdtd.set("name", "port PML extension %d row %d" % (port_index, row_number))
-            fdtd.set("material", str(row["material"]))
-            if axis_index == 0:
-                fdtd.set("x", 0.5 * (extension_min + extension_max) * UM)
-                fdtd.set("x span", (extension_max - extension_min) * UM)
-                fdtd.set("y", 0.5 * (interval[0] + interval[1]) * UM)
-                fdtd.set("y span", (interval[1] - interval[0]) * UM)
-            else:
-                fdtd.set("y", 0.5 * (extension_min + extension_max) * UM)
-                fdtd.set("y span", (extension_max - extension_min) * UM)
-                fdtd.set("x", 0.5 * (interval[0] + interval[1]) * UM)
-                fdtd.set("x span", (interval[1] - interval[0]) * UM)
-            fdtd.set("z min", (z1 - etch_depth_um) * UM)
-            fdtd.set("z max", z1 * UM)
-            print("Extended waveguide at port %s through the %s PML." % (port.get("name"), axis[0].upper()))
-
-
 def _nearest_port_axis(outward_angle_deg):
     nearest = int(round(float(outward_angle_deg) / 90.0) * 90) % 360
     axis = "x-axis" if nearest in (0, 180) else "y-axis"
@@ -1025,8 +980,28 @@ def _silica_cladding_top_um(z_ranges, device_top_um):
     return max((z1 for _conformal, z1 in silica_rows), default=float(device_top_um))
 
 
-def _vertical_reference_um(item, device_top_um, stack_top_um, silica_cladding_top_um=None):
+def _silica_cladding_center_um(z_ranges, device_top_um):
+    """Center of the same upper silica film selected by _silica_cladding_top_um."""
+    silica_rows = []
+    for row, z0, z1 in z_ranges:
+        label = (str(row.get("name", "")) + " " + str(row.get("material", ""))).lower()
+        is_silica = "sio2" in label or "silica" in label or "glass" in label
+        if is_silica and float(z1) >= float(device_top_um) - 1e-12:
+            silica_rows.append((bool(row.get("conformal", False)), float(z0), float(z1)))
+    candidates = [entry for entry in silica_rows if entry[0]] or silica_rows
+    if not candidates:
+        return float(device_top_um)
+    _conformal, z0, z1 = max(candidates, key=lambda entry: entry[2])
+    return 0.5 * (z0 + z1)
+
+
+def _vertical_reference_um(
+    item, device_top_um, stack_top_um,
+    silica_cladding_top_um=None, silica_cladding_center_um=None,
+):
     reference = str(item.get("z reference", "device top")).strip().lower()
+    if reference in {"center of sio2 cladding", "center of silica cladding", "cladding center"}:
+        return device_top_um if silica_cladding_center_um is None else silica_cladding_center_um
     if reference in {"top of sio2 cladding", "top of silica cladding", "top cladding"}:
         return device_top_um if silica_cladding_top_um is None else silica_cladding_top_um
     if reference == "top of stack":
@@ -1034,7 +1009,9 @@ def _vertical_reference_um(item, device_top_um, stack_top_um, silica_cladding_to
     return device_top_um
 
 
-def _add_fiber_geometries(fdtd, device_top_um, stack_top_um, silica_cladding_top_um):
+def _add_fiber_geometries(
+    fdtd, device_top_um, stack_top_um, silica_cladding_top_um, silica_cladding_center_um
+):
     """Add only the official tilted core/cladding structure groups; never add a source here."""
     used_names = set()
     for index, fiber in enumerate(FIBER_GEOMETRIES, start=1):
@@ -1050,17 +1027,17 @@ def _add_fiber_geometries(fdtd, device_top_um, stack_top_um, silica_cladding_top
         fiber_length_um = max(1e-6, float(fiber.get("fiber length_um", 20.0)))
         bottom_gap_um = float(fiber.get("distance_um", 0.0))
         reference_z_um = _vertical_reference_um(
-            fiber, device_top_um, stack_top_um, silica_cladding_top_um
+            fiber, device_top_um, stack_top_um,
+            silica_cladding_top_um, silica_cladding_center_um,
         )
-        # Match the official fiber group's meaning of "z span": its requested
-        # vertical span is preserved after tilting the cylinder.
-        center_z_um = reference_z_um + bottom_gap_um + 0.5 * fiber_length_um
-        # The exported/editor center is the physical bottom-center where the
-        # fiber touches the cladding. The scripted cylinders rotate around
-        # their midpoint, so move the structure-group midpoint laterally.
-        midpoint_shift_um = 0.5 * fiber_length_um * np.tan(np.deg2rad(theta_deg))
-        x_um = bottom_x_um + midpoint_shift_um * np.cos(np.deg2rad(phi_deg))
-        y_um = bottom_y_um + midpoint_shift_um * np.sin(np.deg2rad(phi_deg))
+        # Match the official Ansys construction: core and cladding are
+        # through-going tilted cylinders centered on the nominal polished
+        # contact point. They visibly cross the complete model in both axial
+        # directions; mesh precedence clips their effective material at the
+        # grating, top oxide, BOX, and substrate.
+        center_z_um = reference_z_um + bottom_gap_um
+        x_um = bottom_x_um
+        y_um = bottom_y_um
 
         fdtd.addstructuregroup()
         fdtd.set("name", name)
@@ -1084,8 +1061,8 @@ def _add_fiber_geometries(fdtd, device_top_um, stack_top_um, silica_cladding_top
         fdtd.adduserprop("cladding index", 0, float(fiber.get("cladding index", 1.43482)))
         # Keep both overlap priorities visible on the fiber group instead of
         # burying a legacy mesh-order value in its setup script.
-        fdtd.adduserprop("core mesh order", 0, 1)
-        fdtd.adduserprop("cladding mesh order", 0, 2)
+        fdtd.adduserprop("core mesh order", 0, 4)
+        fdtd.adduserprop("cladding mesh order", 0, 5)
         fiber_setup_script = r"""
 deleteall;
 core_index = %core index%;
@@ -1131,12 +1108,16 @@ set("rotation 1",theta);
         fdtd.runsetup()
         print(
             "Added scripted Ansys fiber property group %s with core/cladding internal offsets (0, 0, 0) um "
-            "and bottom-center contact at (%.6g, %.6g) um (no source or port was created)."
+            "as through-going cylinders centered on the nominal contact at (%.6g, %.6g) um "
+            "(mesh precedence clips the effective fiber material; no source or port was created)."
             % (name, bottom_x_um, bottom_y_um)
         )
 
 
-def _add_ports(fdtd, z_center_um, device_top_um, stack_top_um, silica_cladding_top_um):
+def _add_ports(
+    fdtd, z_center_um, device_top_um, stack_top_um,
+    silica_cladding_top_um, silica_cladding_center_um,
+):
     used_names = set()
     for index, port in enumerate(PORTS, start=1):
         name = str(port.get("name") or f"opt_{index}")
@@ -1156,7 +1137,8 @@ def _add_ports(fdtd, z_center_um, device_top_um, stack_top_um, silica_cladding_t
             axis = "x-axis"
         if axis == "z-axis":
             z_um = _vertical_reference_um(
-                port, device_top_um, stack_top_um, silica_cladding_top_um
+                port, device_top_um, stack_top_um,
+                silica_cladding_top_um, silica_cladding_center_um,
             ) + distance_um
             direction = "Backward"
         else:
@@ -1213,7 +1195,10 @@ def _add_ports(fdtd, z_center_um, device_top_um, stack_top_um, silica_cladding_t
         print("Updated selected modal data for FDTD port " + name)
 
 
-def _add_monitors(fdtd, z_center_um, device_top_um, stack_top_um, silica_cladding_top_um):
+def _add_monitors(
+    fdtd, z_center_um, device_top_um, stack_top_um,
+    silica_cladding_top_um, silica_cladding_center_um,
+):
     used_names = set()
     for index, monitor in enumerate(MONITORS, start=1):
         name = str(monitor.get("name") or f"monitor_{index}")
@@ -1238,7 +1223,8 @@ def _add_monitors(fdtd, z_center_um, device_top_um, stack_top_um, silica_claddin
                 z_center_um
                 if z_reference == "device center"
                 else _vertical_reference_um(
-                    monitor, device_top_um, stack_top_um, silica_cladding_top_um
+                    monitor, device_top_um, stack_top_um,
+                    silica_cladding_top_um, silica_cladding_center_um,
                 )
             ) + distance_um
         else:
@@ -1356,6 +1342,7 @@ def build_simulation():
         device_top_um = max((z1 for z0, z1 in geometry_ranges), default=device_z_um)
     stack_top_um = z_max_um
     silica_cladding_top_um = _silica_cladding_top_um(z_ranges, device_top_um)
+    silica_cladding_center_um = _silica_cladding_center_um(z_ranges, device_top_um)
 
     fdtd.addfdtd()
     fdtd.set("dimension", "3D")
@@ -1376,7 +1363,8 @@ def build_simulation():
         for port in PORTS:
             if str(port.get("plane normal", "X")).upper() == "Z":
                 source_z_um = _vertical_reference_um(
-                    port, device_top_um, stack_top_um, silica_cladding_top_um
+                    port, device_top_um, stack_top_um,
+                    silica_cladding_top_um, silica_cladding_center_um,
                 ) + float(port.get("distance_um", 0.0))
                 z_extent_min_um = min(z_extent_min_um, source_z_um)
                 z_extent_max_um = max(z_extent_max_um, source_z_um)
@@ -1398,7 +1386,8 @@ def build_simulation():
             plane_normal = min(((abs(x_span), "X"), (abs(y_span), "Y"), (abs(z_span), "Z")))[1]
         if plane_normal == "Z":
             monitor_z_um = _vertical_reference_um(
-                monitor, device_top_um, stack_top_um, silica_cladding_top_um
+                monitor, device_top_um, stack_top_um,
+                silica_cladding_top_um, silica_cladding_center_um,
             ) + float(monitor.get("distance_um", 0.0))
             z_extent_min_um = min(z_extent_min_um, monitor_z_um)
             z_extent_max_um = max(z_extent_max_um, monitor_z_um)
@@ -1449,12 +1438,17 @@ def build_simulation():
         raise ValueError("pml_profile must be Standard or Stabilized")
     fdtd.set("pml profile", 2 if pml_profile_name == "stabilized" else 1)
     fdtd.set("auto scale pml parameters", False if GRATING_ANALYSIS else True)
-    fdtd.set("simulation time", float(SETTINGS.get("simulation_time_fs", 2000.0)) * 1e-15)
-    print("FDTD stability: dt factor %.3g, %s PML" % (dt_stability_factor, pml_profile_name))
+    simulation_time_fs = max(1.0, float(SETTINGS.get("simulation_time_fs", 10000.0)))
+    auto_shutoff_min = min(1.0, max(1e-12, float(SETTINGS.get("auto_shutoff_min", 1e-6))))
+    fdtd.set("simulation time", simulation_time_fs * 1e-15)
+    fdtd.set("auto shutoff min", auto_shutoff_min)
     print(
-        "Material overlap priority: FDTD air background; fiber core mesh order 1; "
-        "fiber cladding 2; grating grow layers 3; top SiO2, BOX, and substrate "
-        "background layers 5 with later process layers taking priority."
+        "FDTD stability: dt factor %.3g, %s PML, %.6g ps maximum, auto shutoff %.3g"
+        % (dt_stability_factor, pml_profile_name, simulation_time_fs * 1e-3, auto_shutoff_min)
+    )
+    print(
+        "Material mesh orders: grating 2; top SiO2 cladding 3; BOX 2; "
+        "substrate 2; fiber core 4; fiber cladding 5."
     )
 
     if z_ranges:
@@ -1462,19 +1456,26 @@ def build_simulation():
             fdtd, z_ranges, bounds, simulation_z_min_um, simulation_z_max_um, pml_geometry_overlap_um
         )
         _add_layer_mesh_overrides(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_z_max_um)
-        if SETTINGS.get("include_ports", True):
-            _add_waveguide_boundary_extensions(fdtd, z_ranges, bounds, boundary_clearance_um, pml_geometry_overlap_um)
     # Port eigensolvers must see the requested wavelength range before their
     # mode profiles are explicitly updated.
     fdtd.setglobalsource("wavelength start", float(SETTINGS.get("wavelength_start_um", 1.25)) * UM)
     fdtd.setglobalsource("wavelength stop", float(SETTINGS.get("wavelength_stop_um", 1.35)) * UM)
-    _add_fiber_geometries(fdtd, device_top_um, stack_top_um, silica_cladding_top_um)
+    _add_fiber_geometries(
+        fdtd, device_top_um, stack_top_um,
+        silica_cladding_top_um, silica_cladding_center_um,
+    )
     if SETTINGS.get("include_ports", True):
-        _add_ports(fdtd, device_z_um, device_top_um, stack_top_um, silica_cladding_top_um)
+        _add_ports(
+            fdtd, device_z_um, device_top_um, stack_top_um,
+            silica_cladding_top_um, silica_cladding_center_um,
+        )
         if PORTS:
             fdtd.select("FDTD::ports")
             fdtd.set("monitor frequency points", int(SETTINGS.get("frequency_points", 31)))
-    _add_monitors(fdtd, device_z_um, device_top_um, stack_top_um, silica_cladding_top_um)
+    _add_monitors(
+        fdtd, device_z_um, device_top_um, stack_top_um,
+        silica_cladding_top_um, silica_cladding_center_um,
+    )
     fdtd.setglobalmonitor("use source limits", True)
     fdtd.setglobalmonitor("frequency points", int(SETTINGS.get("frequency_points", 31)))
     model_bounds_um = [
@@ -1592,25 +1593,27 @@ def _draw_process_projection(axis, coordinate_index, coordinate_label):
     device_top = max(geometry_tops, default=0.0)
     stack_top = z_ranges[-1][2] if z_ranges else device_top
     silica_cladding_top = _silica_cladding_top_um(z_ranges, device_top)
+    silica_cladding_center = _silica_cladding_center_um(z_ranges, device_top)
     for fiber in FIBER_GEOMETRIES:
         x_um, y_um = map(float, fiber.get("center", (0.0, 0.0)))
         start_horizontal = x_um if coordinate_index == 0 else y_um
         start_z = _vertical_reference_um(
-            fiber, device_top, stack_top, silica_cladding_top
+            fiber, device_top, stack_top, silica_cladding_top, silica_cladding_center
         ) + float(fiber.get("distance_um", 0.0))
         length = float(fiber.get("fiber length_um", 20.0))
         theta = np.deg2rad(float(fiber.get("angle theta", 10.0)))
         phi = np.deg2rad(float(fiber.get("angle phi", 0.0)))
-        horizontal_delta = length * np.sin(theta) * (np.cos(phi) if coordinate_index == 0 else np.sin(phi))
-        vertical_delta = length * np.cos(theta)
+        horizontal_delta = 0.5 * length * np.tan(theta) * (
+            np.cos(phi) if coordinate_index == 0 else np.sin(phi)
+        )
         axis.plot(
-            [start_horizontal, start_horizontal + horizontal_delta],
-            [start_z, start_z + vertical_delta],
+            [start_horizontal - horizontal_delta, start_horizontal + horizontal_delta],
+            [start_z - 0.5 * length, start_z + 0.5 * length],
             color="#bae6fd", linewidth=10.0, alpha=0.06, solid_capstyle="round",
         )
         axis.plot(
-            [start_horizontal, start_horizontal + horizontal_delta],
-            [start_z, start_z + vertical_delta],
+            [start_horizontal - horizontal_delta, start_horizontal + horizontal_delta],
+            [start_z - 0.5 * length, start_z + 0.5 * length],
             color="#0e7490", linewidth=4.0, alpha=0.35, solid_capstyle="round",
         )
 
@@ -2564,6 +2567,10 @@ def generate_lumerical_notebook(
             else "full"
         )
         row["mesh_factor"] = max(0.0, float(row.get("mesh_factor", 0.2)))
+        row["mesh_order"] = max(
+            1,
+            int(row.get("mesh_order", 3 if bool(row.get("conformal", False)) else 2)),
+        )
         if row["thickness_um"] > 0 and not str(row.get("material", "")).strip():
             warnings.append(f"Active stack layer {row.get('name', '')!r} has no material name.")
 
@@ -2590,7 +2597,8 @@ def generate_lumerical_notebook(
         "dt_stability_factor": min(0.99, max(0.1, float(configuration.get("dt_stability_factor", 0.99)))),
         "pml_profile": str(configuration.get("pml_profile", "Standard")).strip().title(),
         "pml_geometry_overlap_um": max(0.0, float(configuration.get("pml_geometry_overlap_um", 1.0))),
-        "simulation_time_fs": float(configuration.get("simulation_time_fs", 2000.0)),
+        "simulation_time_fs": max(1.0, float(configuration.get("simulation_time_fs", 10000.0))),
+        "auto_shutoff_min": min(1.0, max(1e-12, float(configuration.get("auto_shutoff_min", 1e-6)))),
         "frequency_points": int(configuration.get("frequency_points", 31)),
         "build_cpu_threads": max(1, int(configuration.get("build_cpu_threads", 30))),
         "resource_mode": configuration.get("resource_mode", "GPU"),
@@ -2612,7 +2620,6 @@ def generate_lumerical_notebook(
                 "mesh_accuracy": 2,
                 "dt_stability_factor": 0.99,
                 "pml_profile": "Standard",
-                "simulation_time_fs": 2000.0,
                 "frequency_points": int(configuration.get("frequency_points", 31)),
             }
         )
@@ -2656,7 +2663,7 @@ def generate_lumerical_notebook(
         "for warning in EXPORT_WARNINGS:\n"
         "    print('Export note:', warning)\n"
     )
-    remote_builder_source = "import os\nimport json\nimport numpy as np\nimport lumapi\n" + _BUILD_CELL
+    remote_builder_source = _BUILD_CELL
     remote_build_cell = (
         "# Send the complete self-contained model to the already licensed persistent Lambda session.\n"
         f"REMOTE_MODEL_BUILDER = {repr(remote_builder_source)}\n"
@@ -2801,7 +2808,7 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
 - Placed power, mode-expansion, and field-profile monitors become `addpower`, `addmodeexpansion`, and `addprofile` objects.
 - The fiber geometry and its Z-axis FDTD port have independent positions and heights above the exported device. Grating-coupler exit analysis is centered on the placed fiber-axis FDTD port.
 - A conformal cladding row fills etched openings in the patterned layer immediately below it and then covers the device.
-- The FDTD boundary keeps at least λ/4 clearance from ordinary device features. Bottom and top background films extend through their PMLs, and each manually placed lateral waveguide port receives a cross-section-matched continuation through its PML, following the official Ansys example.
+- The FDTD boundary keeps at least λ/4 clearance from ordinary device features. Background films may extend through their PMLs, but ports never create additional waveguide-to-PML geometry; only the polygons exported from the layout are simulated.
 - `LiNbO3` is created as a frequency- and temperature-dependent anisotropic sampled material using the Zelmon/Moretti model and the selected X/Y/Z crystal cut.
 - Grating-coupler exports use the tilted Z-axis fiber FDTD port as the Backward source and the waveguide FDTD port as the receiver. They plot coupling efficiency in dB versus wavelength; no grating field or far-field plot is generated.
 - A 1×2 MMI export launches mode 1 from its input port, measures input power 2 µm before the input taper, plots both output powers relative to that measured input, and plots the normalized longitudinal |E|² distribution through the complete MMI.

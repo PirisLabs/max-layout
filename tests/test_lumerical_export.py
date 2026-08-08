@@ -82,6 +82,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertTrue(stack[4]["conformal"])
         self.assertEqual(stack[5]["material"], "Air")
         self.assertTrue(all(row["mesh_factor"] == 0.0 for row in stack))
+        self.assertEqual([row["mesh_order"] for row in stack], [2, 2, 2, 2, 3, 1])
 
     def test_automatic_soi_grating_port_order_matches_ansys_source_receiver_sequence(self) -> None:
         from max_layout.ui.window import NativeLayoutWindow
@@ -106,6 +107,27 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(orders["fiber_source"], 1)
         self.assertEqual(orders["waveguide_point"], 2)
         self.assertEqual(orders["fiber_input_power"], 3)
+        notebook, _warnings = generate_lumerical_notebook(
+            [grating, *companions],
+            {
+                "included_layers": [[1, 0], [2, 0]],
+                "material_stack": lumerical.default_stack("SOI grating coupler (Ansys)"),
+            },
+        )
+        fibers = assignment_value(notebook, "FIBER_GEOMETRIES")
+        ports = assignment_value(notebook, "PORTS")
+        fiber = fibers[0]
+        source = next(port for port in ports if port["name"].endswith("fiber_axis"))
+        measurement = next(port for port in ports if port["name"].endswith("fiber_input_power"))
+        self.assertEqual(fiber["z reference"], "center of SiO2 cladding")
+        self.assertAlmostEqual(
+            source["center"][0] - fiber["center"][0],
+            0.65 * np.sin(np.deg2rad(10.0)),
+        )
+        self.assertAlmostEqual(
+            measurement["center"][0] - fiber["center"][0],
+            (0.65 * np.cos(np.deg2rad(10.0)) - 0.1) * np.tan(np.deg2rad(10.0)),
+        )
 
     def test_generic_grating_has_editable_terminal_output_arc(self) -> None:
         grating = component("Grating coupler")
@@ -306,6 +328,7 @@ class LumericalExportTests(unittest.TestCase):
             if cell["cell_type"] == "code":
                 compile("".join(cell["source"]), f"<notebook cell {index}>", "exec")
         build_source = cell_source_containing(notebook, "REMOTE_MODEL_BUILDER =")
+        self.assertIn("import lumapi", build_source)
         self.assertIn("addport", build_source)
         self.assertIn('serverArgs={"threads": str(build_cpu_threads)}', build_source)
         self.assertIn('SETTINGS.get("build_cpu_threads", 30)', build_source)
@@ -320,22 +343,26 @@ class LumericalExportTests(unittest.TestCase):
         self.assertNotIn('fdtd.set("auto update", True)', build_source)
         self.assertNotIn('fdtd.set("angle theta"', build_source)
         self.assertIn("addlayerbuilder", build_source)
-        self.assertIn('fdtd.set("base mesh order", 3)', build_source)
+        self.assertIn('fdtd.set("base mesh order", layer_builder_mesh_order)', build_source)
         self.assertIn('fdtd.set("background index", 1.0)', build_source)
         self.assertIn('str(row.get("material", "")).strip().lower() == "air"', build_source)
-        self.assertIn('fdtd.adduserprop("core mesh order", 0, 1)', build_source)
-        self.assertIn('fdtd.adduserprop("cladding mesh order", 0, 2)', build_source)
+        self.assertIn('fdtd.adduserprop("core mesh order", 0, 4)', build_source)
+        self.assertIn('fdtd.adduserprop("cladding mesh order", 0, 5)', build_source)
         self.assertIn('fiber_setup_script = r"""\ndeleteall;', lumerical._BUILD_CELL)
         self.assertIn('set("mesh order",core_mesh_order);', build_source)
         self.assertIn('set("mesh order",cladding_mesh_order);', build_source)
         self.assertNotIn('set("mesh order",4)', build_source)
-        self.assertIn("Material overlap priority: FDTD air background", build_source)
+        self.assertIn("Material mesh orders: grating 2", build_source)
+        self.assertIn("background_volumes", build_source)
+        self.assertIn('fdtd.set("mesh order", mesh_order)', build_source)
         self.assertIn('addmaterial("Sampled 3D data")', build_source)
         self.assertIn('"sampled 3d data"', build_source)
         self.assertIn("_silica_cladding_top_um", build_source)
-        self.assertIn("fiber, device_top_um, stack_top_um, silica_cladding_top_um", build_source)
+        self.assertIn("silica_cladding_top_um, silica_cladding_center_um", build_source)
         self.assertIn("center_z_um = reference_z_um + bottom_gap_um", build_source)
-        self.assertIn("midpoint_shift_um = 0.5 * fiber_length_um", build_source)
+        self.assertNotIn("midpoint_shift_um", build_source)
+        self.assertIn("through-going cylinders centered on the nominal contact", build_source)
+        self.assertIn("mesh precedence clips the effective fiber material", build_source)
         self.assertNotIn('fdtd.set("rotation 1", theta_deg)', build_source)
         self.assertIn('"sidewall angle"', build_source)
         self.assertIn("z_extent_max_um = max(z_extent_max_um, device_z_um + 0.5 * z_span_um)", build_source)
@@ -343,8 +370,9 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("z_max_padding = max(boundary_clearance_um, requested_z_max_padding)", build_source)
         self.assertIn("boundary_clearance_um = 0.25 * min", build_source)
         self.assertIn("domain_padding = dict(SETTINGS.get", build_source)
-        self.assertIn("_add_waveguide_boundary_extensions", build_source)
-        self.assertIn("Extended waveguide at port", build_source)
+        self.assertNotIn("_add_waveguide_boundary_extensions", build_source)
+        self.assertNotIn("port PML extension", build_source)
+        self.assertNotIn("Extended waveguide at port", build_source)
         self.assertIn('SETTINGS.get("pml_geometry_overlap_um", 1.0)', build_source)
         self.assertIn("_add_layer_mesh_overrides", build_source)
         self.assertIn('fdtd.set("override x mesh", True)', build_source)
@@ -356,7 +384,6 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("Limited unetched slab", build_source)
         self.assertIn("simulation_z_min_um - pml_geometry_overlap_um", build_source)
         self.assertIn("simulation_z_max_um + pml_geometry_overlap_um", build_source)
-        self.assertIn("bounds[axis_index] - pml_geometry_overlap_um", build_source)
         self.assertIn("Added scripted Ansys fiber property group", build_source)
         self.assertIn('fdtd.adduserprop("core diameter", 2', build_source)
         self.assertIn('fdtd.adduserprop("cladding diameter", 2', build_source)
@@ -385,7 +412,8 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(settings["resource_mode"], "GPU")
         self.assertEqual(settings["dt_stability_factor"], 0.99)
         self.assertEqual(settings["pml_profile"], "Standard")
-        self.assertEqual(settings["simulation_time_fs"], 2000.0)
+        self.assertEqual(settings["simulation_time_fs"], 10000.0)
+        self.assertEqual(settings["auto_shutoff_min"], 1e-6)
         self.assertEqual(settings["frequency_points"], 31)
         self.assertEqual(settings["build_cpu_threads"], 30)
         self.assertEqual(settings["tfln_crystal_cut"], "X")
@@ -404,6 +432,8 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("Lambda is headless", review_source)
         self.assertIn('fdtd.set("dt stability factor", dt_stability_factor)', build_source)
         self.assertIn('fdtd.set("pml profile", 2 if pml_profile_name == "stabilized" else 1)', build_source)
+        self.assertIn('fdtd.set("simulation time", simulation_time_fs * 1e-15)', build_source)
+        self.assertIn('fdtd.set("auto shutoff min", auto_shutoff_min)', build_source)
         analysis_source = cell_source_containing(notebook, "REMOTE_GRATING_ANALYSIS")
         self.assertNotIn("farfield3d", analysis_source)
         self.assertNotIn("farfieldux", analysis_source)
@@ -458,6 +488,8 @@ class LumericalExportTests(unittest.TestCase):
         self.assertTrue(settings["official_gc_domain"])
         self.assertTrue(settings["use_y_antisymmetry"])
         self.assertEqual(settings["antisymmetry_boundary"], "y min")
+        self.assertEqual(settings["simulation_time_fs"], 10000.0)
+        self.assertEqual(settings["auto_shutoff_min"], 1e-6)
         build_source = cell_source_containing(notebook, "REMOTE_MODEL_BUILDER")
         self.assertIn('SETTINGS.get("official_gc_domain", False)', build_source)
         self.assertIn('fdtd.set(antisymmetry_boundary + " bc", "Anti-Symmetric")', build_source)
@@ -465,6 +497,20 @@ class LumericalExportTests(unittest.TestCase):
         self.assertNotIn("Re-save solved project", solve_source)
         save_source = cell_source_containing(notebook, "REMOTE_RESULTS_SAVER")
         self.assertIn("Reused the already extracted grating spectrum", save_source)
+
+    def test_grating_time_and_auto_shutoff_remain_user_editable(self) -> None:
+        grating = component("GC-SOI")
+        notebook, _warnings = generate_lumerical_notebook(
+            [grating],
+            {
+                "included_layers": [[1, 0], [2, 0]],
+                "simulation_time_fs": 12500.0,
+                "auto_shutoff_min": 2e-7,
+            },
+        )
+        settings = assignment_value(notebook, "SETTINGS")
+        self.assertEqual(settings["simulation_time_fs"], 12500.0)
+        self.assertEqual(settings["auto_shutoff_min"], 2e-7)
 
     def test_symmetric_mmi_uses_pre_taper_input_reference_and_two_outputs(self) -> None:
         mmi = component("1x2 MMI")

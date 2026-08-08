@@ -1111,7 +1111,10 @@ class NativeLayoutWindow(QMainWindow):
                     "angle theta": fiber_angle_deg,
                     "angle phi": 0.0,
                     "distance_um": 0.0,
-                    "z reference": "top of SiO2 cladding",
+                    "z reference": (
+                        "center of SiO2 cladding" if kind == "GC-SOI"
+                        else "top of SiO2 cladding"
+                    ),
                     "core diameter_um": float(grating_params.get("fiber_core_diameter_um", 9.0)),
                     "core index": float(grating_params.get("fiber_core_index", 1.44427)),
                     "cladding diameter_um": float(grating_params.get("fiber_cladding_diameter_um", 50.0)),
@@ -1389,7 +1392,10 @@ class NativeLayoutWindow(QMainWindow):
                     # Migrate automatic fibers created before the SiO2-specific
                     # vertical reference was introduced. Manual fibers retain
                     # their independently selected reference.
-                    companion.setdefault("params", {})["z reference"] = "top of SiO2 cladding"
+                    companion.setdefault("params", {})["z reference"] = (
+                        "center of SiO2 cladding" if is_soi
+                        else "top of SiO2 cladding"
+                    )
                     companion["params"]["distance_um"] = 0.0
                     if is_soi:
                         companion["params"].update(
