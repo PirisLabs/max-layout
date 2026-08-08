@@ -124,7 +124,9 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                      'fiber_offset_after_taper_um': 5.0,
                      'fiber_power_monitor_below_source_um': 0.1,
                      'fdtd_port_offset_from_waveguide_end_um': 2.0,
-                     'waveguide_monitor_span_um': 2.5,
+                     # Automatic TFLN waveguide planes use at least 3 um and
+                     # at least twice the physical waveguide width.
+                     'waveguide_monitor_span_um': 3.0,
                      'waveguide_total_power_before_mode_um': 1.0,
                      # TFLN ridge/slab guides are typically near 2.0.  This
                      # value validates the automatically selected fundamental
@@ -808,7 +810,7 @@ DEFAULT_COMPONENT_VALUES.update(
     {
         "FDTD port": {
             "name": "opt_1", "dir": "Bidirectional", "loc": 0.5, "pos": "Left", "order": 1,
-            "port geometry": "surface", "plane normal": "X", "distance_um": 0.0, "span_um": 2.5, "z_span_um": 2.25,
+            "port geometry": "surface", "plane normal": "X", "distance_um": 0.0, "span_um": 3.0, "z_span_um": 2.25,
             "mode": "fundamental mode",
         },
         "Fiber-axis FDTD port": {

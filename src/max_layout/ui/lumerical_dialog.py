@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -33,7 +34,17 @@ from PySide6.QtWidgets import (
 
 from ..constants import LAYER_NAME_MAP
 from ..gds.build import component_geometry_arrays
-from ..lumerical import MATERIAL_CHOICES, STACK_PRESETS, available_geometry_layers, default_stack, seed_simulation_ports
+from ..lumerical import (
+    LUMERICAL_SWEEP_MAX_RUNS,
+    LUMERICAL_SWEEP_WARNING_RUNS,
+    MATERIAL_CHOICES,
+    STACK_PRESETS,
+    available_geometry_layers,
+    default_stack,
+    normalize_lumerical_sweep_spec,
+    seed_simulation_ports,
+    sweepable_component_parameters,
+)
 
 
 def _checked_item(checked: bool) -> QTableWidgetItem:
@@ -110,6 +121,82 @@ def _conformal_fill_start(
         )
         return min(default_z0, previous_z1 - etch_depth)
     return default_z0
+
+
+def _offset_preview_polygon(points: Any, distance_um: float) -> np.ndarray:
+    """Return a winding-independent miter offset with one vertex per input point.
+
+    This is intentionally a lightweight preview operation rather than a GDS
+    Boolean.  Keeping the vertex count stable lets the 3D renderer join each
+    top edge to the corresponding bottom edge while still showing concave and
+    curved component outlines.
+    """
+    original = np.asarray(points, dtype=float)
+    if original.ndim != 2 or original.shape[1] != 2 or len(original) < 3:
+        return original.copy()
+    if not np.isfinite(original).all() or abs(float(distance_um)) <= 1e-12:
+        return original.copy()
+    closed = bool(np.linalg.norm(original[0] - original[-1]) <= 1e-12)
+    polygon = original[:-1].copy() if closed else original.copy()
+    if len(polygon) < 3:
+        return original.copy()
+    signed_twice_area = float(
+        np.sum(
+            polygon[:, 0] * np.roll(polygon[:, 1], -1)
+            - polygon[:, 1] * np.roll(polygon[:, 0], -1)
+        )
+    )
+    if abs(signed_twice_area) <= 1e-18:
+        return original.copy()
+    winding = 1.0 if signed_twice_area > 0.0 else -1.0
+    edges = np.roll(polygon, -1, axis=0) - polygon
+    lengths = np.linalg.norm(edges, axis=1)
+    normals = np.zeros_like(edges)
+    valid = lengths > 1e-15
+    normals[valid, 0] = winding * edges[valid, 1] / lengths[valid]
+    normals[valid, 1] = -winding * edges[valid, 0] / lengths[valid]
+    if not np.any(valid):
+        return original.copy()
+
+    result = polygon.copy()
+    count = len(polygon)
+    for index in range(count):
+        previous_index = (index - 1) % count
+        while not valid[previous_index] and previous_index != index:
+            previous_index = (previous_index - 1) % count
+        next_index = index
+        while not valid[next_index] and next_index != previous_index:
+            next_index = (next_index + 1) % count
+        previous_normal = normals[previous_index]
+        next_normal = normals[next_index]
+        combined = previous_normal + next_normal
+        denominator = 1.0 + float(np.dot(previous_normal, next_normal))
+        if denominator <= 1e-10 or float(np.linalg.norm(combined)) <= 1e-12:
+            shift = float(distance_um) * next_normal
+        else:
+            shift = float(distance_um) * combined / denominator
+        # Extremely acute decorative vertices can produce an unbounded miter.
+        # Limit only that singular visual spike; ordinary device edges retain
+        # the exact Layer Builder offset.
+        maximum_shift = 50.0 * abs(float(distance_um))
+        shift_length = float(np.linalg.norm(shift))
+        if maximum_shift > 0.0 and shift_length > maximum_shift:
+            shift *= maximum_shift / shift_length
+        result[index] += shift
+    return np.vstack([result, result[0]]) if closed else result
+
+
+def _sidewall_face_points(
+    points: Any, etch_depth_um: float, sidewall_angle_deg: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Top/bottom XY faces matching Lumerical's middle sidewall reference."""
+    depth = max(0.0, float(etch_depth_um))
+    angle = min(179.999, max(0.001, float(sidewall_angle_deg)))
+    tangent = math.tan(math.radians(angle))
+    half_offset_um = 0.0 if abs(tangent) <= 1e-12 else 0.5 * depth / tangent
+    top = _offset_preview_polygon(points, -half_offset_um)
+    bottom = _offset_preview_polygon(points, half_offset_um)
+    return top, bottom
 
 
 def _stack_reference_z(
@@ -460,26 +547,31 @@ class ThreeDModelPreview(QWidget):
             matching = [entry for entry in state["stack_ranges"] if str(entry[0].get("role")) == "geometry" and int(layer) in {int(v) for v in entry[0].get("gds_layers", [])}]
             if not matching:
                 continue
-            row, row_z0, row_z1 = matching[0]
-            etch_depth = min(row_z1 - row_z0, max(0.0, float(row.get("etch_depth_um", row_z1 - row_z0))))
-            film_top = row_z1 - etch_depth
-            if (
-                str(row.get("slab_extent", "full")).strip().lower() == "geometry"
-                and film_top > row_z0
-            ):
-                projected_slab_top = [raw((float(point[0]), float(point[1]), film_top)) for point in points]
-                projected_slab_bottom = [raw((float(point[0]), float(point[1]), row_z0)) for point in points]
-                all_points.extend(projected_slab_top)
-                all_points.extend(projected_slab_bottom)
-                polygon_rows.append((projected_slab_top, projected_slab_bottom, row))
-            if etch_depth <= 0.0:
-                continue
-            patterned_z0 = row_z1 - etch_depth
-            projected_top = [raw((float(point[0]), float(point[1]), row_z1)) for point in points]
-            projected_bottom = [raw((float(point[0]), float(point[1]), patterned_z0)) for point in points]
-            all_points.extend(projected_top)
-            all_points.extend(projected_bottom)
-            polygon_rows.append((projected_top, projected_bottom, row))
+            for row, row_z0, row_z1 in matching:
+                etch_depth = min(row_z1 - row_z0, max(0.0, float(row.get("etch_depth_um", row_z1 - row_z0))))
+                film_top = row_z1 - etch_depth
+                if (
+                    str(row.get("slab_extent", "full")).strip().lower() == "geometry"
+                    and film_top > row_z0
+                ):
+                    projected_slab_top = [raw((float(point[0]), float(point[1]), film_top)) for point in points]
+                    projected_slab_bottom = [raw((float(point[0]), float(point[1]), row_z0)) for point in points]
+                    all_points.extend(projected_slab_top)
+                    all_points.extend(projected_slab_bottom)
+                    polygon_rows.append((projected_slab_top, projected_slab_bottom, row))
+                if etch_depth <= 0.0:
+                    continue
+                patterned_z0 = row_z1 - etch_depth
+                top_points, bottom_points = _sidewall_face_points(
+                    points,
+                    etch_depth,
+                    float(row.get("sidewall_angle_deg", 90.0)),
+                )
+                projected_top = [raw((float(point[0]), float(point[1]), row_z1)) for point in top_points]
+                projected_bottom = [raw((float(point[0]), float(point[1]), patterned_z0)) for point in bottom_points]
+                all_points.extend(projected_top)
+                all_points.extend(projected_bottom)
+                polygon_rows.append((projected_top, projected_bottom, row))
         min_x = min(point.x() for point in all_points); max_x = max(point.x() for point in all_points)
         min_y = min(point.y() for point in all_points); max_y = max(point.y() for point in all_points)
         scale = self.zoom_factor * min((self.width() - 100.0) / max(1e-9, max_x - min_x), (self.height() - 120.0) / max(1e-9, max_y - min_y))
@@ -701,6 +793,8 @@ class ThreeDModelPreview(QWidget):
             painter.drawRect(QRectF(legend_x + 10.0, row_y + 3.0, 18.0, 16.0))
             painter.setPen(QPen(QColor("#1e293b"), 1))
             label = f"{row.get('name', 'Layer')} — {row.get('material', '')}"
+            if str(row.get("role", "background")) == "geometry":
+                label += f" · sidewall {float(row.get('sidewall_angle_deg', 90.0)):.3g}°"
             painter.drawText(QRectF(legend_x + 36.0, row_y, legend_width - 46.0, 22.0), Qt.AlignmentFlag.AlignVCenter, label)
 
 
@@ -877,6 +971,202 @@ class SimulationPortsDialog(QDialog):
                 }
             )
         return result
+
+
+class LumericalSweepDialog(QDialog):
+    """Choose one or more exact component-JSON parameters and Cartesian ranges."""
+
+    def __init__(
+        self,
+        component: dict[str, Any],
+        saved: dict[str, Any] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.component = component
+        self.saved = deepcopy(saved or {})
+        self.parameters = sweepable_component_parameters(component)
+        self.editors: list[dict[str, Any]] = []
+        self._accepted_spec: dict[str, Any] | None = None
+        self.setWindowTitle(f"Lumerical parameter sweep — {component.get('kind', 'component')}")
+        self.resize(1120, min(880, max(430, 250 + 52 * len(self.parameters))))
+        self.setMinimumSize(920, 430)
+        outer = QVBoxLayout(self)
+        explanation = QLabel(
+            "Select the geometry parameters to sweep. Start and stop are inclusive; Points controls "
+            "how many values are simulated on that axis. Multiple checked rows form a Cartesian grid. "
+            "The exact JSON parameter name is shown in brackets."
+        )
+        explanation.setWordWrap(True)
+        outer.addWidget(explanation)
+
+        speed_note = QLabel(
+            "Fast mode: one licence session, one static model build, one nominal FSP, then in-place "
+            "geometry updates and sequential GPU solves. Numerical spectra are downloaded once and all plots are made on CPU."
+        )
+        speed_note.setWordWrap(True)
+        speed_note.setStyleSheet("color:#0f766e; font-weight:600;")
+        outer.addWidget(speed_note)
+
+        self.table = QTableWidget(len(self.parameters), 7)
+        self.table.setHorizontalHeaderLabels(
+            ["Sweep", "Parameter [JSON name]", "Current", "Start", "Stop", "Points", "Axis runs"]
+        )
+        self.table.verticalHeader().setDefaultSectionSize(46)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column in (2, 3, 4, 5, 6):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        saved_axes = {
+            str(axis.get("parameter", "")): axis
+            for axis in self.saved.get("axes", [])
+        }
+        default_keys = (
+            {"pitch", "duty_cycle", "fill_factor"}
+            if str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"}
+            else ({str(self.parameters[0]["parameter"])} if self.parameters else set())
+        )
+        for row, metadata in enumerate(self.parameters):
+            key = str(metadata["parameter"])
+            value_type = str(metadata["value_type"])
+            nominal = metadata["nominal"]
+            saved_axis = saved_axes.get(key)
+            saved_values = list(saved_axis.get("values", [])) if saved_axis else []
+            checked = bool(saved_axis) or (not saved_axes and key in default_keys)
+            check = QCheckBox()
+            check.setChecked(checked)
+            check.setToolTip("Include this parameter in the Cartesian sweep")
+            self.table.setCellWidget(row, 0, check)
+            item = QTableWidgetItem(f"{metadata['label']}  [{key}]")
+            item.setToolTip(f"Exact project JSON key: {key}")
+            self.table.setItem(row, 1, item)
+            self.table.setItem(row, 2, QTableWidgetItem(str(nominal)))
+
+            if saved_values:
+                start_value, stop_value = saved_values[0], saved_values[-1]
+                point_count = len(saved_values)
+            elif value_type == "int":
+                start_value = max(1, int(nominal) - 1)
+                stop_value = max(start_value + 1, int(nominal) + 1)
+                point_count = int(stop_value - start_value + 1)
+            else:
+                numeric = float(nominal)
+                if key in {"duty_cycle", "fill_factor"}:
+                    start_value, stop_value = max(0.001, numeric - 0.05), min(0.999, numeric + 0.05)
+                else:
+                    delta = max(abs(numeric) * 0.05, 0.01)
+                    start_value, stop_value = numeric - delta, numeric + delta
+                point_count = 3
+
+            if value_type == "int":
+                start_box = QSpinBox(); start_box.setRange(-1_000_000_000, 1_000_000_000); start_box.setValue(int(start_value))
+                stop_box = QSpinBox(); stop_box.setRange(-1_000_000_000, 1_000_000_000); stop_box.setValue(int(stop_value))
+            else:
+                start_box = QDoubleSpinBox(); start_box.setRange(-1e9, 1e9); start_box.setDecimals(9); start_box.setValue(float(start_value))
+                stop_box = QDoubleSpinBox(); stop_box.setRange(-1e9, 1e9); stop_box.setDecimals(9); stop_box.setValue(float(stop_value))
+            for box in (start_box, stop_box):
+                box.setMinimumWidth(125)
+                box.setKeyboardTracking(False)
+            points_box = QSpinBox()
+            points_box.setRange(2, LUMERICAL_SWEEP_MAX_RUNS)
+            points_box.setValue(max(2, int(point_count)))
+            points_box.setMinimumWidth(82)
+            runs_item = QTableWidgetItem(str(points_box.value()))
+            runs_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, 6, runs_item)
+            self.table.setCellWidget(row, 3, start_box)
+            self.table.setCellWidget(row, 4, stop_box)
+            self.table.setCellWidget(row, 5, points_box)
+            editor = {
+                **metadata,
+                "check": check,
+                "start": start_box,
+                "stop": stop_box,
+                "points": points_box,
+                "runs_item": runs_item,
+            }
+            self.editors.append(editor)
+            check.toggled.connect(self._update_run_count)
+            points_box.valueChanged.connect(self._update_run_count)
+        outer.addWidget(self.table, 1)
+
+        self.run_count = QLabel()
+        self.run_count.setWordWrap(True)
+        outer.addWidget(self.run_count)
+        output_note = QLabel(
+            "Grating result names include every selected value, for example CE-P=0.75-F=0.56.png. "
+            "A maximum-CE summary plot and CSV are generated after all runs."
+        )
+        output_note.setWordWrap(True)
+        outer.addWidget(output_note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Continue to stack and FDTD settings…")
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        outer.addWidget(buttons)
+        self._update_run_count()
+
+    def _update_run_count(self, *_args) -> None:
+        total = 1
+        selected = 0
+        for editor in self.editors:
+            editor["runs_item"].setText(str(editor["points"].value()))
+            if editor["check"].isChecked():
+                selected += 1
+                total *= int(editor["points"].value())
+        if not selected:
+            self.run_count.setText("Select at least one parameter.")
+            self.run_count.setStyleSheet("color:#b91c1c; font-weight:600;")
+        elif total > LUMERICAL_SWEEP_MAX_RUNS:
+            self.run_count.setText(
+                f"{total} total GPU simulations — above the {LUMERICAL_SWEEP_MAX_RUNS}-run safety limit."
+            )
+            self.run_count.setStyleSheet("color:#b91c1c; font-weight:600;")
+        elif total > LUMERICAL_SWEEP_WARNING_RUNS:
+            self.run_count.setText(
+                f"{total} total GPU simulations. This is a large sweep; compact checkpoint files permit restart."
+            )
+            self.run_count.setStyleSheet("color:#b45309; font-weight:600;")
+        else:
+            self.run_count.setText(f"{total} total GPU simulation{'s' if total != 1 else ''}.")
+            self.run_count.setStyleSheet("color:#0f766e; font-weight:600;")
+
+    def _raw_axes(self) -> list[dict[str, Any]]:
+        axes = []
+        for editor in self.editors:
+            if not editor["check"].isChecked():
+                continue
+            start = editor["start"].value()
+            stop = editor["stop"].value()
+            point_count = int(editor["points"].value())
+            values = np.linspace(float(start), float(stop), point_count).tolist()
+            axes.append({"parameter": editor["parameter"], "values": values})
+        return axes
+
+    def _validate_and_accept(self) -> None:
+        try:
+            spec = normalize_lumerical_sweep_spec(self.component, self._raw_axes())
+        except Exception as exc:
+            QMessageBox.critical(self, "Invalid Lumerical sweep", str(exc))
+            return
+        if int(spec["point_count"]) > LUMERICAL_SWEEP_WARNING_RUNS:
+            answer = QMessageBox.question(
+                self,
+                "Confirm large GPU sweep",
+                f"This will run {spec['point_count']} separate 3D GPU simulations. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._accepted_spec = spec
+        self.accept()
+
+    def sweep_spec(self) -> dict[str, Any]:
+        if self._accepted_spec is None:
+            return normalize_lumerical_sweep_spec(self.component, self._raw_axes())
+        return deepcopy(self._accepted_spec)
 
 
 class LumericalExportDialog(QDialog):
@@ -1201,7 +1491,8 @@ class LumericalExportDialog(QDialog):
         form.addRow(self.run_after_build)
         resource_note = QLabel(
             "GPU is the default for every 3D simulation. The notebook detects the GPU, sets its SM licence estimate, "
-            "keeps the CPU row active for meshing, and solves with run(\"FDTD\", \"GPU\")."
+            "keeps the CPU row active for meshing, solves with run(\"FDTD\", \"GPU\"), then switches back to "
+            "the 30-thread CPU resource for result extraction and plotting."
         )
         resource_note.setWordWrap(True)
         form.addRow(resource_note)

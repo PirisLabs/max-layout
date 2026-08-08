@@ -30,12 +30,18 @@ from ..geometry.shapes import mmi_total_length
 from ..geometry.rf_taper import synchronize_rf_taper_points
 from ..geometry.transforms import scene_to_world_point, transform_points, transformed_local_points, world_to_scene_point
 from ..modules_db import load_native_modules, save_native_modules
-from ..lumerical import default_stack, write_lumerical_notebook
+from ..lumerical import (
+    apply_lumerical_sweep_values,
+    default_stack,
+    expand_lumerical_sweep_points,
+    write_lumerical_notebook,
+    write_lumerical_sweep_notebook,
+)
 from ..params import resize_component_parameters
 from ..ports import PORT_ALIASES, component_global_ports, component_local_ports, solve_attachment
 from ..ui.dialogs import ArrayDialog, EbeamDialog, ModuleVariablesDialog
 from ..ui.items import ComponentGraphicsItem, EbeamContainerItem, LayoutView, WriteFieldItem, clear_preview_caches
-from ..ui.lumerical_dialog import LumericalExportDialog
+from ..ui.lumerical_dialog import LumericalExportDialog, LumericalSweepDialog
 from ..ui.theme import _force_dark_popup, color_for_layer
 from ..utils import inclusive_sweep, numeric_list, parse_sequence, safe_json_copy
 
@@ -44,6 +50,38 @@ CHIP_BOUNDARY_MARGIN_UM = 50.0
 WAFER_BOUNDARY_MARGIN_UM = 5000.0  # 0.5 cm keep-out from the wafer edge
 BOUNDARY_MARGINS_UM = {"Chip outline": CHIP_BOUNDARY_MARGIN_UM, "4-inch wafer outline": WAFER_BOUNDARY_MARGIN_UM}
 BOUNDARY_COMPONENT_KINDS = set(BOUNDARY_MARGINS_UM)
+
+
+def automatic_waveguide_port_span_um(
+    component: dict[str, Any], port_name: str = ""
+) -> float:
+    """Platform-aware transverse span for automatically placed waveguide planes.
+
+    The current general photonic library is TFLN-first, so its automatic
+    planes are at least 3 um and at least twice the endpoint waveguide width.
+    GC-SOI remains tied to the separate official-example span.
+    """
+    kind = str(component.get("kind", ""))
+    params = component.get("params", {})
+    if kind == "GC-SOI":
+        return max(0.5, float(params.get("waveguide_monitor_span_um", 2.5)))
+    if kind == "Taper":
+        width_um = float(
+            params.get("width_start", 1.2)
+            if str(port_name) == "left"
+            else params.get("width_end", params.get("width_start", 1.2))
+        )
+    elif kind in {"Grating coupler", "1x2 MMI", "Cascaded MMI", "MMI + Reference"}:
+        width_um = float(params.get("wg_width", params.get("width", 1.2)))
+    else:
+        width_um = float(params.get("width", params.get("wg_width", 1.2)))
+    requested_um = float(
+        params.get(
+            "waveguide_monitor_span_um",
+            params.get("waveguide_port_span_um", 0.0),
+        )
+    )
+    return max(3.0, 2.0 * abs(width_um), requested_um)
 
 
 def add_fixed_default_row(table: QTableWidget, row: int, key: str, value: Any) -> tuple[str, Any, bool, Any]:
@@ -534,12 +572,21 @@ class NativeLayoutWindow(QMainWindow):
         action("export_python", "Export Python", self.export_python, None, None, file_menu)
         action(
             "export_lumerical",
-            "Export Lumerical Notebook…",
+            "Lumerical Run…",
             self.export_lumerical_notebook,
             None,
             None,
             file_menu,
             status_tip="Export selected geometry, material stack, simulation-only ports, and CPU/GPU settings as a self-contained notebook.",
+        )
+        action(
+            "export_lumerical_sweep",
+            "Lumerical Sweep…",
+            self.export_lumerical_sweep_notebook,
+            None,
+            None,
+            file_menu,
+            status_tip="Sweep selected component parameters in one persistent Lumerical/GPU session with minimal model-build and FSP overhead.",
         )
         action("export_field", "Export Field TXT", self.export_field_txt, None, None, file_menu)
         action("export_ftext", "Export BEAMER FTEXT", self.export_beamer_ftext, None, file_toolbar, file_menu)
@@ -862,6 +909,8 @@ class NativeLayoutWindow(QMainWindow):
                 elif component.get("kind") == "Grating coupler":
                     params = component.setdefault("params", {})
                     params.setdefault("fill_factors", "")
+                    if abs(float(params.get("waveguide_monitor_span_um", 3.0)) - 2.5) <= 1e-12:
+                        params["waveguide_monitor_span_um"] = 3.0
                     if abs(float(params.get("fdtd_port_offset_from_waveguide_end_um", 2.0)) - 3.0) <= 1e-12:
                         params["fdtd_port_offset_from_waveguide_end_um"] = 2.0
             self.components = components
@@ -996,15 +1045,7 @@ class NativeLayoutWindow(QMainWindow):
                 )
             if kind in {"Grating coupler", "GC-SOI"} and port_name == "waveguide_point":
                 grating_params = component.get("params", {})
-                monitor_span_um = max(
-                    0.5,
-                    float(
-                        grating_params.get(
-                            "waveguide_monitor_span_um",
-                            grating_params.get("waveguide_port_span_um", 2.5),
-                        )
-                    ),
-                )
+                monitor_span_um = automatic_waveguide_port_span_um(component, port_name)
                 before_mode_um = max(
                     0.0,
                     float(grating_params.get("waveguide_total_power_before_mode_um", 1.0)),
@@ -1082,6 +1123,7 @@ class NativeLayoutWindow(QMainWindow):
                     "pos": "Right",
                     "plane normal": "X",
                     "distance_um": 0.0,
+                    "span_um": automatic_waveguide_port_span_um(component, port_name),
                 }
             )
             next_order += 1
@@ -1237,9 +1279,8 @@ class NativeLayoutWindow(QMainWindow):
                         {
                             "order": automatic_order_base + 1,
                             "mode": "fundamental TE mode",
-                            "span_um": max(
-                                0.5,
-                                float(grating_params.get("waveguide_port_span_um", 4.0)),
+                            "span_um": automatic_waveguide_port_span_um(
+                                component, "waveguide_point"
                             ),
                         }
                     )
@@ -1307,15 +1348,7 @@ class NativeLayoutWindow(QMainWindow):
         if str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"}:
             grating_params = component.get("params", {})
             default_waveguide_neff = 2.5 if str(component.get("kind", "")) == "GC-SOI" else 2.0
-            monitor_span_um = max(
-                0.5,
-                float(
-                    grating_params.get(
-                        "waveguide_monitor_span_um",
-                        grating_params.get("waveguide_port_span_um", 2.5),
-                    )
-                ),
-            )
+            monitor_span_um = automatic_waveguide_port_span_um(component, "waveguide_point")
             waveguide_power_name = f"uid_{parent_uid}_waveguide_total_power"
             # Older projects used a waveguide-side FDTD port. Convert it to a
             # mode-expansion monitor so the tilted fiber remains the only port/source.
@@ -1496,6 +1529,10 @@ class NativeLayoutWindow(QMainWindow):
                     outward = float(port["outward_orientation_deg"]) % 360.0
                     center_x, center_y = map(float, port["center"])
                     port_offset_um = 0.0
+                    if companion.get("kind") == "FDTD port":
+                        companion.setdefault("params", {})["span_um"] = automatic_waveguide_port_span_um(
+                            component, str(parent_port_name)
+                        )
                     if str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"} and str(parent_port_name) == "waveguide_point":
                         port_offset_um = max(
                             0.0,
@@ -1507,14 +1544,8 @@ class NativeLayoutWindow(QMainWindow):
                         center_x += port_offset_um * math.cos(inward_angle)
                         center_y += port_offset_um * math.sin(inward_angle)
                         role = str(companion.get("grating_monitor_role", ""))
-                        monitor_span_um = max(
-                            0.5,
-                            float(
-                                component.get("params", {}).get(
-                                    "waveguide_monitor_span_um",
-                                    component.get("params", {}).get("waveguide_port_span_um", 2.5),
-                                )
-                            ),
+                        monitor_span_um = automatic_waveguide_port_span_um(
+                            component, str(parent_port_name)
                         )
                         if role == "waveguide_total_power":
                             before_mode_um = max(
@@ -2271,9 +2302,19 @@ class NativeLayoutWindow(QMainWindow):
         if component.get("kind") in {"Grating coupler", "GC-SOI"}:
             grating_params = component.setdefault("params", {})
             grating_params.setdefault("fill_factors", "")
+            if (
+                component.get("kind") == "Grating coupler"
+                and abs(float(grating_params.get("waveguide_monitor_span_um", 3.0)) - 2.5) <= 1e-12
+            ):
+                grating_params["waveguide_monitor_span_um"] = 3.0
             grating_params.setdefault(
                 "waveguide_monitor_span_um",
-                float(grating_params.pop("waveguide_port_span_um", 2.5)),
+                float(
+                    grating_params.pop(
+                        "waveguide_port_span_um",
+                        2.5 if component.get("kind") == "GC-SOI" else 3.0,
+                    )
+                ),
             )
             grating_params.setdefault("waveguide_total_power_before_mode_um", 1.0)
             grating_params.setdefault(
@@ -2563,8 +2604,9 @@ class NativeLayoutWindow(QMainWindow):
         duplicate_action = menu.addAction("Duplicate")
         array_action = menu.addAction("Make an array")
         lattice_action = menu.addAction("Create photonic-crystal lattice…")
-        simulation_menu = menu.addMenu("Lumerical simulation")
-        export_lumerical_action = simulation_menu.addAction("Export simulation notebook…")
+        menu.addSeparator()
+        export_lumerical_action = menu.addAction("Lumerical run…")
+        sweep_lumerical_action = menu.addAction("Lumerical sweep…")
         boolean_menu=menu.addMenu("Boolean operation")
         boolean_actions={boolean_menu.addAction(label):op for label,op in (("Union","union"),("Difference (first minus rest)","difference"),("Intersection","intersection"),("XOR","xor"))}
         save_module_action = menu.addAction("Add selection to User modules…")
@@ -2575,7 +2617,8 @@ class NativeLayoutWindow(QMainWindow):
         for action_item in (go_action, duplicate_action, array_action, lattice_action, save_module_action, delete_action):
             action_item.setEnabled(has_selection)
         boolean_menu.setEnabled(len(self.selected_components())>=2)
-        simulation_menu.setEnabled(len(self.selected_components()) == 1)
+        export_lumerical_action.setEnabled(len(self.selected_components()) == 1)
+        sweep_lumerical_action.setEnabled(len(self.selected_components()) == 1)
         chosen = menu.exec(self.project_tree.viewport().mapToGlobal(position))
         if chosen is go_action:
             self.fit_selection()
@@ -2587,6 +2630,8 @@ class NativeLayoutWindow(QMainWindow):
             self.create_photonic_crystal_lattice()
         elif chosen is export_lumerical_action:
             self.export_lumerical_notebook(self.selected_components()[0])
+        elif chosen is sweep_lumerical_action:
+            self.export_lumerical_sweep_notebook(self.selected_components()[0])
         elif chosen in boolean_actions:
             self.boolean_selected_geometry(boolean_actions[chosen])
         elif chosen is save_module_action:
@@ -4122,6 +4167,175 @@ class NativeLayoutWindow(QMainWindow):
             message += f" ({len(warnings)} note(s) are recorded inside the notebook)"
         self.statusBar().showMessage(message, 10000)
 
+    def export_lumerical_sweep_notebook(
+        self, clicked_component: dict[str, Any] | bool | None = None
+    ) -> None:
+        """Export a one-session Cartesian geometry sweep for one physical component."""
+        if isinstance(clicked_component, bool):
+            clicked_component = None
+        if clicked_component is None:
+            selected = self.selected_components()
+            clicked_component = selected[0] if selected else None
+        if clicked_component is None:
+            QMessageBox.information(
+                self, "Lumerical sweep", "Right-click the physical component whose parameters you want to sweep."
+            )
+            return
+        target_component = clicked_component
+        if target_component.get("kind") in SIMULATION_COMPONENT_KINDS:
+            parent_uid = target_component.get("simulation_parent_uid")
+            target_component = next(
+                (
+                    component for component in self.components
+                    if parent_uid is not None and int(component.get("uid", -1)) == int(parent_uid)
+                ),
+                None,
+            )
+        if target_component is None or target_component.get("kind") in SIMULATION_COMPONENT_KINDS:
+            QMessageBox.information(
+                self,
+                "Lumerical sweep",
+                "A port or monitor cannot be the sweep target. Right-click its parent device instead.",
+            )
+            return
+
+        sweep_dialog = LumericalSweepDialog(
+            target_component,
+            saved=target_component.get("lumerical_sweep_settings", {}),
+            parent=self,
+        )
+        if not sweep_dialog.parameters:
+            QMessageBox.information(
+                self,
+                "Lumerical sweep",
+                f"{target_component.get('kind')} has no supported scalar geometry parameters to sweep.",
+            )
+            return
+        if sweep_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        sweep_spec = sweep_dialog.sweep_spec()
+
+        saved_export = copy.deepcopy(target_component.get("lumerical_export_settings", {}))
+        if target_component.get("kind") == "GC-SOI" and saved_export:
+            # Apply the same compact-domain migration as the one-run export.
+            # Old saved bounds could crop the terminal arc during a sweep.
+            if int(saved_export.get("gc_domain_version", 0)) < 3:
+                saved_export.pop("domain_padding_um", None)
+                saved_export["official_gc_domain"] = True
+                saved_export["use_y_antisymmetry"] = False
+                saved_export["gc_domain_version"] = 3
+        if target_component.get("kind") == "GC-SOI" and not saved_export:
+            saved_export = {
+                "stack_preset": "SOI grating coupler (Ansys)",
+                "material_stack": default_stack("SOI grating coupler (Ansys)"),
+                "wavelength_start_um": 1.50,
+                "wavelength_stop_um": 1.60,
+                "frequency_points": 31,
+                "resource_mode": "GPU",
+                "dimension": "3D",
+                "official_gc_domain": True,
+                "use_y_antisymmetry": False,
+                "gc_domain_version": 3,
+                "run_after_build": True,
+            }
+        export_dialog = LumericalExportDialog(
+            self.components,
+            self.lumerical_scope_options(target_component),
+            saved=saved_export,
+            parent=self,
+        )
+        export_dialog.setWindowTitle("Lumerical sweep — stack, domain, and GPU settings")
+        if export_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            configuration = export_dialog.configuration()
+        except Exception as exc:
+            QMessageBox.critical(self, "Invalid Lumerical sweep settings", str(exc))
+            return
+        selected_uids = set(map(int, configuration.get("scope_uids", [])))
+        export_components = [
+            safe_json_copy(component)
+            for component in self.components
+            if int(component["uid"]) in selected_uids
+        ]
+        target_uid = int(target_component["uid"])
+        if not any(int(component.get("uid", -1)) == target_uid for component in export_components):
+            QMessageBox.critical(
+                self,
+                "Invalid Lumerical sweep scope",
+                "The selected export geometry does not contain the component being swept.",
+            )
+            return
+
+        class _SweepCompanionContext:
+            make_component = NativeLayoutWindow.make_component
+            synchronize_automatic_simulation_companions = (
+                NativeLayoutWindow.synchronize_automatic_simulation_companions
+            )
+
+        sweep_cases = []
+        for values in expand_lumerical_sweep_points(sweep_spec):
+            variant_components = copy.deepcopy(export_components)
+            variant_target = next(
+                component for component in variant_components
+                if int(component.get("uid", -1)) == target_uid
+            )
+            apply_lumerical_sweep_values(variant_target, values)
+            context = _SweepCompanionContext()
+            context.components = variant_components
+            context.next_uid = 1 + max(
+                (int(component.get("uid", 0)) for component in variant_components),
+                default=0,
+            )
+            context.synchronize_automatic_simulation_companions(variant_target)
+            sweep_cases.append(
+                {"values": dict(values), "components": context.components}
+            )
+
+        base_name = re.sub(
+            r"[^A-Za-z0-9_-]+",
+            "_",
+            str(target_component.get("kind", "component")),
+        ).strip("_").lower() or "component"
+        default_path = Path.home() / f"{base_name}_sweep.ipynb"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save optimized Lumerical sweep notebook",
+            str(default_path),
+            "Jupyter notebook (*.ipynb)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".ipynb"):
+            path += ".ipynb"
+        configuration["lumerical_sweep"] = sweep_spec
+        configuration["run_after_build"] = True
+        configuration["resource_mode"] = "GPU"
+        configuration["project_file"] = f"{base_name}_sweep.fsp"
+        try:
+            warnings = write_lumerical_sweep_notebook(
+                path,
+                sweep_cases,
+                configuration,
+                sweep_spec,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Lumerical sweep export failed", str(exc))
+            return
+
+        snapshot = self.snapshot()
+        target_component["lumerical_sweep_settings"] = safe_json_copy(sweep_spec)
+        target_component["lumerical_export_settings"] = safe_json_copy(configuration)
+        self.commit_interaction_snapshot(snapshot)
+        self.rebuild_scene(preserve_selection=True)
+        message = (
+            f"Exported {sweep_spec['point_count']}-point optimized Lumerical sweep: {path}. "
+            "One nominal FSP; no per-point FSP saves."
+        )
+        if warnings:
+            message += f" ({len(warnings)} export note(s))"
+        self.statusBar().showMessage(message, 12000)
+
     def export_gds(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -5239,6 +5453,7 @@ ENDFLOW
         scan_component = None
         clicked_component = None
         export_lumerical_action = None
+        sweep_lumerical_action = None
         if component_item is not None and component_item.data(10) is not None:
             component = self.component_by_uid(int(component_item.data(10)))
             if component is not None:
@@ -5264,9 +5479,9 @@ ENDFLOW
                             action = section_menu.addAction(section_title)
                             section_actions[action] = (component, section_title, section_keys)
                     menu.addSeparator()
-                simulation_menu = menu.addMenu("Lumerical simulation")
-                export_lumerical_action = simulation_menu.addAction("Export simulation notebook…")
+                export_lumerical_action = menu.addAction("Lumerical run…")
                 export_font = export_lumerical_action.font(); export_font.setBold(True); export_lumerical_action.setFont(export_font)
+                sweep_lumerical_action = menu.addAction("Lumerical sweep…")
                 menu.addSeparator()
         save_module_action = menu.addAction("Add selection to User modules…")
         save_module_action.setEnabled(bool([component for component in self.selected_components() if component.get("kind") != "E-beam multipass"]))
@@ -5285,6 +5500,8 @@ ENDFLOW
             self.edit_component_section(*section_actions[chosen])
         elif chosen is export_lumerical_action and clicked_component is not None:
             self.export_lumerical_notebook(clicked_component)
+        elif chosen is sweep_lumerical_action and clicked_component is not None:
+            self.export_lumerical_sweep_notebook(clicked_component)
         elif chosen is save_module_action:
             self.save_selection_as_module()
         elif chosen is lattice_action:

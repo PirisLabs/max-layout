@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import base64
 import json
 from pathlib import Path
 import unittest
+import zlib
 
 import numpy as np
 
@@ -11,7 +13,20 @@ from max_layout.constants import DEFAULT_COMPONENT_VALUES
 from max_layout.gds.build import component_geometry_arrays, resolve_and_build
 from max_layout.gds.couplers import resolve_grating_fill_factors
 from max_layout import lumerical
-from max_layout.lumerical import generate_lumerical_notebook, seed_simulation_ports
+from max_layout.lumerical import (
+    apply_lumerical_sweep_values,
+    expand_lumerical_sweep_points,
+    generate_lumerical_notebook,
+    generate_lumerical_sweep_notebook,
+    normalize_lumerical_sweep_spec,
+    seed_simulation_ports,
+    sweepable_component_parameters,
+)
+from max_layout.ui.lumerical_dialog import (
+    _anchored_stack_ranges,
+    _conformal_fill_start,
+    _sidewall_face_points,
+)
 from max_layout.utils import parse_sequence
 
 
@@ -51,6 +66,84 @@ def assignment_value(notebook: dict, name: str):
 
 
 class LumericalExportTests(unittest.TestCase):
+    def test_3d_preview_sidewall_faces_match_middle_reference(self) -> None:
+        square = np.asarray([[-2.0, -2.0], [2.0, -2.0], [2.0, 2.0], [-2.0, 2.0]])
+
+        top_90, bottom_90 = _sidewall_face_points(square, 1.0, 90.0)
+        np.testing.assert_allclose(top_90, square)
+        np.testing.assert_allclose(bottom_90, square)
+
+        top_45, bottom_45 = _sidewall_face_points(square, 1.0, 45.0)
+        np.testing.assert_allclose(top_45.min(axis=0), [-1.5, -1.5])
+        np.testing.assert_allclose(top_45.max(axis=0), [1.5, 1.5])
+        np.testing.assert_allclose(bottom_45.min(axis=0), [-2.5, -2.5])
+        np.testing.assert_allclose(bottom_45.max(axis=0), [2.5, 2.5])
+
+        top_135, bottom_135 = _sidewall_face_points(square, 1.0, 135.0)
+        np.testing.assert_allclose(top_135.min(axis=0), [-2.5, -2.5])
+        np.testing.assert_allclose(bottom_135.min(axis=0), [-1.5, -1.5])
+
+        reverse_top, reverse_bottom = _sidewall_face_points(square[::-1], 1.0, 45.0)
+        np.testing.assert_allclose(reverse_top.min(axis=0), [-1.5, -1.5])
+        np.testing.assert_allclose(reverse_bottom.max(axis=0), [2.5, 2.5])
+
+    def test_tfln_automatic_ports_are_twice_width_with_three_um_minimum(self) -> None:
+        from max_layout.ui.window import NativeLayoutWindow, automatic_waveguide_port_span_um
+
+        class Factory:
+            make_component = NativeLayoutWindow.make_component
+            automatic_simulation_companions = NativeLayoutWindow.automatic_simulation_companions
+
+            def __init__(self) -> None:
+                self.components = []
+                self.next_uid = 1
+
+        self.assertEqual(DEFAULT_COMPONENT_VALUES["Straight"]["width"], 1.2)
+        self.assertEqual(DEFAULT_COMPONENT_VALUES["Grating coupler"]["wg_width"], 1.2)
+        self.assertEqual(DEFAULT_COMPONENT_VALUES["FDTD port"]["span_um"], 3.0)
+        self.assertEqual(DEFAULT_COMPONENT_VALUES["Grating coupler"]["waveguide_monitor_span_um"], 3.0)
+
+        factory = Factory()
+        straight = factory.make_component("Straight", 0.0, 0.0)
+        factory.components.append(straight)
+        straight_ports = factory.automatic_simulation_companions(straight)
+        self.assertEqual([port["params"]["span_um"] for port in straight_ports], [3.0, 3.0])
+
+        taper = factory.make_component("Taper", 0.0, 0.0)
+        self.assertEqual(automatic_waveguide_port_span_um(taper, "left"), 3.0)
+        self.assertEqual(automatic_waveguide_port_span_um(taper, "right"), 5.0)
+
+        grating = factory.make_component("Grating coupler", 0.0, 0.0)
+        generic_companions = factory.automatic_simulation_companions(grating)
+        generic_waveguide_planes = [
+            item for item in generic_companions
+            if item.get("grating_monitor_role") in {"waveguide_total_power", "waveguide_mode_expansion"}
+        ]
+        self.assertEqual(
+            [item["params"]["y span"] for item in generic_waveguide_planes],
+            [3.0, 3.0],
+        )
+
+        soi = factory.make_component("GC-SOI", 0.0, 0.0)
+        soi_companions = factory.automatic_simulation_companions(soi)
+        soi_waveguide_planes = [
+            item for item in soi_companions
+            if item.get("grating_monitor_role") in {"waveguide_total_power", "waveguide_mode_expansion"}
+        ]
+        self.assertEqual(
+            [item["params"]["y span"] for item in soi_waveguide_planes],
+            [2.5, 2.5],
+        )
+
+    def test_scalar_fill_sweep_disables_apodization_only_in_temporary_copy(self) -> None:
+        original = component("GC-SOI")
+        original["params"]["fill_factors"] = "linspace(0.30, 0.50)"
+        temporary = deepcopy(original)
+        apply_lumerical_sweep_values(temporary, {"duty_cycle": 0.46})
+        self.assertEqual(temporary["params"]["duty_cycle"], 0.46)
+        self.assertEqual(temporary["params"]["fill_factors"], "")
+        self.assertEqual(original["params"]["fill_factors"], "linspace(0.30, 0.50)")
+
     def test_grating_platforms_have_distinct_neff_validation_defaults(self) -> None:
         self.assertEqual(component("Grating coupler")["params"]["waveguide_effective_index"], 2.0)
         self.assertEqual(component("GC-SOI")["params"]["waveguide_effective_index"], 2.5)
@@ -92,6 +185,63 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(stack[5]["material"], "Air")
         self.assertTrue(all(row["mesh_factor"] == 0.0 for row in stack))
         self.assertEqual([row["mesh_order"] for row in stack], [2, 2, 2, 2, 3, 1])
+
+    def test_conformal_cladding_fills_full_device_depth_in_solver_and_previews(self) -> None:
+        soi_stack = lumerical.default_stack("SOI grating coupler (Ansys)")
+        soi_ranges = _anchored_stack_ranges(soi_stack)
+        soi_cladding_index = next(
+            index for index, (row, _z0, _z1) in enumerate(soi_ranges)
+            if bool(row.get("conformal", False))
+        )
+        _row, soi_cladding_z0, _z1 = soi_ranges[soi_cladding_index]
+        # The 120 nm residual film and 100 nm upper mask are one physical
+        # 220 nm silicon film, so oxide must fill down to its -60 nm base.
+        self.assertAlmostEqual(
+            _conformal_fill_start(soi_ranges, soi_cladding_index, soi_cladding_z0),
+            -0.06,
+        )
+
+        tfln_stack = [
+            {
+                "name": "TFLN device",
+                "material": "LiNbO3",
+                "thickness_um": 0.4,
+                "etch_depth_um": 0.2,
+                "role": "geometry",
+                "gds_layer": 1,
+            },
+            {
+                "name": "SiO2 cladding",
+                "material": "SiO2 (Glass) - Palik",
+                "thickness_um": 1.0,
+                "role": "background",
+                "conformal": True,
+            },
+        ]
+        tfln_ranges = _anchored_stack_ranges(tfln_stack)
+        _row, tfln_cladding_z0, _z1 = tfln_ranges[1]
+        self.assertAlmostEqual(
+            _conformal_fill_start(tfln_ranges, 1, tfln_cladding_z0),
+            0.0,
+        )
+
+        self.assertIn("def _conformal_fill_start", lumerical._BUILD_CELL)
+        self.assertIn(
+            "_conformal_fill_start(z_ranges, row_index - 1, z0)",
+            lumerical._BUILD_CELL,
+        )
+        self.assertIn(
+            "Verified full-domain conformal cladding",
+            lumerical._BUILD_CELL,
+        )
+        self.assertIn(
+            "covers every waveguide, grating tooth, flare, terminal arc, and extension",
+            lumerical._BUILD_CELL,
+        )
+        self.assertIn(
+            "_conformal_fill_start(z_ranges, row_index, z0)",
+            lumerical._GEOMETRY_PROJECTIONS_REMOTE,
+        )
 
     def test_automatic_soi_grating_uses_one_source_and_waveguide_monitors(self) -> None:
         from max_layout.ui.window import NativeLayoutWindow
@@ -230,6 +380,226 @@ class LumericalExportTests(unittest.TestCase):
     def test_parse_sequence_symbolic_n(self) -> None:
         self.assertEqual(parse_sequence("linspace(0.2, 0.8)", 4), [0.2, 0.4, 0.6000000000000001, 0.8])
         self.assertEqual(parse_sequence("linspace(0.2, 0.8, N)", 4), [0.2, 0.4, 0.6000000000000001, 0.8])
+
+    def test_lumerical_sweep_parameters_and_cartesian_validation(self) -> None:
+        grating = component("GC-SOI")
+        eligible = {
+            item["parameter"]: item
+            for item in sweepable_component_parameters(grating)
+        }
+        self.assertIn("pitch", eligible)
+        self.assertIn("duty_cycle", eligible)
+        self.assertEqual(eligible["pitch"]["short_name"], "P")
+        self.assertEqual(eligible["duty_cycle"]["short_name"], "F")
+        for excluded in (
+            "slab_layer", "slab_datatype", "etched_layer", "etched_datatype",
+            "tolerance", "h_total", "etch_depth", "waveguide_effective_index",
+            "waveguide_mode_search_count", "fiber_core_diameter_um",
+        ):
+            self.assertNotIn(excluded, eligible)
+
+        spec = normalize_lumerical_sweep_spec(
+            grating,
+            [
+                {"parameter": "pitch", "values": [0.65, 0.67, 0.69]},
+                {"parameter": "duty_cycle", "values": [0.38, 0.42]},
+            ],
+        )
+        self.assertEqual(spec["point_count"], 6)
+        self.assertFalse(spec["save_each_fsp"])
+        self.assertEqual(
+            expand_lumerical_sweep_points(spec),
+            [
+                {"pitch": 0.65, "duty_cycle": 0.38},
+                {"pitch": 0.65, "duty_cycle": 0.42},
+                {"pitch": 0.67, "duty_cycle": 0.38},
+                {"pitch": 0.67, "duty_cycle": 0.42},
+                {"pitch": 0.69, "duty_cycle": 0.38},
+                {"pitch": 0.69, "duty_cycle": 0.42},
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            normalize_lumerical_sweep_spec(
+                grating, [{"parameter": "pitch", "values": [0.67, 0.67]}]
+            )
+        with self.assertRaisesRegex(ValueError, "at least two"):
+            normalize_lumerical_sweep_spec(
+                grating, [{"parameter": "pitch", "values": [0.67]}]
+            )
+        with self.assertRaisesRegex(ValueError, "limit"):
+            normalize_lumerical_sweep_spec(
+                grating,
+                [
+                    {"parameter": "pitch", "values": np.linspace(0.6, 0.8, 11)},
+                    {"parameter": "duty_cycle", "values": np.linspace(0.3, 0.5, 10)},
+                ],
+            )
+
+        generic = component("Grating coupler")
+        with self.assertRaisesRegex(ValueError, "whole number"):
+            normalize_lumerical_sweep_spec(
+                generic, [{"parameter": "N", "values": [10, 11.5]}]
+            )
+
+    def test_optimized_lumerical_sweep_notebook_builds_once_and_names_ce_curves(self) -> None:
+        from max_layout.ui.window import NativeLayoutWindow
+
+        class Factory:
+            make_component = NativeLayoutWindow.make_component
+            automatic_simulation_companions = NativeLayoutWindow.automatic_simulation_companions
+            synchronize_automatic_simulation_companions = NativeLayoutWindow.synchronize_automatic_simulation_companions
+
+            def __init__(self) -> None:
+                self.components = []
+                self.next_uid = 1
+
+        factory = Factory()
+        grating = factory.make_component("GC-SOI", 0.0, 0.0)
+        factory.components.append(grating)
+        factory.components.extend(factory.automatic_simulation_companions(grating))
+        spec = normalize_lumerical_sweep_spec(
+            grating,
+            [
+                {"parameter": "pitch", "values": [0.65, 0.75]},
+                {"parameter": "duty_cycle", "values": [0.46, 0.56]},
+            ],
+        )
+        original = deepcopy(factory.components)
+        sweep_cases = []
+        for values in expand_lumerical_sweep_points(spec):
+            variant_components = deepcopy(factory.components)
+            variant_grating = next(item for item in variant_components if item["uid"] == grating["uid"])
+            variant_grating["params"].update(values)
+            variant_factory = Factory()
+            variant_factory.components = variant_components
+            variant_factory.next_uid = 1 + max(item["uid"] for item in variant_components)
+            variant_factory.synchronize_automatic_simulation_companions(variant_grating)
+            sweep_cases.append({"values": values, "components": variant_factory.components})
+        self.assertEqual(factory.components, original)
+
+        notebook, warnings = generate_lumerical_sweep_notebook(
+            sweep_cases,
+            {
+                "included_layers": [[1, 0], [2, 0]],
+                "material_stack": lumerical.default_stack("SOI grating coupler (Ansys)"),
+                "wavelength_start_um": 1.50,
+                "wavelength_stop_um": 1.60,
+                "frequency_points": 11,
+                "resource_mode": "GPU",
+                "run_after_build": True,
+                "project_file": "gc_soi_sweep.fsp",
+            },
+            spec,
+        )
+        self.assertTrue(any("Layout origin moved" in warning for warning in warnings))
+        self.assertEqual(notebook["metadata"]["max_layout"]["point_count"], 4)
+        self.assertFalse(notebook["metadata"]["max_layout"]["per_point_fsp"])
+        all_source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
+        for index, cell in enumerate(notebook["cells"]):
+            if cell["cell_type"] == "code":
+                compile("".join(cell["source"]), f"<sweep notebook cell {index}>", "exec")
+        self.assertEqual(all_source.count("lumapi.FDTD("), 1)
+        self.assertIn("one persistent Lumerical/GPU session", all_source)
+        self.assertIn("_layer_builder_geometry(layer_x_um, layer_y_um, GEOMETRY)", all_source)
+        self.assertIn('fdtd.run("FDTD", resource_mode)', all_source)
+        self.assertNotIn('fdtd.save(_sweep_case_npz', all_source)
+        self.assertIn("no per-point FSP is saved", all_source)
+        self.assertIn("All sweep solves complete; post-processing resource is CPU", all_source)
+        self.assertIn('fdtd.setresource("FDTD", 1, "active", False)', all_source)
+        self.assertIn("CE-maximum-", all_source)
+        self.assertIn("result_stems", all_source)
+
+        payload_source = cell_source_containing(notebook, "_SWEEP_CASES_B64")
+        encoded = assignment_value(notebook, "_SWEEP_CASES_B64")
+        decoded_cases = json.loads(zlib.decompress(base64.b64decode(encoded)).decode("utf-8"))
+        self.assertEqual(
+            [case["result_stem"] for case in decoded_cases],
+            [
+                "CE-P=0.65-F=0.46",
+                "CE-P=0.65-F=0.56",
+                "CE-P=0.75-F=0.46",
+                "CE-P=0.75-F=0.56",
+            ],
+        )
+        bbox = assignment_value(notebook, "BOUNDING_BOX_UM")
+        for case in decoded_cases:
+            points = np.vstack([
+                np.asarray(polygon["vertices_um"], dtype=float)
+                for polygon in case["target_geometry"]
+            ])
+            self.assertGreaterEqual(float(points[:, 0].min()), bbox[0] - 1e-9)
+            self.assertGreaterEqual(float(points[:, 1].min()), bbox[1] - 1e-9)
+            self.assertLessEqual(float(points[:, 0].max()), bbox[2] + 1e-9)
+            self.assertLessEqual(float(points[:, 1].max()), bbox[3] + 1e-9)
+        self.assertIn("SWEEP_CASES =", payload_source)
+
+        window_source = Path("src/max_layout/ui/window.py").read_text(encoding="utf-8")
+        self.assertGreaterEqual(window_source.count('addAction("Lumerical run…")'), 2)
+        self.assertGreaterEqual(window_source.count('addAction("Lumerical sweep…")'), 2)
+        self.assertIn("def export_lumerical_sweep_notebook", window_source)
+        self.assertIn(
+            'saved_export = copy.deepcopy(target_component.get("lumerical_export_settings", {}))',
+            window_source,
+        )
+        self.assertIn("variant_components = copy.deepcopy(export_components)", window_source)
+
+    def test_accepting_sweep_parameters_opens_stack_dialog(self) -> None:
+        from max_layout.ui import window as window_module
+
+        target = component("GC-SOI")
+        spec = normalize_lumerical_sweep_spec(
+            target, [{"parameter": "pitch", "values": [0.65, 0.67]}]
+        )
+        opened: dict[str, object] = {}
+
+        class FakeSweepDialog:
+            parameters = ["pitch"]
+
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def exec(self):
+                return window_module.QDialog.DialogCode.Accepted
+
+            def sweep_spec(self):
+                return spec
+
+        class FakeExportDialog:
+            def __init__(self, _components, _scope, saved=None, parent=None) -> None:
+                opened["saved"] = saved
+                opened["parent"] = parent
+
+            def setWindowTitle(self, title: str) -> None:
+                opened["title"] = title
+
+            def exec(self):
+                return window_module.QDialog.DialogCode.Rejected
+
+        class Harness:
+            components = [target]
+
+            def selected_components(self):
+                return [target]
+
+            def lumerical_scope_options(self, _clicked):
+                return [("Clicked component", [int(target["uid"])])]
+
+        original_sweep_dialog = window_module.LumericalSweepDialog
+        original_export_dialog = window_module.LumericalExportDialog
+        try:
+            window_module.LumericalSweepDialog = FakeSweepDialog
+            window_module.LumericalExportDialog = FakeExportDialog
+            window_module.NativeLayoutWindow.export_lumerical_sweep_notebook(
+                Harness(), target
+            )
+        finally:
+            window_module.LumericalSweepDialog = original_sweep_dialog
+            window_module.LumericalExportDialog = original_export_dialog
+
+        self.assertEqual(
+            opened["title"], "Lumerical sweep — stack, domain, and GPU settings"
+        )
+        self.assertEqual(opened["saved"]["stack_preset"], "SOI grating coupler (Ansys)")
 
     def test_mmi_export_includes_longitudinal_fundamental_field_plot(self) -> None:
         mmi = component("1x2 MMI")
@@ -514,6 +884,9 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(settings["tfln_temperature_K"], 296.3)
         run_source = cell_source_containing(notebook, "_solve_code")
         self.assertIn('fdtd.run("FDTD", "GPU")', run_source)
+        self.assertIn("REMOTE_SWITCH_TO_CPU_ANALYSIS", run_source)
+        self.assertIn('fdtd.setresource("FDTD", 1, "active", False)', run_source)
+        self.assertIn('fdtd.setresource("FDTD", 2, "threads", analysis_threads)', run_source)
         resource_source = cell_source_containing(notebook, "saved pre-solve project ->")
         self.assertIn('getlicenseestimate("FDTD", "1")', resource_source)
         self.assertIn('fdtd.set("source port", str(GRATING_ANALYSIS["fiber_port_name"]))', resource_source)
@@ -535,7 +908,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertNotIn("farfieldux", analysis_source)
         self.assertNotIn("farfielduy", analysis_source)
         self.assertIn("grating_response.png", analysis_source)
-        self.assertIn("Passive tilted fiber port — forward T_in", analysis_source)
+        self.assertIn("Passive tilted fiber port — power toward grating |T_in|", analysis_source)
         self.assertIn("Passive tilted fiber-port power accounting", analysis_source)
         self.assertIn("Source-normalized waveguide total power", analysis_source)
         self.assertIn("Source-normalized selected waveguide-mode power", analysis_source)
@@ -544,6 +917,14 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("_fiber_forward", analysis_source)
         self.assertIn("_fiber_reflected", analysis_source)
         self.assertIn("_fiber_net", analysis_source)
+        self.assertIn("_fiber_net_signed", analysis_source)
+        self.assertIn(
+            "fiber_net_power = fiber_forward_power - fiber_reflected_power",
+            analysis_source,
+        )
+        self.assertIn('"fiber_net_power_signed": fiber_net_power_signed', analysis_source)
+        self.assertIn("physical net |T_in| - |T_out|", analysis_source)
+        self.assertIn("raw signed Tnet diagnostic", analysis_source)
         self.assertIn("passive tilted fiber port", analysis_source.lower())
         self.assertNotIn("grating_field_distribution.png", analysis_source)
         self.assertNotIn("field_intensity_normalized", analysis_source)
@@ -552,6 +933,18 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn('modal_direction_key = str(GRATING_ANALYSIS.get("waveguide_modal_direction", "Tbackward"))', analysis_source)
         self.assertIn('_fiber_port_expansion(', analysis_source)
         self.assertIn('_find_result_key(fiber_expansion, "T_in", "Tin", "T in")', analysis_source)
+        self.assertIn(
+            "fiber_expansion, fiber_forward_key, magnitude=True",
+            analysis_source,
+        )
+        self.assertIn(
+            "fiber_expansion, fiber_reflected_key, magnitude=True",
+            analysis_source,
+        )
+        self.assertIn(
+            "fiber_expansion, fiber_net_key, magnitude=False",
+            analysis_source,
+        )
         self.assertIn("fiber_coupling = waveguide_mode_power_source_normalized / np.maximum", analysis_source)
         self.assertNotIn("np.abs(scattering) ** 2", analysis_source)
         self.assertIn("fiber_coupling", analysis_source)
