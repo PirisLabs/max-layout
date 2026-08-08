@@ -51,6 +51,10 @@ def assignment_value(notebook: dict, name: str):
 
 
 class LumericalExportTests(unittest.TestCase):
+    def test_grating_platforms_have_distinct_neff_validation_defaults(self) -> None:
+        self.assertEqual(component("Grating coupler")["params"]["waveguide_effective_index"], 2.0)
+        self.assertEqual(component("GC-SOI")["params"]["waveguide_effective_index"], 2.5)
+
     def test_official_soi_grating_component_and_stack_defaults(self) -> None:
         grating = component("GC-SOI")
         params = grating["params"]
@@ -63,6 +67,11 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(params["fiber_x_from_grating_start_um"], 2.74533)
         self.assertEqual(params["tolerance"], 0.005)
         self.assertEqual(params["fdtd_port_offset_from_waveguide_end_um"], 2.0)
+        self.assertEqual(params["waveguide_monitor_span_um"], 2.5)
+        self.assertEqual(params["waveguide_total_power_before_mode_um"], 1.0)
+        self.assertEqual(params["waveguide_effective_index"], 2.5)
+        self.assertEqual(params["waveguide_neff_tolerance"], 0.3)
+        self.assertEqual(params["waveguide_mode_search_count"], 20)
         polygons, _ = component_geometry_arrays(grating)
         self.assertEqual(len(polygons), 47)
         self.assertLess(sum(len(points) for points, _layer, _datatype in polygons), 30_000)
@@ -84,7 +93,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertTrue(all(row["mesh_factor"] == 0.0 for row in stack))
         self.assertEqual([row["mesh_order"] for row in stack], [2, 2, 2, 2, 3, 1])
 
-    def test_automatic_soi_grating_port_order_matches_ansys_source_receiver_sequence(self) -> None:
+    def test_automatic_soi_grating_uses_one_source_and_waveguide_monitors(self) -> None:
         from max_layout.ui.window import NativeLayoutWindow
 
         class Factory:
@@ -105,8 +114,42 @@ class LumericalExportTests(unittest.TestCase):
             if item["kind"] in {"FDTD port", "Fiber-axis FDTD port"}
         }
         self.assertEqual(orders["fiber_source"], 1)
-        self.assertEqual(orders["waveguide_point"], 2)
-        self.assertEqual(orders["fiber_input_power"], 3)
+        self.assertEqual(orders["fiber_input_power"], 2)
+        self.assertNotIn("waveguide_point", orders)
+        diagnostic_port = next(
+            item for item in companions
+            if item["kind"] == "Fiber-axis FDTD port"
+            and item.get("simulation_parent_port") == "fiber_input_power"
+        )
+        self.assertEqual(diagnostic_port["params"]["plane normal"], "Z")
+        self.assertTrue(diagnostic_port["params"]["align to fiber axis"])
+        self.assertEqual(diagnostic_port["params"]["fiber plane role"], "input power measurement")
+        self.assertEqual(diagnostic_port["params"]["mode number"], 2)
+        self.assertEqual(diagnostic_port["params"]["polarization"], "Ey")
+        waveguide_power = next(
+            item for item in companions
+            if item["kind"] == "Power monitor"
+            and item.get("grating_monitor_role") == "waveguide_total_power"
+        )
+        waveguide_mode = next(
+            item for item in companions
+            if item["kind"] == "Mode expansion monitor"
+            and item.get("grating_monitor_role") == "waveguide_mode_expansion"
+        )
+        self.assertEqual(waveguide_power["params"]["y span"], 2.5)
+        self.assertEqual(waveguide_mode["params"]["y span"], 2.5)
+        self.assertEqual(waveguide_mode["params"]["mode"], "fundamental mode")
+        self.assertEqual(waveguide_mode["params"]["target neff"], 2.5)
+        self.assertEqual(waveguide_mode["params"]["mode search count"], 20)
+        self.assertEqual(waveguide_power["x"] - waveguide_mode["x"], 1.0)
+        fiber_source_component = next(
+            item for item in companions
+            if item["kind"] == "Fiber-axis FDTD port"
+            and item.get("simulation_parent_port") != "fiber_input_power"
+        )
+        self.assertEqual(fiber_source_component["params"]["mode"], "user select")
+        self.assertEqual(fiber_source_component["params"]["mode number"], 2)
+        self.assertEqual(fiber_source_component["params"]["polarization"], "Ey")
         notebook, _warnings = generate_lumerical_notebook(
             [grating, *companions],
             {
@@ -116,9 +159,17 @@ class LumericalExportTests(unittest.TestCase):
         )
         fibers = assignment_value(notebook, "FIBER_GEOMETRIES")
         ports = assignment_value(notebook, "PORTS")
+        monitors = assignment_value(notebook, "MONITORS")
         fiber = fibers[0]
         source = next(port for port in ports if port["name"].endswith("fiber_axis"))
         measurement = next(port for port in ports if port["name"].endswith("fiber_input_power"))
+        self.assertEqual(len(ports), 2)
+        self.assertEqual(source["name"], "uid_1_fiber_axis")
+        self.assertEqual(measurement["fiber plane role"], "input power measurement")
+        self.assertEqual(measurement["dir"], "Backward")
+        self.assertFalse(any(monitor["name"].endswith("fiber_input_power") for monitor in monitors))
+        self.assertTrue(any(monitor["name"].endswith("waveguide_total_power") for monitor in monitors))
+        self.assertTrue(any(monitor["name"].endswith("waveguide_mode") for monitor in monitors))
         self.assertEqual(fiber["z reference"], "center of SiO2 cladding")
         self.assertAlmostEqual(
             source["center"][0] - fiber["center"][0],
@@ -256,6 +307,39 @@ class LumericalExportTests(unittest.TestCase):
         grating = component("Grating coupler")
         power_monitor = component("Power monitor", uid=2)
         power_monitor["x"] = -27.0
+        power_monitor["simulation_parent_uid"] = 1
+        power_monitor["simulation_parent_port"] = "waveguide_point"
+        power_monitor["grating_monitor_role"] = "waveguide_total_power"
+        power_monitor["params"].update(
+            {
+                "name": "waveguide_total_power",
+                "plane normal": "X",
+                "x span": 0.0,
+                "y span": 2.5,
+                "z span": 2.25,
+            }
+        )
+        waveguide_mode = component("Mode expansion monitor", uid=4)
+        waveguide_mode["x"] = -28.0
+        waveguide_mode["orientation_deg"] = 180.0
+        waveguide_mode["simulation_parent_uid"] = 1
+        waveguide_mode["simulation_parent_port"] = "waveguide_point"
+        waveguide_mode["grating_monitor_role"] = "waveguide_mode_expansion"
+        waveguide_mode["params"].update(
+            {
+                "name": "waveguide_mode",
+                "plane normal": "X",
+                "x span": 0.0,
+                "y span": 2.5,
+                "z span": 2.25,
+                "mode": "user select",
+                "target neff": 2.5,
+                "neff tolerance": 0.3,
+                "mode search count": 4,
+                "expansion for": "waveguide_total_power",
+                "expansion result name": "waveguide_power",
+            }
+        )
         fiber = component("Fiber geometry", uid=3)
         fiber["x"] = 20.0
         fiber["params"]["name"] = "fiber"
@@ -265,30 +349,25 @@ class LumericalExportTests(unittest.TestCase):
         fiber_port["params"]["name"] = "fiber_out"
         fiber_port["params"]["order"] = 2
         fiber_port["params"]["angle theta"] = 7.0
-        fiber_input_power = component("Fiber-axis FDTD port", uid=6)
+        fiber_input_power = component("Power monitor", uid=6)
         fiber_input_power.update({"x": 20.0, "simulation_parent_uid": 1, "simulation_parent_port": "fiber_input_power"})
         fiber_input_power["params"].update(
             {
                 "name": "fiber_input_power",
-                "order": 3,
-                "dir": "Backward",
                 "fiber plane role": "input power measurement",
                 "plane normal": "Z",
                 "z reference": "top of stack",
                 "distance_um": -0.1,
-                "span_um": 20.0,
-                "z_span_um": 0.0,
+                "x span": 20.0,
+                "y span": 20.0,
+                "z span": 0.0,
                 "angle theta": 10.0,
                 "angle phi": 0.0,
                 "align to fiber axis": True,
             }
         )
-        waveguide = component("FDTD port", uid=4)
-        waveguide["x"] = -27.0
-        waveguide["params"]["name"] = "waveguide_in"
-        waveguide["params"]["order"] = 1
         notebook, _ = generate_lumerical_notebook(
-            [grating, power_monitor, fiber, fiber_port, fiber_input_power, waveguide],
+            [grating, power_monitor, waveguide_mode, fiber, fiber_port, fiber_input_power],
             {
                 "included_layers": [[1, 0], [2, 0]],
                 "include_ports": True,
@@ -303,22 +382,27 @@ class LumericalExportTests(unittest.TestCase):
         )
         ports = assignment_value(notebook, "PORTS")
         fiber_ports = [port for port in ports if port.get("plane normal") == "Z"]
+        monitors = assignment_value(notebook, "MONITORS")
         fiber_geometries = assignment_value(notebook, "FIBER_GEOMETRIES")
-        self.assertEqual(len(ports), 3)
+        self.assertEqual(len(ports), 2)
         self.assertFalse(any(port.get("auto_generated_for_grating") for port in ports))
         self.assertEqual(len(fiber_ports), 2)
         self.assertEqual(len(fiber_geometries), 1)
         source_port = next(port for port in fiber_ports if port["name"] == "fiber_out")
+        input_port = next(port for port in fiber_ports if port["name"] == "fiber_input_power")
         self.assertEqual(source_port["angle theta"], fiber_geometries[0]["angle theta"])
         self.assertAlmostEqual(
             source_port["center"][0] - fiber_geometries[0]["center"][0],
             np.tan(np.deg2rad(10.0)),
         )
-        input_monitor = next(port for port in fiber_ports if port["name"] == "fiber_input_power")
         self.assertAlmostEqual(
-            input_monitor["center"][0] - fiber_geometries[0]["center"][0],
+            input_port["center"][0] - fiber_geometries[0]["center"][0],
             0.9 * np.tan(np.deg2rad(10.0)),
         )
+        self.assertEqual(input_port["fiber plane role"], "passive fiber measurement")
+        self.assertEqual(input_port["mode number"], 2)
+        self.assertEqual(input_port["polarization"], "Ey")
+        self.assertFalse(any(monitor["name"] == "fiber_input_power" for monitor in monitors))
         self.assertAlmostEqual(
             source_port["rotation offset_um"],
             4.0 * fiber_geometries[0]["core diameter_um"] * np.tan(np.deg2rad(10.0)),
@@ -395,6 +479,9 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn('set("alpha",0.03);', build_source)
         self.assertIn('set("alpha",0.35);', build_source)
         self.assertIn("fdtd.updateportmodes()", build_source)
+        self.assertIn("fdtd.updateportmodes(requested_mode_number)", build_source)
+        self.assertIn("Verified fiber/port concentricity", build_source)
+        self.assertIn("is not concentric", build_source)
         self.assertIn("no source or port was created", build_source)
         payload = cell_source_containing(notebook, "MATERIAL_STACK =")
         self.assertIn("'dimension': '3D'", payload)
@@ -404,9 +491,16 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("'conformal': True", payload)
         self.assertIn("GRATING_ANALYSIS =", payload)
         analysis = assignment_value(notebook, "GRATING_ANALYSIS")
-        self.assertEqual(analysis["waveguide_port_name"], "waveguide_in")
+        self.assertEqual(analysis["waveguide_power_monitor_name"], "waveguide_total_power")
+        self.assertEqual(analysis["waveguide_mode_monitor_name"], "waveguide_mode")
+        self.assertEqual(analysis["waveguide_target_neff"], 2.5)
+        self.assertEqual(analysis["waveguide_modal_direction"], "Tbackward")
         self.assertEqual(analysis["fiber_port_name"], "fiber_out")
         self.assertEqual(analysis["fiber_input_measurement_port_name"], "fiber_input_power")
+        self.assertEqual(analysis["fiber_measurement_expansion_result_name"], "expansion for port monitor")
+        self.assertIsNone(analysis["fiber_input_monitor_name"])
+        self.assertEqual(analysis["fiber_source_mode"], "mode 2")
+        self.assertEqual(analysis["fiber_polarization"], "Ey")
         self.assertEqual(analysis["frequency_points"], 31)
         settings = assignment_value(notebook, "SETTINGS")
         self.assertEqual(settings["resource_mode"], "GPU")
@@ -423,7 +517,9 @@ class LumericalExportTests(unittest.TestCase):
         resource_source = cell_source_containing(notebook, "saved pre-solve project ->")
         self.assertIn('getlicenseestimate("FDTD", "1")', resource_source)
         self.assertIn('fdtd.set("source port", str(GRATING_ANALYSIS["fiber_port_name"]))', resource_source)
-        self.assertIn('fdtd.set("source mode", "mode 1")', resource_source)
+        self.assertIn('fdtd.set("source mode", fiber_source_mode)', resource_source)
+        self.assertIn('GRATING_ANALYSIS.get("fiber_source_mode", "mode 2")', resource_source)
+        self.assertIn('GRATING_ANALYSIS.get("fiber_polarization", "Ey")', resource_source)
         self.assertIn("Backward along the tilted Z-axis fiber port", resource_source)
         self.assertIn("PIRIS_FSP_DIR / os.path.basename(REMOTE_PROJECT_FILE)", resource_source)
         self.assertNotIn("_solve_code", resource_source)
@@ -439,18 +535,42 @@ class LumericalExportTests(unittest.TestCase):
         self.assertNotIn("farfieldux", analysis_source)
         self.assertNotIn("farfielduy", analysis_source)
         self.assertIn("grating_response.png", analysis_source)
+        self.assertIn("Passive tilted fiber port — forward T_in", analysis_source)
+        self.assertIn("Passive tilted fiber-port power accounting", analysis_source)
+        self.assertIn("Source-normalized waveguide total power", analysis_source)
+        self.assertIn("Source-normalized selected waveguide-mode power", analysis_source)
+        self.assertIn("_waveguide_total_power", analysis_source)
+        self.assertIn("_waveguide_mode_power", analysis_source)
+        self.assertIn("_fiber_forward", analysis_source)
+        self.assertIn("_fiber_reflected", analysis_source)
+        self.assertIn("_fiber_net", analysis_source)
+        self.assertIn("passive tilted fiber port", analysis_source.lower())
         self.assertNotIn("grating_field_distribution.png", analysis_source)
         self.assertNotIn("field_intensity_normalized", analysis_source)
-        self.assertIn('receiver_port_path = "::model::FDTD::ports::" + waveguide_port_name', analysis_source)
-        self.assertIn('T_data = fdtd.getresult(receiver_port_path, "T")', analysis_source)
-        self.assertIn('input_path = "::model::FDTD::ports::" + str(fiber_input_measurement_port_name)', analysis_source)
-        self.assertIn("fiber_coupling = waveguide_transmission / np.maximum(fiber_input_power", analysis_source)
+        self.assertIn('waveguide_power_data = fdtd.getresult(waveguide_power_monitor_name, "T")', analysis_source)
+        self.assertIn('expansion_data = fdtd.getresult(waveguide_mode_monitor_name, expansion_result_name)', analysis_source)
+        self.assertIn('modal_direction_key = str(GRATING_ANALYSIS.get("waveguide_modal_direction", "Tbackward"))', analysis_source)
+        self.assertIn('_fiber_port_expansion(', analysis_source)
+        self.assertIn('_find_result_key(fiber_expansion, "T_in", "Tin", "T in")', analysis_source)
+        self.assertIn("fiber_coupling = waveguide_mode_power_source_normalized / np.maximum", analysis_source)
         self.assertNotIn("np.abs(scattering) ** 2", analysis_source)
-        self.assertIn("fiber port to waveguide port", analysis_source)
-        self.assertIn("fiber_coupling_db", analysis_source)
-        self.assertIn("coupling efficiency [dB]", analysis_source)
+        self.assertIn("fiber_coupling", analysis_source)
+        self.assertNotIn("fiber_coupling_db", analysis_source)
+        self.assertNotIn("coupling efficiency [dB]", analysis_source)
+        self.assertIn("Incident-normalized waveguide coupling efficiency (linear)", analysis_source)
+        self.assertIn("source-normalized linear power", analysis_source)
         self.assertIn("lam.fetch(_remote_grating_npz", analysis_source)
         self.assertIn("display(Image(filename=str(_local_response_png)", analysis_source)
+        self.assertIn('fdtd.setexpansion(result_name, input_monitor_name)', build_source)
+        self.assertIn('fdtd.set("mode selection", "fundamental mode")', build_source)
+        self.assertIn('status = fdtd.updatemodes()', build_source)
+        self.assertNotIn('fdtd.seteigensolver("use max index", 1)', build_source)
+        self.assertNotIn('fdtd.seteigensolver("number of trial modes", trial_mode_count)', build_source)
+        self.assertIn('mode_seed_project = os.path.join(REMOTE_WORK, "_max_layout_mode_seed.fsp")', build_source)
+        self.assertIn('geometry_by_layer = _layer_builder_geometry(layer_builder_x_um, layer_builder_y_um)', build_source)
+        self.assertIn('(global_vertices_um - local_origin_um) * UM', build_source)
+        self.assertNotIn('fdtd.seteigensolver("n", target_neff)', build_source)
+        self.assertNotIn('fdtd.updatemodes(mode_numbers)', build_source)
         fetch_source = cell_source_containing(notebook, "REMOTE_ARTIFACTS")
         self.assertNotIn('REMOTE_WORK + "/grating_analysis.npz"', fetch_source)
         self.assertNotIn('REMOTE_WORK + "/grating_response.png"', fetch_source)
@@ -465,6 +585,18 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("XY — top view", projection_source)
         self.assertIn("XZ — side view", projection_source)
         self.assertIn("YZ — end view", projection_source)
+        self.assertIn(
+            'fdtd.getnamed("FDTD", property_name)',
+            lumerical._GEOMETRY_PROJECTIONS_REMOTE,
+        )
+        self.assertIn(
+            '("x min", "y min", "z min", "x max", "y max", "z max")',
+            lumerical._GEOMETRY_PROJECTIONS_REMOTE,
+        )
+        self.assertIn(
+            "Run the model-build cell before rendering its geometry",
+            lumerical._GEOMETRY_PROJECTIONS_REMOTE,
+        )
         connection_source = cell_source_containing(notebook, "def solve_remote_checked")
         self.assertIn("file=_ml_sys.stdout", connection_source)
         self.assertIn("Lumerical solver log:", connection_source)
@@ -555,6 +687,10 @@ class LumericalExportTests(unittest.TestCase):
         mmi_source = cell_source_containing(notebook, "REMOTE_MMI_ANALYSIS")
         self.assertIn('input_reference_monitor_name = str(MMI_ANALYSIS["input_reference_monitor_name"])', mmi_source)
         self.assertIn("output_1_over_input", mmi_source)
+        self.assertIn("normalized power (linear)", mmi_source)
+        self.assertIn("symmetry_error_percent", mmi_source)
+        self.assertNotIn("imbalance_db", mmi_source)
+        self.assertNotIn("np.log10", mmi_source)
         self.assertIn("ideal 50/50", mmi_source)
         self.assertIn("Verified symmetric 50/50 MMI", mmi_source)
         fetch_source = cell_source_containing(notebook, "REMOTE_ARTIFACTS")
@@ -630,6 +766,7 @@ class LumericalExportTests(unittest.TestCase):
         checkout = index("products checkout")
         build = index("run_remote_checked(_remote_payload + REMOTE_MODEL_BUILDER")
         project_prefetch = index("saved pre-solve project ->")
+        port_mode_preview = index("REMOTE_PORT_MODE_PROFILES")
         project_review = index("OPEN_REMOTE_LUMERICAL_GUI")
         solve = index("_solve_code")
         save = index("REMOTE_RESULTS_SAVER")
@@ -637,6 +774,8 @@ class LumericalExportTests(unittest.TestCase):
         checkin = index("products checkin")
         close = index("lam.close()")
         self.assertLess(checkout, build)
+        self.assertLess(build, port_mode_preview)
+        self.assertLess(port_mode_preview, project_prefetch)
         self.assertLess(build, project_prefetch)
         self.assertLess(project_prefetch, project_review)
         self.assertLess(project_review, solve)
@@ -674,10 +813,51 @@ class LumericalExportTests(unittest.TestCase):
                 self.assertIn("geometry_xyz_projections.png", projections)
                 self.assertEqual(notebook["metadata"]["max_layout"]["dimension"], "3D")
 
+    def test_port_modes_are_visualized_and_checked_before_solve(self) -> None:
+        grating = component("GC-SOI", uid=1)
+        fiber_port = component("Fiber-axis FDTD port", uid=2)
+        fiber_port["params"].update({
+            "name": "fiber_source",
+            "mode": "user select",
+            "mode number": 2,
+            "polarization": "Ey",
+        })
+        waveguide_port = component("FDTD port", uid=3)
+        waveguide_port["params"]["name"] = "waveguide_receiver"
+        notebook, _ = generate_lumerical_notebook(
+            [grating, fiber_port, waveguide_port],
+            {"included_layers": [[1, 0]], "run_after_build": True},
+        )
+        sources = ["".join(cell["source"]) for cell in notebook["cells"]]
+        preview_index = next(i for i, source in enumerate(sources) if "REMOTE_PORT_MODE_PROFILES" in source)
+        solve_index = next(i for i, source in enumerate(sources) if "_solve_code" in source)
+        preview = sources[preview_index]
+        self.assertLess(preview_index, solve_index)
+        self.assertIn('getresult(result_path, "mode profiles")', preview)
+        self.assertIn("electric = np.asarray(mode_profile[candidate])", preview)
+        self.assertNotIn('if "E" in mode_profile', preview)
+        self.assertIn('vector_candidates.append("E%d" % int(preferred_mode_number))', preview)
+        self.assertIn("key[0] == \"E\" and key[1:].isdigit()", preview)
+        self.assertIn("preferred_mode_number = max(0, int(profile_object.get(\"mode number\", 0)))", preview)
+        self.assertIn('"|Ex|"', preview)
+        self.assertIn('"|Ey|"', preview)
+        self.assertIn("PORT_POLARIZATION_VALID", preview)
+        self.assertIn("PORT_MODE_CONFINEMENT_VALID", preview)
+        self.assertIn("edge_fraction > 0.05", preview)
+        self.assertIn("PORT_MODE_VALID", preview)
+        self.assertIn("not Ey-dominant", preview)
+        self.assertIn('str(GRATING_ANALYSIS["waveguide_mode_monitor_name"])', preview)
+        self.assertIn('"Waveguide fundamental mode"', preview)
+        self.assertIn('WAVEGUIDE_MODE_SELECTIONS.get(object_name, {})', preview)
+        self.assertIn("lam.show(PORT_MODE_PROFILES_FILE", preview)
+        fetch = cell_source_containing(notebook, "REMOTE_ARTIFACTS")
+        self.assertIn("port_mode_Ex_Ey.png", fetch)
+
     def test_embedded_remote_programs_compile(self) -> None:
         for name in (
             "_BUILD_CELL",
             "_GEOMETRY_PROJECTIONS_REMOTE",
+            "_PORT_MODE_PROFILES_REMOTE",
             "_REMOTE_RESOURCE_AND_SAVE",
             "_SAVE_REMOTE_RESULTS",
             "_GRATING_ANALYSIS_REMOTE",

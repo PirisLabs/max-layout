@@ -124,6 +124,14 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                      'fiber_offset_after_taper_um': 5.0,
                      'fiber_power_monitor_below_source_um': 0.1,
                      'fdtd_port_offset_from_waveguide_end_um': 2.0,
+                     'waveguide_monitor_span_um': 2.5,
+                     'waveguide_total_power_before_mode_um': 1.0,
+                     # TFLN ridge/slab guides are typically near 2.0.  This
+                     # value validates the automatically selected fundamental
+                     # mode; it is not used to force an eigensolver mode.
+                     'waveguide_effective_index': 2.0,
+                     'waveguide_neff_tolerance': 0.3,
+                     'waveguide_mode_search_count': 20,
                      'layer': 2,
                      'datatype': 0,
                      'tolerance': 0.0005,
@@ -762,6 +770,11 @@ DEFAULT_COMPONENT_VALUES["GC-SOI"] = {
     "fiber_length_um": 20.0,
     "fiber_power_monitor_below_source_um": 0.1,
     "fdtd_port_offset_from_waveguide_end_um": 2.0,
+    "waveguide_monitor_span_um": 2.5,
+    "waveguide_total_power_before_mode_um": 1.0,
+    "waveguide_effective_index": 2.5,
+    "waveguide_neff_tolerance": 0.3,
+    "waveguide_mode_search_count": 20,
     "slab_layer": PHOTONIC_LAYER,
     "slab_datatype": DEFAULT_DATATYPE,
     "etched_layer": GC_LAYER,
@@ -801,7 +814,8 @@ DEFAULT_COMPONENT_VALUES.update(
         "Fiber-axis FDTD port": {
             "name": "opt_1", "dir": "Bidirectional", "loc": 0.5, "pos": "Top", "order": 1,
             "port geometry": "surface", "plane normal": "Z", "distance_um": 0.0, "z reference": "top of stack",
-            "span_um": 20.0, "z_span_um": 0.0, "mode": "fundamental mode",
+            "span_um": 20.0, "z_span_um": 0.0, "mode": "user select",
+            "mode number": 2, "polarization": "Ey",
             "angle theta": 7.0, "angle phi": 0.0,
             "align to fiber axis": True,
             "rotation offset_um": 4.420244193,
@@ -828,6 +842,8 @@ DEFAULT_COMPONENT_VALUES.update(
         "Mode expansion monitor": {
             "name": "mode_expansion", "monitor geometry": "surface", "plane normal": "X", "distance_um": 0.0,
             "x span": 0.0, "y span": 4.0, "z span": 2.0, "mode": "fundamental TE mode",
+            "target neff": 2.5, "neff tolerance": 0.3, "mode search count": 20,
+            "expansion for": "",
         },
         "Field profile monitor": {
             "name": "field_profile", "monitor geometry": "surface", "plane normal": "X", "distance_um": 0.0,
@@ -837,6 +853,10 @@ DEFAULT_COMPONENT_VALUES.update(
 )
 
 INTEGER_PARAMETERS.add("order")
+
+INTEGER_PARAMETERS.add("waveguide_mode_search_count")
+
+INTEGER_PARAMETERS.add("mode search count")
 
 BOOL_PARAMETERS.add("align to fiber axis")
 
