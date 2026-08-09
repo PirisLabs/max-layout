@@ -4,6 +4,7 @@ from copy import deepcopy
 import base64
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 import zlib
 
@@ -23,6 +24,7 @@ from max_layout.lumerical import (
     sweepable_component_parameters,
 )
 from max_layout.ui.lumerical_dialog import (
+    CrossSectionDomainPreview,
     _anchored_stack_ranges,
     _conformal_fill_start,
     _sidewall_face_points,
@@ -65,7 +67,275 @@ def assignment_value(notebook: dict, name: str):
     raise AssertionError(f"No notebook assignment named {name!r}")
 
 
+def decoded_sweep_cases(notebook: dict) -> list[dict]:
+    encoded = assignment_value(notebook, "_SWEEP_CASES_B64")
+    return json.loads(zlib.decompress(base64.b64decode(encoded)).decode("utf-8"))
+
+
+def soi_sweep_cases() -> tuple[list[dict], dict]:
+    """Build a small, realistic GC-SOI Cartesian sweep export fixture."""
+    from max_layout.ui.window import NativeLayoutWindow
+
+    class Factory:
+        make_component = NativeLayoutWindow.make_component
+        automatic_simulation_companions = (
+            NativeLayoutWindow.automatic_simulation_companions
+        )
+        synchronize_automatic_simulation_companions = (
+            NativeLayoutWindow.synchronize_automatic_simulation_companions
+        )
+
+        def __init__(self) -> None:
+            self.components = []
+            self.next_uid = 1
+
+    factory = Factory()
+    grating = factory.make_component("GC-SOI", 0.0, 0.0)
+    factory.components.append(grating)
+    factory.components.extend(factory.automatic_simulation_companions(grating))
+    spec = normalize_lumerical_sweep_spec(
+        grating,
+        [
+            {"parameter": "pitch", "values": [0.65, 0.75]},
+            {"parameter": "duty_cycle", "values": [0.46, 0.56]},
+        ],
+    )
+    cases = []
+    for values in expand_lumerical_sweep_points(spec):
+        variant_components = deepcopy(factory.components)
+        variant_grating = next(
+            item for item in variant_components if item["uid"] == grating["uid"]
+        )
+        variant_grating["params"].update(values)
+        variant_factory = Factory()
+        variant_factory.components = variant_components
+        variant_factory.next_uid = 1 + max(item["uid"] for item in variant_components)
+        variant_factory.synchronize_automatic_simulation_companions(variant_grating)
+        cases.append({"values": values, "components": variant_factory.components})
+    return cases, spec
+
+
+def mmi_sweep_cases() -> tuple[list[dict], dict]:
+    """Build a two-point 1x2 MMI sweep with its automatic simulation setup."""
+    from max_layout.ui.window import NativeLayoutWindow
+
+    class Factory:
+        make_component = NativeLayoutWindow.make_component
+        automatic_simulation_companions = (
+            NativeLayoutWindow.automatic_simulation_companions
+        )
+        synchronize_automatic_simulation_companions = (
+            NativeLayoutWindow.synchronize_automatic_simulation_companions
+        )
+
+        def __init__(self) -> None:
+            self.components = []
+            self.next_uid = 1
+
+    factory = Factory()
+    mmi = factory.make_component("1x2 MMI", 0.0, 0.0)
+    mmi["params"]["add_grating_couplers"] = False
+    factory.components.append(mmi)
+    factory.components.extend(factory.automatic_simulation_companions(mmi))
+    spec = normalize_lumerical_sweep_spec(
+        mmi,
+        [{"parameter": "mmi_length", "values": [29.0, 31.0]}],
+    )
+    cases = []
+    for values in expand_lumerical_sweep_points(spec):
+        variant_components = deepcopy(factory.components)
+        variant_mmi = next(
+            item for item in variant_components if item["uid"] == mmi["uid"]
+        )
+        apply_lumerical_sweep_values(variant_mmi, values)
+        variant_factory = Factory()
+        variant_factory.components = variant_components
+        variant_factory.next_uid = 1 + max(
+            item["uid"] for item in variant_components
+        )
+        variant_factory.synchronize_automatic_simulation_companions(variant_mmi)
+        cases.append({"values": values, "components": variant_factory.components})
+    return cases, spec
+
+
 class LumericalExportTests(unittest.TestCase):
+    def test_every_lumerical_result_path_writes_and_fetches_summary_txt(self) -> None:
+        straight = component("Straight")
+        notebook, _ = generate_lumerical_notebook(
+            [straight],
+            {
+                "included_layers": [(1, 0)],
+                "material_stack": lumerical.default_stack("TFLN on SiO2"),
+                "run_after_build": True,
+                "project_file": "straight_summary.fsp",
+            },
+        )
+        save_source = cell_source_containing(notebook, "REMOTE_RESULTS_SAVER")
+        fetch_source = cell_source_containing(notebook, "REMOTE_ARTIFACTS")
+        build_source = cell_source_containing(notebook, "REMOTE_MODEL_BUILDER")
+        self.assertIn('REMOTE_TEXT_SUMMARY = os.path.join(REMOTE_WORK, "summary.txt")', save_source)
+        self.assertIn("Exact source parameters (JSON)", save_source)
+        single_headings = (
+            "PROJECT",
+            "PARAMETERS",
+            "MATERIAL STACK AND MESH",
+            "SIMULATION SETTINGS",
+            "SOURCES / PORTS / MONITORS",
+            "RESULTS SUMMARY",
+            "WARNINGS / NOTES",
+        )
+        for heading in single_headings:
+            self.assertIn('"%s"' % heading, save_source)
+        self.assertEqual(
+            list(map(save_source.index, ('"%s"' % heading for heading in single_headings))),
+            sorted(map(save_source.index, ('"%s"' % heading for heading in single_headings))),
+        )
+        self.assertIn('("pitch", "Pitch", "um")', save_source)
+        self.assertIn('("fiber_offset", "Fiber offset", "um")', save_source)
+        self.assertIn('("angle_theta", "Fiber angle theta", "deg")', save_source)
+        self.assertIn("slab_extent", save_source)
+        self.assertIn("geometry/PML overlap", save_source)
+        self.assertIn("Generic numeric providers saved", save_source)
+        self.assertIn('REMOTE_WORK + "/summary.txt"', fetch_source)
+        self.assertIn("SOURCE_COMPONENTS_JSON = ' + repr(SOURCE_COMPONENTS_JSON)", build_source)
+
+        sweep_cases, sweep_spec = soi_sweep_cases()
+        sweep_configuration = {
+            "included_layers": [(1, 0), (2, 0)],
+            "material_stack": lumerical.default_stack("SOI grating coupler (Ansys)"),
+            "wavelength_start_um": 1.50,
+            "wavelength_stop_um": 1.60,
+            "run_after_build": True,
+        }
+        sequential, _ = generate_lumerical_sweep_notebook(
+            sweep_cases, sweep_configuration, sweep_spec
+        )
+        sequential_source = "\n".join(
+            "".join(cell.get("source", [])) for cell in sequential["cells"]
+        )
+        self.assertIn('SWEEP_TEXT_SUMMARY = os.path.join(results_root, "summary.txt")', sequential_source)
+        self.assertIn("Peak-best case:", sequential_source)
+        self.assertIn("Peak-best exact source parameters (JSON):", sequential_source)
+        self.assertIn("Target-best case at", sequential_source)
+        self.assertIn("SWEEP DEFINITION", sequential_source)
+        self.assertIn("FSP PROVENANCE", sequential_source)
+        self.assertIn("per_case_fsp_saved=false", sequential_source)
+        self.assertIn("_local_text_summary = PIRIS_RESULTS_DIR / \"summary.txt\"", sequential_source)
+        self.assertIn("SWEEP_NOMINAL_PARAMETERS = ' + repr(SWEEP_NOMINAL_PARAMETERS)", sequential_source)
+
+        multigpu, _ = lumerical.generate_lumerical_multigpu_sweep_notebook(
+            sweep_cases,
+            {**sweep_configuration, "lumerical_multigpu": {"node_count": 2}},
+            sweep_spec,
+        )
+        multigpu_source = "\n".join(
+            "".join(cell.get("source", [])) for cell in multigpu["cells"]
+        )
+        self.assertIn("SWEEP_TEXT_SUMMARY", multigpu_source)
+        self.assertIn("'MATERIAL_STACK': MATERIAL_STACK", multigpu_source)
+        self.assertIn("'SWEEP_NOMINAL_PARAMETERS': SWEEP_NOMINAL_PARAMETERS", multigpu_source)
+        self.assertIn("lumerical_sweep_multithread_results.json", multigpu_source)
+        self.assertIn("_local_text_summary = PIRIS_RESULTS_DIR / \"summary.txt\"", multigpu_source)
+
+    def test_sweep_summary_txt_records_complete_winning_source_parameters(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            cases = [
+                {
+                    "values": {"pitch": 0.77},
+                    "source_parameters": {
+                        "pitch": 0.77, "fill_factor": 0.43, "N": 31,
+                        "fiber_offset": 4.8, "angle_theta": 7.0,
+                    },
+                    "display_label": "P=0.77",
+                    "result_stem": "CE-P=0.77",
+                    "mmi_analysis": None,
+                },
+                {
+                    "values": {"pitch": 0.81},
+                    "source_parameters": {
+                        "pitch": 0.81, "fill_factor": 0.43, "N": 31,
+                        "fiber_offset": 4.8, "angle_theta": 7.0,
+                    },
+                    "display_label": "P=0.81",
+                    "result_stem": "CE-P=0.81",
+                    "mmi_analysis": None,
+                },
+            ]
+            namespace = {
+                "REMOTE_WORK": temporary_directory,
+                "SWEEP_SHARED_CHECKPOINT_DIR": str(Path(temporary_directory) / "checkpoints"),
+                "SWEEP_HASH": "summary-contract",
+                "SWEEP_CASES": cases,
+                "SWEEP_SPEC": {
+                    "component_uid": 9,
+                    "component_kind": "Grating coupler",
+                    "axes": [{
+                        "parameter": "pitch", "short_name": "P",
+                        "values": [0.77, 0.81],
+                    }],
+                },
+                "SWEEP_NOMINAL_PARAMETERS": deepcopy(cases[0]["source_parameters"]),
+                "SOURCE_COMPONENTS_JSON": [{
+                    "uid": 9, "kind": "Grating coupler",
+                    "params": deepcopy(cases[0]["source_parameters"]),
+                }],
+                "SETTINGS": {
+                    "wavelength_start_um": 1.25, "wavelength_stop_um": 1.35,
+                    "frequency_points": 3, "resource_mode": "GPU",
+                },
+                "MATERIAL_STACK": lumerical.default_stack("TFLN on SiO2"),
+                "BOUNDING_BOX_UM": [-2.0, -5.0, 20.0, 5.0],
+                "PORTS": [],
+                "FIBER_GEOMETRIES": [],
+                "MONITORS": [],
+                "GRATING_ANALYSIS": {"component_uid": 9},
+                "MMI_ANALYSIS": None,
+            }
+            exec(lumerical._SWEEP_RUNTIME_REMOTE, namespace)
+            wavelength_m = np.asarray([1.25e-6, 1.30e-6, 1.35e-6])
+            namespace["_save_sweep_case"](
+                0, "coupling_efficiency", wavelength_m,
+                np.asarray([0.20, 0.60, 0.25]), {},
+            )
+            namespace["_save_sweep_case"](
+                1, "coupling_efficiency", wavelength_m,
+                np.asarray([0.70, 0.55, 0.40]), {},
+            )
+            namespace["_finalize_sweep_results"]([])
+            summary = (Path(temporary_directory) / "summary.txt").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertIn("completed=2 | failed=0", summary)
+        headings = (
+            "PROJECT",
+            "PARAMETERS",
+            "SWEEP DEFINITION",
+            "MATERIAL STACK AND MESH",
+            "SIMULATION SETTINGS",
+            "SOURCES / PORTS / MONITORS",
+            "RESULTS SUMMARY",
+            "WARNINGS / NOTES",
+            "FSP PROVENANCE",
+        )
+        positions = [summary.index("\n" + heading + "\n") for heading in headings]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("Peak-best case: index=2", summary)
+        self.assertIn('swept parameters={"pitch":0.81}', summary)
+        self.assertIn("Target-best case at 1300 nm: index=1", summary)
+        self.assertIn('swept parameters={"pitch":0.77} | value=0.6 (60%)', summary)
+        self.assertIn("- Pitch: 0.81 um", summary)
+        self.assertIn("- Fill factor: 0.43", summary)
+        self.assertIn("- Number of grating periods: 31", summary)
+        self.assertIn("- Fiber offset: 4.8 um", summary)
+        self.assertIn("- Fiber angle theta: 7 deg", summary)
+        self.assertIn('"fill_factor":0.43', summary)
+        self.assertIn('"fiber_offset":4.8', summary)
+        self.assertIn('"angle_theta":7.0', summary)
+        self.assertIn("peak=0.7 (70%) at 1250 nm", summary)
+        self.assertIn("value at target 1300 nm=0.55 (55%)", summary)
+        self.assertIn("per_case_fsp_saved=false", summary)
+
     def test_3d_preview_sidewall_faces_match_middle_reference(self) -> None:
         square = np.asarray([[-2.0, -2.0], [2.0, -2.0], [2.0, 2.0], [-2.0, 2.0]])
 
@@ -135,18 +405,229 @@ class LumericalExportTests(unittest.TestCase):
             [2.5, 2.5],
         )
 
-    def test_scalar_fill_sweep_disables_apodization_only_in_temporary_copy(self) -> None:
+    def test_apodized_grating_rejects_scalar_fill_sweep_and_preserves_pitch_sweep(self) -> None:
         original = component("GC-SOI")
         original["params"]["fill_factors"] = "linspace(0.30, 0.50)"
         temporary = deepcopy(original)
-        apply_lumerical_sweep_values(temporary, {"duty_cycle": 0.46})
-        self.assertEqual(temporary["params"]["duty_cycle"], 0.46)
-        self.assertEqual(temporary["params"]["fill_factors"], "")
+        self.assertNotIn(
+            "duty_cycle",
+            {
+                item["parameter"]
+                for item in sweepable_component_parameters(temporary)
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "apodization array"):
+            apply_lumerical_sweep_values(temporary, {"duty_cycle": 0.46})
+        apply_lumerical_sweep_values(temporary, {"pitch": 0.713})
+        self.assertEqual(temporary["params"]["pitch"], 0.713)
+        self.assertEqual(
+            temporary["params"]["fill_factors"], "linspace(0.30, 0.50)"
+        )
         self.assertEqual(original["params"]["fill_factors"], "linspace(0.30, 0.50)")
+
+    def test_grating_geometry_requires_explicit_project_pitch_fill_and_count(self) -> None:
+        generic = component("Grating coupler")
+        for missing in ("pitch", "fill_factor", "N"):
+            broken = deepcopy(generic)
+            broken["params"].pop(missing)
+            with self.assertRaises((KeyError, ValueError), msg=missing):
+                component_geometry_arrays(broken)
+
+        soi = component("GC-SOI")
+        for missing in ("pitch", "duty_cycle"):
+            broken = deepcopy(soi)
+            broken["params"].pop(missing)
+            with self.assertRaisesRegex(ValueError, missing):
+                component_geometry_arrays(broken)
+
+    def test_nondefault_grating_json_is_embedded_without_geometry_defaults(self) -> None:
+        generic = component("Grating coupler")
+        generic["params"].update(
+            {"pitch": 0.9137, "fill_factor": 0.317, "N": 4}
+        )
+        generic_notebook, _ = generate_lumerical_notebook(
+            [generic], {"included_layers": [[1, 0], [2, 0]]}
+        )
+        generic_source = assignment_value(
+            generic_notebook, "SOURCE_COMPONENTS_JSON"
+        )[0]["params"]
+        self.assertEqual(generic_source["pitch"], 0.9137)
+        self.assertEqual(generic_source["fill_factor"], 0.317)
+        self.assertEqual(generic_source["N"], 4)
+
+        soi = component("GC-SOI")
+        soi["params"].update(
+            {"pitch": 0.7319, "duty_cycle": 0.437, "target_length": 2.5}
+        )
+        soi_notebook, _ = generate_lumerical_notebook(
+            [soi], {"included_layers": [[1, 0], [2, 0]]}
+        )
+        soi_source = assignment_value(
+            soi_notebook, "SOURCE_COMPONENTS_JSON"
+        )[0]["params"]
+        self.assertEqual(soi_source["pitch"], 0.7319)
+        self.assertEqual(soi_source["duty_cycle"], 0.437)
+        self.assertEqual(soi_source["target_length"], 2.5)
+
+    def test_sweep_inspection_model_uses_untouched_nominal_json(self) -> None:
+        nominal = component("Grating coupler")
+        nominal["params"].update(
+            {"pitch": 0.9137, "fill_factor": 0.317, "N": 4}
+        )
+        spec = normalize_lumerical_sweep_spec(
+            nominal, [{"parameter": "pitch", "values": [0.78, 0.82]}]
+        )
+        cases = []
+        for values in expand_lumerical_sweep_points(spec):
+            variant = deepcopy(nominal)
+            apply_lumerical_sweep_values(variant, values)
+            cases.append({"values": values, "components": [variant]})
+        configuration = {
+            "included_layers": [[1, 0], [2, 0]],
+            "material_stack": lumerical.default_stack("TFLN on SiO2"),
+            "run_after_build": True,
+            "resource_mode": "GPU",
+        }
+        single, _ = generate_lumerical_notebook([nominal], configuration)
+        sequential, _ = generate_lumerical_sweep_notebook(
+            cases,
+            configuration,
+            spec,
+            nominal_components=[deepcopy(nominal)],
+        )
+        multigpu, _ = lumerical.generate_lumerical_multigpu_sweep_notebook(
+            cases,
+            configuration,
+            spec,
+            nominal_components=[deepcopy(nominal)],
+        )
+
+        for notebook in (sequential, multigpu):
+            self.assertEqual(
+                assignment_value(notebook, "SWEEP_NOMINAL_PARAMETERS")["pitch"],
+                0.9137,
+            )
+            self.assertEqual(
+                assignment_value(notebook, "SOURCE_COMPONENTS_JSON")[0]["params"]["fill_factor"],
+                0.317,
+            )
+            self.assertEqual(
+                assignment_value(notebook, "GEOMETRY"),
+                assignment_value(single, "GEOMETRY"),
+            )
+            remote_cases = decoded_sweep_cases(notebook)
+            self.assertEqual(
+                [case["source_parameters"]["pitch"] for case in remote_cases],
+                [0.78, 0.82],
+            )
+            self.assertEqual(
+                [case["source_parameters"]["fill_factor"] for case in remote_cases],
+                [0.317, 0.317],
+            )
 
     def test_grating_platforms_have_distinct_neff_validation_defaults(self) -> None:
         self.assertEqual(component("Grating coupler")["params"]["waveguide_effective_index"], 2.0)
         self.assertEqual(component("GC-SOI")["params"]["waveguide_effective_index"], 2.5)
+
+    def test_standard_tfln_grating_and_stack_defaults(self) -> None:
+        params = component("Grating coupler")["params"]
+        self.assertEqual(params["pitch"], 0.8)
+        self.assertEqual(params["fill_factor"], 0.5)
+
+        stack = lumerical.default_stack("TFLN on SiO2")
+        cross_section = next(
+            row for row in stack if row["name"] == "Exported TFLN cross-section"
+        )
+        self.assertEqual(cross_section["sidewall_angle_deg"], 79.0)
+
+    def test_mmi_default_stack_is_three_micron_bottom_oxide_without_silicon(self) -> None:
+        stack = lumerical.default_stack("TFLN MMI (3 um SiO2)")
+        self.assertEqual(stack[0]["name"], "Bottom SiO2")
+        self.assertEqual(stack[0]["material"], "SiO2 (Glass) - Palik")
+        self.assertEqual(stack[0]["thickness_um"], 3.0)
+        self.assertFalse(
+            any(row["material"] == "Si (Silicon) - Palik" for row in stack)
+        )
+
+        from max_layout.ui.window import mmi_lumerical_export_settings
+
+        migrated = mmi_lumerical_export_settings(
+            {
+                "stack_preset": "TFLN on SiO2",
+                "material_stack": lumerical.default_stack("TFLN on SiO2"),
+                "frequency_points": 9,
+            }
+        )
+        self.assertEqual(migrated["stack_preset"], "TFLN MMI (3 um SiO2)")
+        self.assertEqual(migrated["material_stack"][0]["thickness_um"], 3.0)
+        self.assertEqual(migrated["frequency_points"], 9)
+
+        customized_stack = lumerical.default_stack("TFLN on SiO2")
+        customized_stack[1]["thickness_um"] = 4.0
+        preserved = mmi_lumerical_export_settings(
+            {
+                "stack_preset": "TFLN on SiO2",
+                "material_stack": customized_stack,
+            }
+        )
+        self.assertEqual(preserved["material_stack"][1]["thickness_um"], 4.0)
+
+    def test_fdtd_domain_preview_has_stack_xz_and_true_gds_xy_views(self) -> None:
+        source = Path("src/max_layout/ui/lumerical_dialog.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'self.xz_cross_section_preview = CrossSectionDomainPreview(self, "XZ")',
+            source,
+        )
+        self.assertIn(
+            'self.xy_top_view_preview = CrossSectionDomainPreview(self, "XY")',
+            source,
+        )
+        self.assertNotIn('CrossSectionDomainPreview(self, "YZ")', source)
+        self.assertIn("self.cross_section_previews = (", source)
+        self.assertIn("for preview in self.cross_section_previews:", source)
+        self.assertNotIn("self.preview_plane = QComboBox()", source)
+        self.assertIn('for points, layer in state["polygons"]:', source)
+        self.assertIn("painter.drawPolygon(polygon)", source)
+        self.assertIn("XY · TOP / GDS view", source)
+        self.assertIn("self.domain_center_spins", source)
+        self.assertIn("self.domain_size_spins", source)
+        self.assertIn("def _set_domain_center_or_size", source)
+        self.assertIn(
+            "share the same X-min/X-max values",
+            source,
+        )
+
+        state = {
+            "x_base": (-4.0, 8.0),
+            "y_base": (-3.0, 5.0),
+            "z_base": (-1.0, 2.0),
+            "padding": {
+                "x_min": 1.0,
+                "x_max": 2.0,
+                "y_min": 3.0,
+                "y_max": 4.0,
+                "z_min": 5.0,
+                "z_max": 6.0,
+            },
+        }
+
+        class Projection:
+            plane = "XY"
+
+        horizontal, vertical, _h_base, _v_base, xy_domain = (
+            CrossSectionDomainPreview._projection_state(Projection(), state)
+        )
+        self.assertEqual((horizontal, vertical), ("x", "y"))
+        self.assertEqual(xy_domain, (-5.0, 10.0, -6.0, 9.0))
+
+        Projection.plane = "XZ"
+        horizontal, vertical, _h_base, _v_base, xz_domain = (
+            CrossSectionDomainPreview._projection_state(Projection(), state)
+        )
+        self.assertEqual((horizontal, vertical), ("x", "z"))
+        self.assertEqual(xz_domain, (-5.0, 10.0, -6.0, 8.0))
 
     def test_official_soi_grating_component_and_stack_defaults(self) -> None:
         grating = component("GC-SOI")
@@ -156,8 +637,9 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(params["target_length"], 25.0)
         self.assertEqual(params["h_total"], 0.22)
         self.assertEqual(params["etch_depth"], 0.10)
-        self.assertEqual(params["fiber_tilt_deg"], 10.0)
-        self.assertEqual(params["fiber_x_from_grating_start_um"], 2.74533)
+        self.assertEqual(params["angle_theta"], 10.0)
+        self.assertNotIn("fiber_tilt_deg", params)
+        self.assertEqual(params["fiber_offset"], 2.74533)
         self.assertEqual(params["tolerance"], 0.005)
         self.assertEqual(params["fdtd_port_offset_from_waveguide_end_um"], 2.0)
         self.assertEqual(params["waveguide_monitor_span_um"], 2.5)
@@ -543,6 +1025,551 @@ class LumericalExportTests(unittest.TestCase):
         )
         self.assertIn("variant_components = copy.deepcopy(export_components)", window_source)
 
+    def test_multigpu_sweep_is_separate_parallel_resumable_export(self) -> None:
+        sweep_cases, spec = soi_sweep_cases()
+        configuration = {
+            "included_layers": [[1, 0], [2, 0]],
+            "material_stack": lumerical.default_stack("SOI grating coupler (Ansys)"),
+            "wavelength_start_um": 1.50,
+            "wavelength_stop_um": 1.60,
+            "frequency_points": 11,
+            "resource_mode": "GPU",
+            "run_after_build": True,
+            "project_file": "gc_soi_sweep_multigpu.fsp",
+        }
+
+        notebook, warnings = lumerical.generate_lumerical_multigpu_sweep_notebook(
+            sweep_cases, configuration, spec
+        )
+        self.assertTrue(any("Layout origin moved" in warning for warning in warnings))
+        for index, cell in enumerate(notebook["cells"]):
+            if cell["cell_type"] == "code":
+                compile(
+                    "".join(cell["source"]),
+                    f"<multi-GPU sweep notebook cell {index}>",
+                    "exec",
+                )
+
+        metadata = notebook["metadata"]["max_layout"]
+        self.assertEqual(metadata["export"], "lumerical-fdtd-sweep-multigpu")
+        self.assertEqual(metadata["execution"], "multi-node-parallel-workers")
+        self.assertEqual(metadata["point_count"], 4)
+        self.assertEqual(metadata["nominal_fsp_count"], 1)
+        self.assertFalse(metadata["per_point_fsp"])
+        self.assertEqual(
+            metadata["lumerical_multigpu"],
+            {
+                "node_count": 8,
+                "simulations_per_gpu": 1,
+                "max_parallel_simulations": 8,
+            },
+        )
+        self.assertEqual(
+            assignment_value(notebook, "MULTIGPU_SETTINGS"),
+            metadata["lumerical_multigpu"],
+        )
+
+        all_source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"]
+        )
+        lower_source = all_source.lower()
+        self.assertIn("SHARED_NOMINAL_FSP", all_source)
+        self.assertIn("SWEEP_SHARED_CHECKPOINT_DIR", all_source)
+        self.assertIn("ThreadPoolExecutor", all_source)
+        self.assertIn("as_completed", all_source)
+        self.assertRegex(lower_source, r"worker[^\n]{0,100}(work|workspace|remote_work)")
+        self.assertRegex(lower_source, r"(worker_index|worker_id|worker_slot)")
+        self.assertRegex(
+            lower_source,
+            r"(os\.path\.join|path\()[^\n]{0,180}worker",
+        )
+        self.assertIn("Reusing completed sweep checkpoint", all_source)
+        self.assertIn("os.path.isfile(case_path)", all_source)
+        self.assertIn('fdtd.setresource("FDTD", 1, "active", False)', all_source)
+        self.assertIn("finally:\n    for record in MULTIGPU_WORKER_RECORDS", all_source)
+        self.assertIn("_cleanup_worker(record)", all_source)
+        self.assertIn("FDTD STOP UNCONFIRMED; HPC Packs were NOT returned", all_source)
+        self.assertIn("_finalize_sweep_results", all_source)
+        self.assertIn("MULTIGPU_FATAL_ERRORS", all_source)
+        self.assertIn("checkpoint_schema", all_source)
+        self.assertIn("SWEEP_RUNTIME_VERSION", all_source)
+        self.assertIn("socket.gethostname()", all_source)
+        self.assertIn("uuid.uuid4().hex", all_source)
+        self.assertIn("stop_work_processes(timeout=25)", all_source)
+        self.assertIn("_multigpu_run_once_checked", all_source)
+        self.assertIn("remaining_pids", all_source)
+        self.assertRegex(
+            lower_source,
+            r"(release|return|check.?in)[^\n]{0,100}(licen[cs]e|hpc pack)",
+        )
+        self.assertIn("one simulation per gpu", lower_source)
+        self.assertIn("same-gpu oversubscription is intentionally disabled", lower_source)
+
+        inventory_cell = next(
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if "Inventory preflight complete" in "".join(cell.get("source", []))
+        )
+        orchestration_cell = next(
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if "Acquire licences only now" in "".join(cell.get("source", []))
+        )
+        recovery_cell = next(
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if "Idempotent emergency cleanup" in "".join(cell.get("source", []))
+        )
+        self.assertNotIn("_multigpu_run_checked(\n    lam, MULTIGPU_LICENSE_CHECKOUT_REMOTE", inventory_cell)
+        self.assertIn("Lambda.run_once", inventory_cell)
+        self.assertIn("Lambda.stop_work_processes", inventory_cell)
+        self.assertIn('("run_once", "stop_work_processes")', inventory_cell)
+        self.assertIn("MULTIGPU_LICENSE_CHECKOUT_REMOTE", orchestration_cell)
+        self.assertIn(
+            "_multigpu_run_once_checked(client, MULTIGPU_LICENSE_RELEASE_REMOTE",
+            orchestration_cell,
+        )
+        self.assertIn("_client.stop_work_processes(timeout=25)", recovery_cell)
+        self.assertIn(
+            "_release_output = _multigpu_run_once_checked(", recovery_cell
+        )
+        self.assertLess(
+            recovery_cell.index("_release_output = _multigpu_run_once_checked("),
+            recovery_cell.index("_client.close()"),
+        )
+        shared_fsp_cell_index = next(
+            index
+            for index, cell in enumerate(notebook["cells"])
+            if "SHARED_NOMINAL_FSP = REMOTE_PROJECT_FILE" in "".join(cell.get("source", []))
+        )
+        orchestration_cell_index = next(
+            index
+            for index, cell in enumerate(notebook["cells"])
+            if "Acquire licences only now" in "".join(cell.get("source", []))
+        )
+        self.assertLess(shared_fsp_cell_index, orchestration_cell_index)
+
+        # The original one-session exporter remains an independent path.
+        sequential, _ = generate_lumerical_sweep_notebook(
+            sweep_cases, configuration, spec
+        )
+        sequential_metadata = sequential["metadata"]["max_layout"]
+        self.assertEqual(sequential_metadata["export"], "lumerical-fdtd-sweep")
+        self.assertEqual(
+            sequential_metadata["execution"], "one-session-layer-builder-hot-swap"
+        )
+        self.assertNotIn("lumerical_multigpu", sequential_metadata)
+        sequential_source = "\n".join(
+            "".join(cell.get("source", [])) for cell in sequential["cells"]
+        )
+        self.assertNotIn("ThreadPoolExecutor", sequential_source)
+
+        window_source = Path("src/max_layout/ui/window.py").read_text(encoding="utf-8")
+        self.assertGreaterEqual(
+            window_source.count('addAction("Lumerical sweep-multithread…")'), 2
+        )
+        self.assertIn(
+            "def export_lumerical_multigpu_sweep_notebook", window_source
+        )
+
+    def test_sequential_sweep_schema_failure_cancels_then_resets_cpu_and_raises(self) -> None:
+        source = lumerical._SWEEP_RUNNER_REMOTE
+
+        schema_handler = source.index("except SweepResultSchemaError as exc:")
+        cancellation = source.index("remaining solves were cancelled", schema_handler)
+        loop_break = source.index("        break", cancellation)
+        cpu_reset = source.index(
+            'fdtd.setresource("FDTD", 2, "device type", "CPU")', loop_break
+        )
+        final_schema_guard = source.index("if schema_failure is not None:", cpu_reset)
+        final_raise = source.index("    raise RuntimeError(", final_schema_guard)
+
+        self.assertLess(schema_handler, cancellation)
+        self.assertLess(cancellation, loop_break)
+        self.assertLess(loop_break, cpu_reset)
+        self.assertLess(cpu_reset, final_schema_guard)
+        self.assertLess(final_schema_guard, final_raise)
+        self.assertIn("if schema_failure is None:\n    _finalize_sweep_results(failures)", source)
+
+    def test_multigpu_sweep_preflights_one_result_schema_before_queue_submission(self) -> None:
+        sweep_cases, spec = soi_sweep_cases()
+        configuration = {
+            "included_layers": [[1, 0], [2, 0]],
+            "material_stack": lumerical.default_stack("SOI grating coupler (Ansys)"),
+            "resource_mode": "GPU",
+            "run_after_build": True,
+        }
+        notebook, _ = lumerical.generate_lumerical_multigpu_sweep_notebook(
+            sweep_cases, configuration, spec
+        )
+        orchestration = cell_source_containing(notebook, "Result-schema preflight")
+
+        preflight_solve = orchestration.index("'Result-schema preflight — '")
+        queue_filter = orchestration.index(
+            "if case_index != schema_preflight_index:", preflight_solve
+        )
+        queue_fill = orchestration.index("_case_queue.put(case_index)", queue_filter)
+        worker_submission = orchestration.index(
+            "pool.submit(_worker_loop, record)", queue_fill
+        )
+
+        self.assertEqual(orchestration.count("'Result-schema preflight — '"), 1)
+        self.assertIn("schema_preflight_index = 0", orchestration)
+        self.assertLess(preflight_solve, queue_filter)
+        self.assertLess(queue_filter, queue_fill)
+        self.assertLess(queue_fill, worker_submission)
+        self.assertIn(
+            "Result-schema preflight passed; its checkpoint will be reused during aggregation.",
+            orchestration,
+        )
+
+    def test_write_multigpu_sweep_notebook_preserves_parallel_contract(self) -> None:
+        sweep_cases, spec = soi_sweep_cases()
+        configuration = {
+            "included_layers": [[1, 0], [2, 0]],
+            "material_stack": lumerical.default_stack("SOI grating coupler (Ansys)"),
+            "wavelength_start_um": 1.50,
+            "wavelength_stop_um": 1.60,
+            "frequency_points": 5,
+            "resource_mode": "GPU",
+            "run_after_build": True,
+            "project_file": "gc_soi_sweep_multigpu.fsp",
+            "lumerical_multigpu": {
+                "node_count": 4,
+                "simulations_per_gpu": 1,
+                "max_parallel_simulations": 4,
+            },
+        }
+        with TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "gc-soi_sweep_multigpu.ipynb"
+            warnings = lumerical.write_lumerical_multigpu_sweep_notebook(
+                output, sweep_cases, configuration, spec
+            )
+            self.assertTrue(output.is_file())
+            self.assertTrue(any("Layout origin moved" in warning for warning in warnings))
+            saved = json.loads(output.read_text(encoding="utf-8"))
+
+        metadata = saved["metadata"]["max_layout"]
+        self.assertEqual(metadata["export"], "lumerical-fdtd-sweep-multigpu")
+        self.assertEqual(
+            metadata["lumerical_multigpu"],
+            {
+                "node_count": 4,
+                "simulations_per_gpu": 1,
+                "max_parallel_simulations": 4,
+            },
+        )
+        self.assertEqual(saved["nbformat"], 4)
+
+    def test_multigpu_rejects_same_gpu_oversubscription(self) -> None:
+        sweep_cases, spec = soi_sweep_cases()
+        configuration = {
+            "included_layers": [[1, 0], [2, 0]],
+            "material_stack": lumerical.default_stack("SOI grating coupler (Ansys)"),
+            "resource_mode": "GPU",
+            "run_after_build": True,
+            "lumerical_multigpu": {"node_count": 4, "simulations_per_gpu": 2},
+        }
+        with self.assertRaisesRegex(ValueError, "exactly one simulation per GPU"):
+            lumerical.generate_lumerical_multigpu_sweep_notebook(
+                sweep_cases, configuration, spec
+            )
+
+    def test_sweep_checkpoint_rejects_nonfinite_or_wrong_objective(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            checkpoint_directory = Path(temporary_directory) / "checkpoints"
+            namespace = {
+                "REMOTE_WORK": temporary_directory,
+                "SWEEP_SHARED_CHECKPOINT_DIR": str(checkpoint_directory),
+                "SWEEP_HASH": "unit-test-sweep-hash",
+                "SWEEP_CASES": [{"values": {"pitch": 0.65}, "display_label": "P=0.65"}],
+                "SWEEP_SPEC": {
+                    "component_uid": 1,
+                    "component_kind": "GC-SOI",
+                    "axes": [{"parameter": "pitch", "short_name": "P"}],
+                },
+                "SETTINGS": {"wavelength_start_um": 1.5, "wavelength_stop_um": 1.6},
+                "PORTS": [],
+                "FIBER_GEOMETRIES": [],
+                "MONITORS": [],
+                "GRATING_ANALYSIS": {"enabled": True},
+                "MMI_ANALYSIS": None,
+            }
+            exec(lumerical._SWEEP_RUNTIME_REMOTE, namespace)
+            wavelength = np.asarray([1.50e-6, 1.55e-6, 1.60e-6])
+            response = np.asarray([0.2, 0.4, 0.3])
+            namespace["_save_sweep_case"](
+                0, "coupling_efficiency", wavelength, response, {}
+            )
+            self.assertTrue(namespace["_sweep_case_is_complete"](0))
+
+            checkpoint = Path(namespace["_sweep_case_npz"](0))
+            with np.load(checkpoint, allow_pickle=False) as data:
+                payload = {key: np.asarray(data[key]) for key in data.files}
+            payload["primary_response"] = np.asarray([0.2, np.nan, 0.3])
+            np.savez_compressed(checkpoint, **payload)
+            self.assertFalse(namespace["_sweep_case_is_complete"](0))
+
+            payload["primary_response"] = response
+            payload["primary_name"] = np.asarray(["wrong_objective"])
+            np.savez_compressed(checkpoint, **payload)
+            self.assertFalse(namespace["_sweep_case_is_complete"](0))
+
+    def test_grating_sweep_resolves_logical_mode_expansion_result_name(self) -> None:
+        wavelength_m = np.asarray([1.50e-6, 1.55e-6, 1.60e-6])
+
+        class FakeFDTD:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str | None]] = []
+
+            def getresult(self, path, result_name=None):
+                self.calls.append((str(path), result_name))
+                if str(path) == "uid_1_waveguide_total_power" and result_name == "T":
+                    return {"lambda": wavelength_m, "T": np.asarray([0.7, 0.8, 0.75])}
+                if str(path) == "uid_1_waveguide_mode":
+                    if result_name is None:
+                        return "expansion for waveguide_power"
+                    if result_name == "expansion for waveguide_power":
+                        return {
+                            "lambda": wavelength_m,
+                            "Tbackward": np.asarray([0.30, 0.40, 0.35]),
+                        }
+                    raise RuntimeError("Can not find result %r" % result_name)
+                if (
+                    str(path) in {
+                        "FDTD::ports::uid_1_fiber_input_power",
+                        "::model::FDTD::ports::uid_1_fiber_input_power",
+                    }
+                    and result_name == "expansion for port monitor"
+                ):
+                    return {
+                        "lambda": wavelength_m,
+                        "T_in": np.ones(3),
+                        "T_out": np.asarray([0.01, 0.02, 0.01]),
+                    }
+                raise RuntimeError("Can not find result %r" % result_name)
+
+        with TemporaryDirectory() as temporary_directory:
+            fake_fdtd = FakeFDTD()
+            namespace = {
+                "REMOTE_WORK": temporary_directory,
+                "SWEEP_HASH": "logical-expansion-name",
+                "SWEEP_CASES": [],
+                "SWEEP_SPEC": {},
+                "SETTINGS": {},
+                "PORTS": [],
+                "MONITORS": [],
+                "MMI_ANALYSIS": None,
+                "GRATING_ANALYSIS": {
+                    "waveguide_power_monitor_name": "uid_1_waveguide_total_power",
+                    "waveguide_mode_monitor_name": "uid_1_waveguide_mode",
+                    "waveguide_expansion_result_name": "waveguide_power",
+                    "waveguide_modal_direction": "Tbackward",
+                    "fiber_input_measurement_port_name": "uid_1_fiber_input_power",
+                    "fiber_measurement_expansion_result_name": "expansion for port monitor",
+                },
+                "fdtd": fake_fdtd,
+            }
+            exec(lumerical._SWEEP_RUNTIME_REMOTE, namespace)
+            primary_name, returned_wavelength, response, arrays = namespace[
+                "_extract_sweep_result"
+            ]()
+
+        self.assertEqual(primary_name, "coupling_efficiency")
+        np.testing.assert_allclose(returned_wavelength, wavelength_m)
+        np.testing.assert_allclose(response, [0.30, 0.40, 0.35])
+        np.testing.assert_allclose(arrays["waveguide_mode_power"], response)
+        self.assertIn(
+            ("uid_1_waveguide_mode", "expansion for waveguide_power"),
+            fake_fdtd.calls,
+        )
+
+    def test_grating_sweep_discovers_available_mode_expansion_result(self) -> None:
+        wavelength_m = np.asarray([1.50e-6, 1.55e-6])
+
+        class FakeFDTD:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str | None]] = []
+
+            def getresult(self, path, result_name=None):
+                path = str(path)
+                self.calls.append((path, result_name))
+                if path == "uid_1_waveguide_total_power" and result_name == "T":
+                    return {"lambda": wavelength_m, "T": np.asarray([0.8, 0.8])}
+                if path == "uid_1_waveguide_mode":
+                    if result_name is None:
+                        return "T\nexpansion for uid_1_waveguide_mode\nmode profiles"
+                    if result_name == "expansion for uid_1_waveguide_mode":
+                        return {
+                            "lambda": wavelength_m,
+                            "Tbackward": np.asarray([0.25, 0.50]),
+                        }
+                    raise RuntimeError("Can not find result %r" % result_name)
+                if (
+                    path in {
+                        "FDTD::ports::uid_1_fiber_input_power",
+                        "::model::FDTD::ports::uid_1_fiber_input_power",
+                    }
+                    and result_name == "expansion for port monitor"
+                ):
+                    return {
+                        "lambda": wavelength_m,
+                        "T_in": np.asarray([0.5, 1.0]),
+                        "T_out": np.zeros(2),
+                    }
+                raise RuntimeError("Can not find result %r" % result_name)
+
+        with TemporaryDirectory() as temporary_directory:
+            fake_fdtd = FakeFDTD()
+            namespace = {
+                "REMOTE_WORK": temporary_directory,
+                "SWEEP_HASH": "discover-expansion-name",
+                "SWEEP_CASES": [],
+                "SWEEP_SPEC": {},
+                "SETTINGS": {},
+                "PORTS": [],
+                "MONITORS": [],
+                "MMI_ANALYSIS": None,
+                "GRATING_ANALYSIS": {
+                    "waveguide_power_monitor_name": "uid_1_waveguide_total_power",
+                    "waveguide_mode_monitor_name": "uid_1_waveguide_mode",
+                    "waveguide_expansion_result_name": "waveguide_power",
+                    "waveguide_modal_direction": "Tbackward",
+                    "fiber_input_measurement_port_name": "uid_1_fiber_input_power",
+                },
+                "fdtd": fake_fdtd,
+            }
+            exec(lumerical._SWEEP_RUNTIME_REMOTE, namespace)
+            primary_name, _, response, _ = namespace["_extract_sweep_result"]()
+
+        self.assertEqual(primary_name, "coupling_efficiency")
+        np.testing.assert_allclose(response, [0.5, 0.5])
+        self.assertIn(("uid_1_waveguide_mode", None), fake_fdtd.calls)
+        self.assertIn(
+            ("uid_1_waveguide_mode", "expansion for uid_1_waveguide_mode"),
+            fake_fdtd.calls,
+        )
+
+    def test_grating_sweep_expansion_failure_lists_available_results(self) -> None:
+        wavelength_m = np.asarray([1.50e-6, 1.55e-6])
+
+        class FakeFDTD:
+            def getresult(self, path, result_name=None):
+                path = str(path)
+                if path == "uid_1_waveguide_total_power" and result_name == "T":
+                    return {"lambda": wavelength_m, "T": np.ones(2)}
+                if path == "uid_1_waveguide_mode" and result_name is None:
+                    return "T\nneff\nmode profiles"
+                raise RuntimeError("Can not find result %r" % result_name)
+
+        with TemporaryDirectory() as temporary_directory:
+            namespace = {
+                "REMOTE_WORK": temporary_directory,
+                "SWEEP_HASH": "missing-expansion-name",
+                "SWEEP_CASES": [],
+                "SWEEP_SPEC": {},
+                "SETTINGS": {},
+                "PORTS": [],
+                "MONITORS": [],
+                "MMI_ANALYSIS": None,
+                "GRATING_ANALYSIS": {
+                    "waveguide_power_monitor_name": "uid_1_waveguide_total_power",
+                    "waveguide_mode_monitor_name": "uid_1_waveguide_mode",
+                    "waveguide_expansion_result_name": "waveguide_power",
+                    "waveguide_modal_direction": "Tbackward",
+                    "fiber_input_measurement_port_name": "uid_1_fiber_input_power",
+                },
+                "fdtd": FakeFDTD(),
+            }
+            exec(lumerical._SWEEP_RUNTIME_REMOTE, namespace)
+            with self.assertRaises(RuntimeError) as caught:
+                namespace["_extract_sweep_result"]()
+
+        message = str(caught.exception)
+        self.assertIn("waveguide_power", message)
+        self.assertIn("Available", message)
+        self.assertIn("T", message)
+        self.assertIn("neff", message)
+        self.assertIn("mode profiles", message)
+
+    def test_mmi_sweep_normalizes_each_output_branch_to_measured_input(self) -> None:
+        wavelength_m = np.asarray([1.50e-6, 1.55e-6, 1.60e-6])
+
+        class FakeFDTD:
+            def getresult(self, path, result_name=None):
+                key = (str(path), result_name)
+                results = {
+                    ("::model::uid_1_input_reference", "T"): {
+                        "lambda": wavelength_m,
+                        "T": np.asarray([0.80, 0.80, 0.80]),
+                    },
+                    ("::model::FDTD::ports::uid_1_upper_right", "T"): {
+                        "lambda": wavelength_m,
+                        "T": np.asarray([0.32, 0.40, 0.36]),
+                    },
+                    ("::model::FDTD::ports::uid_1_lower_right", "T"): {
+                        "lambda": wavelength_m,
+                        "T": np.asarray([0.36, 0.38, 0.40]),
+                    },
+                }
+                if key not in results:
+                    raise RuntimeError("Can not find result %r" % (key,))
+                return results[key]
+
+        with TemporaryDirectory() as temporary_directory:
+            namespace = {
+                "REMOTE_WORK": temporary_directory,
+                "SWEEP_HASH": "mmi-branch-normalization",
+                "SWEEP_CASES": [],
+                "SWEEP_SPEC": {},
+                "SETTINGS": {},
+                "PORTS": [],
+                "MONITORS": [],
+                "GRATING_ANALYSIS": None,
+                "MMI_ANALYSIS": {
+                    "input_reference_monitor_name": "uid_1_input_reference",
+                    "output_port_names": [
+                        "uid_1_upper_right",
+                        "uid_1_lower_right",
+                    ],
+                },
+                "fdtd": FakeFDTD(),
+            }
+            exec(lumerical._SWEEP_RUNTIME_REMOTE, namespace)
+            primary_name, returned_wavelength, response, arrays = namespace[
+                "_extract_sweep_result"
+            ]()
+            expected_primary_name = namespace["_sweep_expected_primary_name"]()
+
+        expected_upper_over_input = np.asarray([0.40, 0.50, 0.45])
+        expected_lower_over_input = np.asarray([0.45, 0.475, 0.50])
+        self.assertEqual(primary_name, "output_1_over_input")
+        self.assertEqual(expected_primary_name, "output_1_over_input")
+        np.testing.assert_allclose(returned_wavelength, wavelength_m)
+        np.testing.assert_allclose(response, expected_upper_over_input)
+        np.testing.assert_allclose(
+            arrays["output_1_over_input"], expected_upper_over_input
+        )
+        np.testing.assert_allclose(
+            arrays["output_2_over_input"], expected_lower_over_input
+        )
+        np.testing.assert_allclose(
+            arrays["total_output_over_input"],
+            expected_upper_over_input + expected_lower_over_input,
+        )
+        np.testing.assert_allclose(
+            arrays["output_1_ratio"] + arrays["output_2_ratio"], 1.0
+        )
+
+    def test_transient_mode_seed_is_removed_before_nominal_fsp_save(self) -> None:
+        build_source = lumerical._BUILD_CELL
+        self.assertIn('"_max_layout_mode_seed.fsp"', build_source)
+        self.assertIn("os.remove(mode_seed_project)", build_source)
+        self.assertLess(
+            build_source.index("fdtd.save(mode_seed_project)"),
+            build_source.index("os.remove(mode_seed_project)"),
+        )
+
     def test_accepting_sweep_parameters_opens_stack_dialog(self) -> None:
         from max_layout.ui import window as window_module
 
@@ -601,6 +1628,265 @@ class LumericalExportTests(unittest.TestCase):
         )
         self.assertEqual(opened["saved"]["stack_preset"], "SOI grating coupler (Ansys)")
 
+    def test_accepting_optimization_parameters_opens_locked_gpu_stack_dialog(self) -> None:
+        from max_layout.ui import window as window_module
+
+        target = component("GC-SOI")
+        spec = {
+            "version": 1,
+            "method": "shape-adjoint",
+            "component_uid": int(target["uid"]),
+            "component_kind": "GC-SOI",
+            "parameters": [
+                {
+                    "parameter": "pitch",
+                    "initial": 0.6713,
+                    "minimum": 0.64,
+                    "maximum": 0.70,
+                }
+            ],
+            "objective": {
+                "kind": "grating_ce",
+                "center_wavelength_um": 1.55,
+                "bandwidth_nm": 40.0,
+                "wavelength_start_um": 1.53,
+                "wavelength_stop_um": 1.57,
+                "wavelength_points": 5,
+            },
+            "optimizer": {"max_iterations": 12},
+        }
+        opened: dict[str, object] = {}
+
+        class FakeOptimizationDialog:
+            parameters = ["pitch"]
+
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def exec(self):
+                return window_module.QDialog.DialogCode.Accepted
+
+            def optimization_spec(self):
+                return spec
+
+        class FakeWidget:
+            def __init__(self) -> None:
+                self.value = None
+                self.enabled = True
+                self.tooltip = ""
+
+            def setValue(self, value) -> None:
+                self.value = value
+
+            def setEnabled(self, enabled: bool) -> None:
+                self.enabled = bool(enabled)
+
+            def setToolTip(self, tooltip: str) -> None:
+                self.tooltip = str(tooltip)
+
+        class FakeCombo(FakeWidget):
+            def setCurrentText(self, value: str) -> None:
+                self.value = value
+
+        class FakeCheck(FakeWidget):
+            def setChecked(self, value: bool) -> None:
+                self.value = bool(value)
+
+        class FakeExportDialog:
+            def __init__(self, _components, _scope, saved=None, parent=None) -> None:
+                opened["saved"] = saved
+                opened["parent"] = parent
+                self.wavelength_start = FakeWidget()
+                self.wavelength_stop = FakeWidget()
+                self.frequency_points = FakeWidget()
+                self.resource_mode = FakeCombo()
+                self.run_after_build = FakeCheck()
+                opened["dialog"] = self
+
+            def setWindowTitle(self, title: str) -> None:
+                opened["title"] = title
+
+            def exec(self):
+                return window_module.QDialog.DialogCode.Rejected
+
+        class Harness:
+            components = [target]
+
+            def selected_components(self):
+                return [target]
+
+            def lumerical_scope_options(self, _clicked):
+                return [("Clicked component", [int(target["uid"])])]
+
+        original_optimization_dialog = window_module.LumericalOptimizationDialog
+        original_export_dialog = window_module.LumericalExportDialog
+        try:
+            window_module.LumericalOptimizationDialog = FakeOptimizationDialog
+            window_module.LumericalExportDialog = FakeExportDialog
+            window_module.NativeLayoutWindow.export_lumerical_optimization_notebook(
+                Harness(), target
+            )
+        finally:
+            window_module.LumericalOptimizationDialog = original_optimization_dialog
+            window_module.LumericalExportDialog = original_export_dialog
+
+        self.assertEqual(
+            opened["title"],
+            "Lumerical adjoint optimization — stack, domain, and GPU settings",
+        )
+        self.assertEqual(opened["saved"]["wavelength_start_um"], 1.53)
+        self.assertEqual(opened["saved"]["wavelength_stop_um"], 1.57)
+        self.assertEqual(opened["saved"]["frequency_points"], 5)
+        self.assertEqual(opened["saved"]["resource_mode"], "GPU")
+        dialog = opened["dialog"]
+        self.assertFalse(dialog.wavelength_start.enabled)
+        self.assertFalse(dialog.wavelength_stop.enabled)
+        self.assertFalse(dialog.frequency_points.enabled)
+        self.assertEqual(dialog.resource_mode.value, "GPU")
+        self.assertFalse(dialog.resource_mode.enabled)
+        self.assertTrue(dialog.run_after_build.value)
+        self.assertFalse(dialog.run_after_build.enabled)
+
+        window_source = Path("src/max_layout/ui/window.py").read_text(encoding="utf-8")
+        self.assertGreaterEqual(
+            window_source.count('addAction("Lumerical optimization…")'), 2
+        )
+        self.assertIn("def export_lumerical_optimization_notebook", window_source)
+
+    def test_mmi_sweep_keeps_ports_monitors_mesh_orders_in_both_exporters(self) -> None:
+        sweep_cases, spec = mmi_sweep_cases()
+        eligible = {
+            item["parameter"]
+            for item in sweepable_component_parameters(sweep_cases[0]["components"][0])
+        }
+        self.assertTrue(
+            {"mmi_length", "mmi_width", "wg_width", "port_sep"}.issubset(eligible)
+        )
+        self.assertTrue(
+            {
+                "input_reference_before_taper_um",
+                "fdtd_port_clearance_um",
+                "taper_points",
+            }.isdisjoint(eligible)
+        )
+
+        material_stack = lumerical.default_stack("TFLN on SiO2")
+        expected_mesh_orders = [6, 5, 2, 3, 1, 4, 7]
+        for row, mesh_order in zip(material_stack, expected_mesh_orders):
+            row["mesh_order"] = mesh_order
+        configuration = {
+            "included_layers": [[1, 0]],
+            "material_stack": material_stack,
+            "wavelength_start_um": 1.25,
+            "wavelength_stop_um": 1.35,
+            "frequency_points": 5,
+            "resource_mode": "GPU",
+            "run_after_build": True,
+        }
+        sequential, _ = generate_lumerical_sweep_notebook(
+            sweep_cases, configuration, spec
+        )
+        multigpu, _ = lumerical.generate_lumerical_multigpu_sweep_notebook(
+            sweep_cases, configuration, spec
+        )
+
+        self.assertEqual(
+            sequential["metadata"]["max_layout"]["export"],
+            "lumerical-fdtd-sweep",
+        )
+        self.assertEqual(
+            multigpu["metadata"]["max_layout"]["export"],
+            "lumerical-fdtd-sweep-multigpu",
+        )
+        for label, notebook in (("sequential", sequential), ("multigpu", multigpu)):
+            for index, cell in enumerate(notebook["cells"]):
+                if cell["cell_type"] == "code":
+                    compile(
+                        "".join(cell["source"]),
+                        f"<MMI {label} sweep cell {index}>",
+                        "exec",
+                    )
+            self.assertEqual(
+                [row["mesh_order"] for row in assignment_value(notebook, "MATERIAL_STACK")],
+                expected_mesh_orders,
+            )
+            remote_cases = decoded_sweep_cases(notebook)
+            self.assertEqual(len(remote_cases), 2)
+            for remote_case in remote_cases:
+                analysis = remote_case["mmi_analysis"]
+                self.assertFalse(analysis["include_field_distribution"])
+                self.assertNotIn("field_monitor_name", analysis)
+                self.assertEqual(analysis["input_port_name"], "uid_1_left_external")
+                self.assertEqual(
+                    analysis["output_port_names"],
+                    ["uid_1_upper_right", "uid_1_lower_right"],
+                )
+                self.assertEqual(
+                    analysis["input_reference_monitor_name"],
+                    "uid_1_input_reference",
+                )
+                self.assertEqual(
+                    {
+                        port["parent_port_name"]: port["name"]
+                        for port in remote_case["ports"]
+                    },
+                    {
+                        "left_external": "uid_1_left_external",
+                        "upper_right": "uid_1_upper_right",
+                        "lower_right": "uid_1_lower_right",
+                    },
+                )
+                self.assertTrue(
+                    all(float(port["span_um"]) >= 3.0 for port in remote_case["ports"])
+                )
+                self.assertEqual(
+                    {float(port["target neff"]) for port in remote_case["ports"]},
+                    {2.0},
+                )
+                self.assertEqual(
+                    {str(port["polarization"]) for port in remote_case["ports"]},
+                    {"local TE"},
+                )
+                self.assertEqual(
+                    analysis["port_profile_labels"],
+                    ["MMI input", "MMI upper output", "MMI lower output"],
+                )
+                self.assertEqual(
+                    [monitor["name"] for monitor in remote_case["monitors"]],
+                    ["uid_1_input_reference"],
+                )
+
+            first_ports = {
+                port["parent_port_name"]: port
+                for port in remote_cases[0]["ports"]
+            }
+            second_ports = {
+                port["parent_port_name"]: port
+                for port in remote_cases[1]["ports"]
+            }
+            self.assertEqual(
+                first_ports["left_external"]["center"],
+                second_ports["left_external"]["center"],
+            )
+            self.assertNotEqual(
+                first_ports["upper_right"]["center"],
+                second_ports["upper_right"]["center"],
+            )
+            runtime_source = cell_source_containing(notebook, "REMOTE_SWEEP_RUNTIME")
+            self.assertIn('return "output_1_over_input"', runtime_source)
+            self.assertIn('"output_2_over_input": output_2_over_input', runtime_source)
+            self.assertIn("SWEEP_CHECKPOINT_SCHEMA = 4", runtime_source)
+            preview_source = cell_source_containing(notebook, "REMOTE_PORT_MODE_PROFILES")
+            self.assertIn('elif MMI_ANALYSIS:', preview_source)
+            self.assertIn('"MMI input"', preview_source)
+            self.assertIn('"MMI upper output"', preview_source)
+            self.assertIn('"MMI lower output"', preview_source)
+            self.assertIn("PORT_MODE_SELECTIONS", preview_source)
+            local_results = cell_source_containing(notebook, "_mmi_output_1_over_input")
+            self.assertIn('label="upper output / input"', local_results)
+            self.assertIn('label="lower output / input"', local_results)
+            self.assertIn('label="ideal 50/50"', local_results)
+
     def test_mmi_export_includes_longitudinal_fundamental_field_plot(self) -> None:
         mmi = component("1x2 MMI")
         items = [mmi]
@@ -620,6 +1906,7 @@ class LumericalExportTests(unittest.TestCase):
 
         notebook, warnings = generate_lumerical_notebook(items, {"included_layers": [[1, 0]]})
         analysis = assignment_value(notebook, "MMI_ANALYSIS")
+        self.assertTrue(analysis["include_field_distribution"])
         self.assertEqual(analysis["field_monitor_name"], "uid_1_mmi_field")
         monitors = assignment_value(notebook, "MONITORS")
         field_monitor = next(monitor for monitor in monitors if monitor["name"] == "uid_1_mmi_field")
@@ -629,6 +1916,93 @@ class LumericalExportTests(unittest.TestCase):
         source = cell_source_containing(notebook, "REMOTE_MMI_ANALYSIS =")
         self.assertIn("mmi_field_distribution.png", source)
         self.assertIn("field_intensity_normalized", source)
+        self.assertIn("fdtd.getelectric(field_monitor_path, 1)", source)
+        self.assertIn('_field_value("E2")', source)
+        self.assertIn("vector E attribute", source)
+        self.assertNotIn("field_result.get(component_name, 0.0)", source)
+        build_source = cell_source_containing(notebook, "REMOTE_MODEL_BUILDER")
+        self.assertIn('for component_name in ("Ex", "Ey", "Ez")', build_source)
+        self.assertIn('fdtd.set("output " + component_name, True)', build_source)
+
+    def test_mmi_field_plot_accepts_getelectric_when_component_keys_are_missing(self) -> None:
+        wavelengths_m = np.asarray([1.25e-6, 1.35e-6])
+        frequencies_hz = 299792458.0 / wavelengths_m
+        x_m = np.linspace(0.0, 4.0e-6, 4)
+        y_m = np.linspace(-1.0e-6, 1.0e-6, 3)
+        electric_intensity = np.arange(1, 25, dtype=float).reshape(4, 3, 1, 2)
+        ex_field = np.full((4, 3, 1, 2), 0.1 + 0.2j)
+        ey_field = np.arange(1, 25, dtype=float).reshape(4, 3, 1, 2) + 0.5j
+        ez_field = np.zeros((4, 3, 1, 2), dtype=complex)
+
+        class FakeFdtd:
+            def getresult(self, path, result_name):
+                if result_name == "T":
+                    if path.endswith("input_reference"):
+                        power = np.asarray([1.0, 1.0])
+                    else:
+                        power = np.asarray([0.5, 0.5])
+                    return {"lambda": wavelengths_m, "T": power}
+                if result_name == "E":
+                    # Reproduce v261 data that has coordinates but no
+                    # separately expanded Ex/Ey/Ez attributes.
+                    return {"x": x_m, "y": y_m, "f": frequencies_hz}
+                raise AssertionError((path, result_name))
+
+            def getelectric(self, path, option):
+                self.last_getelectric = (path, option)
+                return electric_intensity
+
+            def getdata(self, path, component_name, option):
+                self.getdata_calls.append((path, component_name, option))
+                return {"Ex": ex_field, "Ey": ey_field, "Ez": ez_field}[component_name]
+
+        fake_fdtd = FakeFdtd()
+        fake_fdtd.getdata_calls = []
+        with TemporaryDirectory() as temporary:
+            namespace = {
+                "np": np,
+                "os": __import__("os"),
+                "fdtd": fake_fdtd,
+                "REMOTE_WORK": temporary,
+                "SETTINGS": {
+                    "run_after_build": True,
+                    "wavelength_start_um": 1.25,
+                    "wavelength_stop_um": 1.35,
+                },
+                "PORT_MODE_SELECTIONS": {
+                    "input": {"neff": 1.9},
+                    "upper": {"neff": 1.9},
+                    "lower": {"neff": 1.9},
+                },
+                "MMI_ANALYSIS": {
+                    "input_port_name": "input",
+                    "input_reference_monitor_name": "input_reference",
+                    "output_port_names": ["upper", "lower"],
+                    "output_labels": ["upper output", "lower output"],
+                    "field_monitor_name": "mmi_field",
+                    "symmetry_tolerance_percent": 1.0,
+                    "port_target_neff": 2.0,
+                },
+            }
+            exec(lumerical._MMI_ANALYSIS_REMOTE, namespace)
+            result = np.load(Path(temporary) / "mmi_analysis.npz")
+            self.assertEqual(result["field_intensity_normalized"].shape, (4, 3))
+            self.assertAlmostEqual(
+                float(np.max(result["field_intensity_normalized"])), 1.0
+            )
+            self.assertEqual(result["field_Ex"].shape, (4, 3))
+            self.assertEqual(result["field_Ey"].shape, (4, 3))
+            self.assertAlmostEqual(
+                float(np.max(result["field_Ey_abs_normalized"])), 1.0
+            )
+            self.assertEqual(
+                fake_fdtd.last_getelectric,
+                ("::model::mmi_field", 1),
+            )
+            self.assertEqual(
+                [name for _path, name, _option in fake_fdtd.getdata_calls],
+                ["Ex", "Ey", "Ez"],
+            )
 
     def test_air_and_separate_official_fiber_objects_are_available(self) -> None:
         self.assertIn("Air", lumerical.MATERIAL_CHOICES)
@@ -806,7 +2180,11 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn('set("mesh order",core_mesh_order);', build_source)
         self.assertIn('set("mesh order",cladding_mesh_order);', build_source)
         self.assertNotIn('set("mesh order",4)', build_source)
-        self.assertIn("Material mesh orders: grating 2", build_source)
+        self.assertIn("stack_mesh_summary", build_source)
+        self.assertIn(
+            '"Material mesh orders: %s; fiber core 4; fiber cladding 5."',
+            build_source,
+        )
         self.assertIn("background_volumes", build_source)
         self.assertIn('fdtd.set("mesh order", mesh_order)', build_source)
         self.assertIn('addmaterial("Sampled 3D data")', build_source)
@@ -819,10 +2197,10 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("mesh precedence clips the effective fiber material", build_source)
         self.assertNotIn('fdtd.set("rotation 1", theta_deg)', build_source)
         self.assertIn('"sidewall angle"', build_source)
-        self.assertIn("z_extent_max_um = max(z_extent_max_um, device_z_um + 0.5 * z_span_um)", build_source)
-        self.assertIn("simulation_z_max_um = z_extent_max_um + z_max_padding", build_source)
-        self.assertIn("z_max_padding = max(boundary_clearance_um, requested_z_max_padding)", build_source)
-        self.assertIn("boundary_clearance_um = 0.25 * min", build_source)
+        self.assertIn("z_extent_max_um = max(z_extent_max_um, sampling_z_max_um)", build_source)
+        self.assertIn("simulation_z_max_um = z_extent_max_um + requested_z_max_padding", build_source)
+        self.assertNotIn("max(boundary_clearance_um, requested_z_max_padding)", build_source)
+        self.assertNotIn("boundary_clearance_um = 0.25 * min", build_source)
         self.assertIn("domain_padding = dict(SETTINGS.get", build_source)
         self.assertNotIn("_add_waveguide_boundary_extensions", build_source)
         self.assertNotIn("port PML extension", build_source)
@@ -1016,12 +2394,37 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(settings["simulation_time_fs"], 10000.0)
         self.assertEqual(settings["auto_shutoff_min"], 1e-6)
         build_source = cell_source_containing(notebook, "REMOTE_MODEL_BUILDER")
-        self.assertIn('SETTINGS.get("official_gc_domain", False)', build_source)
+        self.assertIn(
+            "simulation_z_min_um = z_extent_min_um - requested_z_min_padding",
+            build_source,
+        )
         self.assertIn('fdtd.set(antisymmetry_boundary + " bc", "Anti-Symmetric")', build_source)
         solve_source = cell_source_containing(notebook, "_solve_code")
         self.assertNotIn("Re-save solved project", solve_source)
         save_source = cell_source_containing(notebook, "REMOTE_RESULTS_SAVER")
         self.assertIn("Reused the already extracted grating spectrum", save_source)
+
+    def test_manual_fdtd_z_bounds_are_exact_and_reject_crossing_sampling_objects(self) -> None:
+        build_source = lumerical._BUILD_CELL
+        self.assertIn(
+            "simulation_z_min_um = z_extent_min_um - requested_z_min_padding",
+            build_source,
+        )
+        self.assertIn(
+            "simulation_z_max_um = z_extent_max_um + requested_z_max_padding",
+            build_source,
+        )
+        self.assertNotIn("boundary_clearance_um", build_source)
+        self.assertNotIn("Adjusted FDTD Z clearance", build_source)
+        self.assertIn("sampling_z_extents = []", build_source)
+        self.assertIn(
+            "if sample_min <= simulation_z_min_um or sample_max >= simulation_z_max_um",
+            build_source,
+        )
+        self.assertIn(
+            "bounds so every sampling object is strictly inside",
+            build_source,
+        )
 
     def test_grating_time_and_auto_shutoff_remain_user_editable(self) -> None:
         grating = component("GC-SOI")
@@ -1080,7 +2483,19 @@ class LumericalExportTests(unittest.TestCase):
         mmi_source = cell_source_containing(notebook, "REMOTE_MMI_ANALYSIS")
         self.assertIn('input_reference_monitor_name = str(MMI_ANALYSIS["input_reference_monitor_name"])', mmi_source)
         self.assertIn("output_1_over_input", mmi_source)
-        self.assertIn("normalized power (linear)", mmi_source)
+        self.assertIn("output / measured input (linear)", mmi_source)
+        self.assertIn("MMI branch transmission", mmi_source)
+        self.assertIn("Secondary symmetry diagnostic", mmi_source)
+        self.assertIn("%s/Pin %.3f%%", mmi_source)
+        self.assertIn(
+            'axes[0].plot(wavelength_m * 1e9, output_1_over_input',
+            mmi_source,
+        )
+        self.assertIn(
+            'axes[1].plot(wavelength_m * 1e9, output_1_ratio',
+            mmi_source,
+        )
+        self.assertIn("output_1_split_fraction", mmi_source)
         self.assertIn("symmetry_error_percent", mmi_source)
         self.assertNotIn("imbalance_db", mmi_source)
         self.assertNotIn("np.log10", mmi_source)

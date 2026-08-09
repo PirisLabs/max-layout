@@ -16,6 +16,20 @@ from ..geometry.transforms import rot, transform_points
 from ..utils import parse_sequence
 
 
+def _required_grating_parameter(
+    parameters: dict[str, Any], *keys: str, context: str
+) -> Any:
+    """Return the first explicitly stored project value for a grating field."""
+    for key in keys:
+        if key in parameters and parameters[key] is not None:
+            return parameters[key]
+    joined = " or ".join(repr(key) for key in keys)
+    raise ValueError(
+        f"{context} requires project JSON parameter {joined}; "
+        "recreate or repair this component instead of using an implicit geometry default."
+    )
+
+
 def resolve_grating_fill_factors(
     parameters: dict[str, Any],
     count: int,
@@ -30,7 +44,12 @@ def resolve_grating_fill_factors(
 
     expression = parameters.get(array_key, "")
     if expression is None or (isinstance(expression, str) and not expression.strip()):
-        values = [float(parameters.get(scalar_key, 0.5))] * count
+        scalar = _required_grating_parameter(
+            parameters,
+            scalar_key,
+            context="Grating fill-factor resolution",
+        )
+        values = [float(scalar)] * count
     else:
         values = parse_sequence(str(expression), count)
 
@@ -69,7 +88,14 @@ def add_parent_focusing_gc(
     gc_datatype = int(p.get("gc_datatype", DEFAULT_DATATYPE))
     wg_length = float(p.get("gc_wg_length", p.get("wg_length", 20.0)))
 
-    period_count = int(p.get("gc_N", p.get("N", 30)))
+    period_count = int(
+        _required_grating_parameter(
+            p,
+            "gc_N",
+            "N",
+            context="Focusing grating",
+        )
+    )
     array_key = "gc_fill_factors" if str(p.get("gc_fill_factors", "")).strip() else "fill_factors"
     fill_factors = resolve_grating_fill_factors(
         p,
@@ -79,7 +105,14 @@ def add_parent_focusing_gc(
     )
 
     _, gc_cell, *_ = backend.make_focusing_gc_gds(
-        pitch=float(p.get("gc_pitch", p.get("pitch", 0.75))),
+        pitch=float(
+            _required_grating_parameter(
+                p,
+                "gc_pitch",
+                "pitch",
+                context="Focusing grating",
+            )
+        ),
         fill_factor=fill_factors,
         N=period_count,
         alpha_t=float(p.get("gc_alpha_t", p.get("alpha_t", 25.0))),
@@ -151,7 +184,13 @@ def add_soi_grating_coupler(
     additional 100 nm silicon.  With the matching stack preset this reproduces
     the example's 220 nm device layer and 100 nm partial etch.
     """
-    pitch = float(p.get("pitch", 0.6713))
+    pitch = float(
+        _required_grating_parameter(
+            p,
+            "pitch",
+            context="GC-SOI",
+        )
+    )
     target_length = float(p.get("target_length", 25.0))
     radius = float(p.get("radius", 25.0))
     y_span = float(p.get("y_span", 15.0))

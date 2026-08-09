@@ -112,8 +112,8 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
  'Taper': {'length': 30.0, 'width_start': 1.2, 'width_end': 2.5, 'layer': 1, 'datatype': 0},
  'S-bend': {'length': 50.0, 'offset': 20.0, 'width': 1.2, 'layer': 1, 'datatype': 0, 'tolerance': 0.001},
  'Euler bend': {'radius': 200.0, 'bend_angle_deg': 90.0, 'width': 1.2, 'euler_fraction': 1.0, 'layer': 1, 'datatype': 0, 'tolerance': 0.001},
- 'Grating coupler': {'pitch': 0.75,
-                     'fill_factor': 0.57,
+ 'Grating coupler': {'pitch': 0.8,
+                     'fill_factor': 0.5,
                      'fill_factors': '',
                      'N': 30,
                      'alpha_t': 25.0,
@@ -121,7 +121,13 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                      'L_extra': 10.0,
                      'wg_width': 1.2,
                      'wg_length': 5.0,
-                     'fiber_offset_after_taper_um': 5.0,
+                     # Signed local-X distance from the geometry-exact flare
+                     # boundary to the fiber bottom center.  The boundary is
+                     # wg_length - focus_offset + taper_L.
+                     'fiber_offset': 5.0,
+                     # One parent-level tilt drives the fiber core/cladding,
+                     # source port, and passive fiber-power plane together.
+                     'angle_theta': 7.0,
                      'fiber_power_monitor_below_source_um': 0.1,
                      'fdtd_port_offset_from_waveguide_end_um': 2.0,
                      # Automatic TFLN waveguide planes use at least 3 um and
@@ -148,6 +154,12 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
              'input_length': 6.0,
              'input_reference_before_taper_um': 2.0,
              'fdtd_port_clearance_um': 2.0,
+             # All three MMI ports cross the same single-mode access
+             # waveguide.  Use one platform target to validate the input,
+             # upper-output, and lower-output fundamental TE modes.
+             'waveguide_effective_index': 2.0,
+             'waveguide_neff_tolerance': 0.3,
+             'waveguide_mode_search_count': 20,
              'output_length': 6.0,
              'port_sep': 3.25,
              'taper_power': 1.0,
@@ -762,9 +774,13 @@ DEFAULT_COMPONENT_VALUES["GC-SOI"] = {
     "wg_width": 0.5,
     "wg_length": 10.0,
     "taper_exponent": 1.15,
-    "fiber_x_from_grating_start_um": 2.74533,
+    # Signed local-X distance from the first SOI grating flare
+    # (wg_length + radius) to the fiber bottom center.
+    "fiber_offset": 2.74533,
+    # Canonical parent-level fiber/source tilt.  Older projects used
+    # ``fiber_tilt_deg`` and are migrated when loaded.
+    "angle_theta": 10.0,
     "fiber_tox_offset_um": 0.65,
-    "fiber_tilt_deg": 10.0,
     "fiber_core_diameter_um": 9.0,
     "fiber_core_index": 1.44427,
     "fiber_cladding_diameter_um": 50.0,

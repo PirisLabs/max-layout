@@ -211,15 +211,79 @@ an `XY` top view, `XZ` side view, and `YZ` end view built from the exact embedde
 films, etch depths, and sidewall angles sent to Lumerical. The combined verification image is
 also saved with the results.
 
-The default TFLN stack is 2 µm silicon, 5 µm SiO2 BOX, 400 nm TFLN with a
+The component right-click menu also provides two independent parameter-sweep
+exports. **Lumerical sweep…** keeps one persistent FDTD session on one GPU and
+hot-swaps geometry sequentially. **Lumerical sweep-multithread…** builds one
+nominal FSP, loads it into persistent workers on the selected pre-provisioned
+A100 nodes, and assigns sweep points concurrently. The parallel notebook uses
+unique worker folders, atomic shared checkpoints for resume, one simulation per
+GPU, per-worker licence cleanup, and CPU-only result aggregation. The node count
+remains selectable and defaults to eight A100 nodes, but production exports
+intentionally allow only one independent Lumerical process per GPU. Multiple
+processes on one GPU remain unavailable until model-memory and licence preflight
+is implemented. Multi-node notebooks require the matching Piris 3D
+Launcher/Requirements update. Every selected node must already exist, be an
+idle 1xA100, share `/lambda/nfs`, and contain its own private
+`~/remote-token.json`; the launcher does not copy credentials between nodes.
+The notebook stops before checking out GPU licences when this private inventory
+cannot be validated.
+
+**Lumerical optimization…** is a separate 3D alignment + shape-adjoint export. Its first
+page selects continuous geometry and grating-alignment parameters by their exact project-JSON names,
+hard minimum/maximum bounds, a center wavelength, and an optimization
+bandwidth; its second page reuses the material-stack, FDTD-domain, mesh, and GPU
+controls. The notebook uses the official GPU-aware `lumopt2` API when the
+installed Lumerical release provides it, with the bundled legacy LumOpt
+shape-adjoint API as a genuine-adjoint compatibility fallback. Selected
+`angle_theta` and `fiber_offset` values are optimized first with bounded GPU
+forward solves because they move the excitation/measurement basis; the fiber
+core/cladding, source port, and passive fiber-power plane remain concentric and
+change together. Their best alignment is then frozen for the true shape-adjoint
+device-geometry stage. During the blocking GPU run, the notebook tails a
+lightweight remote JSONL stream and redraws every completed alignment and
+shape-adjoint iteration with its linear objective and complete selected JSON
+parameter vector. Reporting never launches an extra solve. Grating-coupler
+optimization targets fiber-to-waveguide coupling efficiency. Symmetric 1×2 MMI
+optimization uses upper-branch fundamental-TE power divided by incident
+input-mode power, with the physically balanced target of 0.5, then reports both
+branches, total transmission, and imbalance for validation. Integer tooth
+counts, `port_sep`, waveguide receivers, meshes, material identifiers, and other
+topology controls remain fixed. The notebook saves
+only the best FSP plus compact convergence, parameter-patch, and response
+artifacts; it does not save an FSP for every iteration.
+
+For a **1×2 MMI**, the simulation setup uses three access-waveguide FDTD ports
+(input, upper output, and lower output) with one editable effective-index target
+and the same local fundamental-TE selection rule. Before solving, the notebook
+shows Ex and Ey for all three ports and reports their selected effective indices.
+An input power monitor placed before the input taper provides the normalization.
+The primary single-run and sweep graph is therefore upper-output/input,
+lower-output/input, and total-output/input in linear power. A separate secondary
+panel divides each branch by total transmitted output only to diagnose whether
+the device is balanced around 50/50; it is not the transmission result. MMI sweep files use `MMI-...`
+names, and the primary sweep objective is upper-branch power divided by measured
+input power. A single-run MMI notebook additionally records the longitudinal
+field plane and plots separate solved `|Ex|` and `|Ey|` maps on one common
+magnitude scale; sequential and multi-GPU sweeps deliberately omit that large
+field monitor and retain only their compact power spectra. The same
+stack-layer mesh factors and mesh orders used by ordinary exports are preserved
+by both MMI sweep exporters. New 1×2 MMI exports default to 3 µm of bottom SiO2,
+the patterned TFLN cross-section, conformal top oxide, and Air, with no silicon
+substrate row; existing custom stacks remain untouched.
+
+For non-MMI TFLN devices, the default stack is 2 µm silicon, 5 µm SiO2 BOX, 400 nm TFLN with a
 200 nm etch, 1 µm conformal SiO2 cladding, and 1 µm top Air. The export window
-includes Air in the material list, a live XZ/YZ process-stack cross-section,
-corner/edge dragging, and exact numeric X-min/X-max/Y-min/Y-max/Z-min/Z-max
-FDTD boundaries. The cross-section camera stays locked while those boundaries
-move, so the fixed stack/device geometry no longer appears to resize; **Fit
-preview** explicitly reframes it when requested. Dragging inside the red box
-translates its center in XZ/YZ without resizing; signed boundary offsets allow
-any boundary to sit inside Air or another layer. Domain edits never modify the physical polygon dimensions.
+includes Air in the material list and two synchronized FDTD views shown side by
+side. The left XZ view is the process-stack cross-section and controls X/Z; the
+right XY view is an equal-scale top/GDS view of the selected polygons and
+controls X/Y. Their common X-min/X-max update together when either view is
+dragged. The same domain can be entered numerically as six exact bounds or as
+X/Y/Z center and size. Corner/edge dragging resizes it and dragging inside the
+red box moves its center. The cross-section cameras stay locked while those
+boundaries move, so the fixed stack/device geometry no longer appears to resize;
+**Fit both previews** explicitly reframes them when requested. Signed boundary
+offsets allow any boundary to sit inside Air or another layer. Domain edits never
+modify the physical polygon dimensions.
 A **Show me a 3D version of the file I have built** button opens
 an interactive pre-export view of the exact polygons, stack, ports, separate
 fiber geometry, material-colored layer faces, a material-name legend, and the
@@ -235,20 +299,38 @@ lifecycle: seed Shared Web, roam three HPC Packs, build/run, save and fetch all
 results, close FDTD, check the packs back in, then close the remote session.
 Remote build, solve, analysis, and save stages are checked explicitly so a hidden remote
 traceback cannot turn into misleading missing-file messages at the end.
+Every completed single run, sequential sweep, multi-GPU sweep, and adjoint
+optimization also writes and fetches `summary.txt`. It records the exact source
+JSON parameters while also presenting the major device values one per line.
+Each report is divided into named Parameters, Material Stack and Mesh,
+Simulation Settings, Sources/Ports/Monitors, and Results Summary sections.
+Sweep summaries additionally include every axis/range, completed and failed
+counts, separate peak-best and target-wavelength-best cases with their complete
+parameters, and explicit FSP provenance. Adjoint summaries separate optimizer
+FOM from the final best-design forward validation and record the optimizer,
+bounds, derived editor patch, and retained artifact paths.
 Grating-coupler exports use only standard waveguide and Z-axis FDTD ports,
 with the Z-axis port passing through a separate 7° fiber geometry group. The
-starter fiber axis is placed on the grating side after the complete taper using
-the editable **Fiber offset after taper toward grating (µm)** parameter (5 µm by default).
+starter fiber axis is placed on the grating side using the editable **Fiber
+offset (µm)** parameter (project JSON key `fiber_offset`). It is a signed
+distance on the component's local X axis from the geometry-exact first flare
+boundary to the fiber bottom center; local Y remains zero. The standard grating
+default is 5 µm. **Angle theta (degrees)** (project JSON key `angle_theta`)
+controls the complete fiber tilt; changing it updates the fiber core/cladding,
+source port, passive fiber-power plane, rotation offset, and concentric plane
+positions together. Both parameters are available in sequential and multi-GPU
+sweeps (`TH` and `FO`) and in the optimization exporter.
 The standalone grating straight lead defaults to 5 µm, and its waveguide FDTD
 port defaults to 3 µm inward from the external lead end using the editable
 **FDTD port offset from waveguide end (µm)** parameter.
-The export centers the upward exit monitor near that port,
-record fiber coupling efficiency in dB versus wavelength, and save the natural
-3D far-field radiation pattern in polar coordinates with its peak exit angles.
+The export centers the upward exit monitor near that port and records linear
+fiber-to-waveguide coupling efficiency versus wavelength.
 There is no synthetic “fiber port” object: the notebook creates the core/cladding
-structure group and the standard FDTD port independently, matching the Ansys example. The FDTD
-region keeps at least a quarter-wavelength clearance from ordinary device
-features, while substrate/top-cladding films and ported waveguide continuations
+structure group and the standard FDTD port independently, matching the Ansys example. The
+quarter-wavelength button is a convenient starting point, but manually typed or
+dragged X/Y/Z bounds are honored exactly; export reports a clear validation error
+if a source, port, or monitor would touch the chosen domain. Substrate/top-cladding films
+and ported waveguide continuations
 extend through their PML boundaries as in the official Ansys example. New
 component exports default to 2 µm transverse clearance, placing endpoint ports
 2 µm from the matching PML boundary. Ported waveguides and the outer material

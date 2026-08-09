@@ -45,6 +45,10 @@ from ..lumerical import (
     seed_simulation_ports,
     sweepable_component_parameters,
 )
+from ..lumerical_optimization import (
+    adjoint_optimizable_component_parameters,
+    normalize_lumerical_optimization_spec,
+)
 
 
 def _checked_item(checked: bool) -> QTableWidgetItem:
@@ -276,12 +280,19 @@ def _fiber_axis_plane_center(
 
 
 class CrossSectionDomainPreview(QWidget):
-    """Live XZ/YZ process-stack preview with draggable FDTD boundaries."""
+    """Live XZ stack or XY/GDS preview with draggable FDTD boundaries."""
 
-    def __init__(self, dialog: "LumericalExportDialog") -> None:
+    def __init__(self, dialog: "LumericalExportDialog", plane: str) -> None:
         super().__init__(dialog)
         self.dialog = dialog
-        self.setMinimumHeight(430)
+        self.plane = str(plane).upper()
+        if self.plane not in {"XZ", "XY"}:
+            raise ValueError("FDTD preview plane must be XZ or XY")
+        # The stack-direction section and GDS-like top view are displayed side
+        # by side, so keep each canvas compact enough to leave the shared
+        # numeric X/Y/Z domain controls visible below them.
+        self.setMinimumHeight(350)
+        self.setMinimumWidth(360)
         self.setMouseTracking(True)
         self._drag_edges: set[str] = set()
         self._drag_origin_world: tuple[float, float] | None = None
@@ -308,44 +319,37 @@ class CrossSectionDomainPreview(QWidget):
         vertical = z0 + (self._plot_rect.bottom() - point.y()) / max(1.0, self._plot_rect.height()) * (z1 - z0)
         return horizontal, vertical
 
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor("#f8fafc"))
-        state = self.dialog.preview_state()
-        axis = self.dialog.preview_plane.currentText()
-        base_min, base_max = state["x_base"] if axis == "XZ" else state["y_base"]
-        pad_min = state["padding"]["x_min" if axis == "XZ" else "y_min"]
-        pad_max = state["padding"]["x_max" if axis == "XZ" else "y_max"]
-        domain_min, domain_max = base_min - pad_min, base_max + pad_max
-        z_min = state["z_base"][0] - state["padding"]["z_min"]
-        z_max = state["z_base"][1] + state["padding"]["z_max"]
-        extra_h = max(0.05, 0.06 * (domain_max - domain_min))
-        extra_z = max(0.05, 0.08 * (z_max - z_min))
-        if not self._view_locked or self._view_plane != axis:
-            # Reserve generous fixed space around the current domain. Keeping
-            # this mapping locked is what makes later FDTD-edge movement
-            # visible instead of making the stack appear to resize.
-            horizontal_margin = max(2.0, 0.35 * (domain_max - domain_min), extra_h)
-            vertical_margin = max(1.0, 0.35 * (z_max - z_min), extra_z)
-            self._world = (
-                domain_min - horizontal_margin,
-                domain_max + horizontal_margin,
-                z_min - vertical_margin,
-                z_max + vertical_margin,
-            )
-            self._view_plane = axis
-            self._view_locked = True
-        self._plot_rect = QRectF(72.0, 44.0, max(120.0, self.width() - 112.0), max(120.0, self.height() - 98.0))
+    def _projection_state(
+        self, state: dict[str, Any]
+    ) -> tuple[str, str, tuple[float, float], tuple[float, float], tuple[float, float, float, float]]:
+        """Resolve the two displayed axes and their exact FDTD boundaries."""
+        horizontal_axis = "x"
+        vertical_axis = "z" if self.plane == "XZ" else "y"
+        horizontal_base = tuple(state[horizontal_axis + "_base"])
+        vertical_base = tuple(state[vertical_axis + "_base"])
+        domain = (
+            float(horizontal_base[0]) - float(state["padding"][horizontal_axis + "_min"]),
+            float(horizontal_base[1]) + float(state["padding"][horizontal_axis + "_max"]),
+            float(vertical_base[0]) - float(state["padding"][vertical_axis + "_min"]),
+            float(vertical_base[1]) + float(state["padding"][vertical_axis + "_max"]),
+        )
+        return horizontal_axis, vertical_axis, horizontal_base, vertical_base, domain
 
-        painter.setPen(QPen(QColor("#cbd5e1"), 1))
-        painter.setBrush(QBrush(QColor("#ffffff")))
-        painter.drawRect(self._plot_rect)
-        painter.save()
-        painter.setClipRect(self._plot_rect)
+    @staticmethod
+    def _layer_color(layer: int) -> QColor:
+        """Give each visible GDS layer a stable, translucent editor color."""
+        color = QColor.fromHsv((int(layer) * 53 + 205) % 360, 145, 225)
+        color.setAlpha(155)
+        return color
+
+    def _draw_stack_section(
+        self,
+        painter: QPainter,
+        state: dict[str, Any],
+        horizontal_base: tuple[float, float],
+    ) -> None:
+        """Draw fixed process materials in the stack-direction XZ view."""
         for row_index, (row, row_z0, row_z1) in enumerate(state["stack_ranges"]):
-            # Draw the material geometry at its fixed stack coordinates. The
-            # independently moving red FDTD box may cut through these media.
             clipped_z0 = (
                 _conformal_fill_start(state["stack_ranges"], row_index, row_z0)
                 if bool(row.get("conformal", False))
@@ -356,26 +360,119 @@ class CrossSectionDomainPreview(QWidget):
                 continue
             role = str(row.get("role", "background"))
             if role == "geometry":
-                horizontal_min, horizontal_max = base_min, base_max
+                horizontal_min, horizontal_max = horizontal_base
             else:
                 # Full films are conceptually extended media. Draw them across
-                # the fixed viewport so resizing FDTD never looks like it is
-                # changing material geometry.
+                # the fixed viewport so moving the FDTD box never resizes them.
                 horizontal_min, horizontal_max = self._world[0], self._world[1]
             top_left = self._pixel(horizontal_min, clipped_z1)
             bottom_right = self._pixel(horizontal_max, clipped_z0)
             rect = QRectF(top_left, bottom_right).normalized()
             painter.setPen(QPen(QColor("#475569"), 1))
-            painter.setBrush(QBrush(_material_color(str(row.get("material", "")), 165 if role == "geometry" else 105)))
+            painter.setBrush(
+                QBrush(
+                    _material_color(
+                        str(row.get("material", "")),
+                        165 if role == "geometry" else 105,
+                    )
+                )
+            )
             painter.drawRect(rect)
             if rect.height() >= 16:
                 painter.setPen(QPen(QColor("#0f172a"), 1))
-                painter.drawText(rect.adjusted(5, 1, -5, -1), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                                 f"{row.get('name', 'layer')} · {row.get('material', '')}")
+                painter.drawText(
+                    rect.adjusted(5, 1, -5, -1),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    f"{row.get('name', 'layer')} · {row.get('material', '')}",
+                )
+
+    def _draw_gds_top_view(self, painter: QPainter, state: dict[str, Any]) -> None:
+        """Draw the exact selected export polygons in their global XY positions."""
+        for points, layer in state["polygons"]:
+            array = np.asarray(points, dtype=float)
+            if array.ndim != 2 or array.shape[1] != 2 or len(array) < 2:
+                continue
+            polygon = QPolygonF(
+                [self._pixel(float(point[0]), float(point[1])) for point in array]
+            )
+            painter.setPen(QPen(self._layer_color(int(layer)).darker(155), 1))
+            painter.setBrush(QBrush(self._layer_color(int(layer))))
+            painter.drawPolygon(polygon)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#f8fafc"))
+        state = self.dialog.preview_state()
+        (
+            horizontal_axis,
+            vertical_axis,
+            horizontal_base,
+            vertical_base,
+            domain,
+        ) = self._projection_state(state)
+        horizontal_min, horizontal_max, vertical_min, vertical_max = domain
+        self._plot_rect = QRectF(
+            72.0,
+            44.0,
+            max(120.0, self.width() - 112.0),
+            max(120.0, self.height() - 98.0),
+        )
+        if not self._view_locked or self._view_plane != self.plane:
+            # Reserve generous fixed space around the current domain. Keeping
+            # this mapping locked is what makes later FDTD-edge movement
+            # visible instead of making the fixed geometry appear to resize.
+            framed_h_min = min(horizontal_min, float(horizontal_base[0]))
+            framed_h_max = max(horizontal_max, float(horizontal_base[1]))
+            framed_v_min = min(vertical_min, float(vertical_base[0]))
+            framed_v_max = max(vertical_max, float(vertical_base[1]))
+            horizontal_span = max(1e-6, framed_h_max - framed_h_min)
+            vertical_span = max(1e-6, framed_v_max - framed_v_min)
+            if self.plane == "XZ":
+                # Preserve the established readable stack framing in the left
+                # view, including room to drag the red box beyond the device.
+                horizontal_margin = max(2.0, 0.35 * horizontal_span)
+                vertical_margin = max(1.0, 0.35 * vertical_span)
+            else:
+                horizontal_margin = max(0.05, 0.22 * horizontal_span)
+                vertical_margin = max(0.05, 0.22 * vertical_span)
+            world_h_min = framed_h_min - horizontal_margin
+            world_h_max = framed_h_max + horizontal_margin
+            world_v_min = framed_v_min - vertical_margin
+            world_v_max = framed_v_max + vertical_margin
+            if self.plane == "XY":
+                # Keep one micrometre the same size in X and Y, as in the GDS
+                # editor. The XZ stack view deliberately fills its canvas so
+                # thin films remain readable beside long photonic devices.
+                pixel_aspect = self._plot_rect.width() / max(1.0, self._plot_rect.height())
+                world_h_span = world_h_max - world_h_min
+                world_v_span = world_v_max - world_v_min
+                world_aspect = world_h_span / max(1e-12, world_v_span)
+                if world_aspect < pixel_aspect:
+                    addition = 0.5 * (world_v_span * pixel_aspect - world_h_span)
+                    world_h_min -= addition
+                    world_h_max += addition
+                else:
+                    addition = 0.5 * (world_h_span / pixel_aspect - world_v_span)
+                    world_v_min -= addition
+                    world_v_max += addition
+            self._world = (world_h_min, world_h_max, world_v_min, world_v_max)
+            self._view_plane = self.plane
+            self._view_locked = True
+
+        painter.setPen(QPen(QColor("#cbd5e1"), 1))
+        painter.setBrush(QBrush(QColor("#ffffff")))
+        painter.drawRect(self._plot_rect)
+        painter.save()
+        painter.setClipRect(self._plot_rect)
+        if self.plane == "XZ":
+            self._draw_stack_section(painter, state, horizontal_base)
+        else:
+            self._draw_gds_top_view(painter, state)
         painter.restore()
 
-        fdtd_top_left = self._pixel(domain_min, z_max)
-        fdtd_bottom_right = self._pixel(domain_max, z_min)
+        fdtd_top_left = self._pixel(horizontal_min, vertical_max)
+        fdtd_bottom_right = self._pixel(horizontal_max, vertical_min)
         fdtd_rect = QRectF(fdtd_top_left, fdtd_bottom_right).normalized()
         pml_width = max(7.0, min(22.0, 0.055 * fdtd_rect.width()))
         pml_height = max(7.0, min(22.0, 0.07 * fdtd_rect.height()))
@@ -394,7 +491,12 @@ class CrossSectionDomainPreview(QWidget):
         painter.setPen(QPen(QColor("#991b1b"), 1))
         painter.drawText(fdtd_rect.adjusted(7, 5, -7, -5), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight, "3D FDTD · drag inside to move · edges to resize")
         painter.setPen(QPen(QColor("#334155"), 1))
-        painter.drawText(10, 24, f"{axis} cross-section   Z ↑   material geometry is fixed; red dashed box is the independent FDTD domain")
+        title = (
+            "XZ · stack-direction cross-section   X →   Z ↑"
+            if self.plane == "XZ"
+            else "XY · TOP / GDS view   X →   Y ↑"
+        )
+        painter.drawText(10, 24, title + "   ·   red dashed box = FDTD domain")
         painter.drawText(10, self.height() - 12, "Drag the red boundary; use Fit preview only when you want to reframe the camera.")
         self._fdtd_rect = fdtd_rect
 
@@ -402,19 +504,27 @@ class CrossSectionDomainPreview(QWidget):
         if not hasattr(self, "_fdtd_rect"):
             return
         point = event.position()
-        x_edges = {"min": abs(point.x() - self._fdtd_rect.left()), "max": abs(point.x() - self._fdtd_rect.right())}
-        z_edges = {"z_max": abs(point.y() - self._fdtd_rect.top()), "z_min": abs(point.y() - self._fdtd_rect.bottom())}
-        x_edge, x_distance = min(x_edges.items(), key=lambda item: item[1])
-        z_edge, z_distance = min(z_edges.items(), key=lambda item: item[1])
+        state = self.dialog.preview_state()
+        horizontal_axis, vertical_axis, _horizontal_base, _vertical_base, domain = self._projection_state(state)
+        horizontal_edges = {
+            horizontal_axis + "_min": abs(point.x() - self._fdtd_rect.left()),
+            horizontal_axis + "_max": abs(point.x() - self._fdtd_rect.right()),
+        }
+        vertical_edges = {
+            vertical_axis + "_max": abs(point.y() - self._fdtd_rect.top()),
+            vertical_axis + "_min": abs(point.y() - self._fdtd_rect.bottom()),
+        }
+        horizontal_edge, horizontal_distance = min(horizontal_edges.items(), key=lambda item: item[1])
+        vertical_edge, vertical_distance = min(vertical_edges.items(), key=lambda item: item[1])
         threshold = 14.0
         # Corners resize both axes. Edges resize one axis and must be grabbed
         # alongside the visible FDTD rectangle, not anywhere on the canvas.
-        if x_distance <= threshold and z_distance <= threshold:
-            self._drag_edges = {x_edge, z_edge}
-        elif x_distance <= threshold and self._fdtd_rect.top() - threshold <= point.y() <= self._fdtd_rect.bottom() + threshold:
-            self._drag_edges = {x_edge}
-        elif z_distance <= threshold and self._fdtd_rect.left() - threshold <= point.x() <= self._fdtd_rect.right() + threshold:
-            self._drag_edges = {z_edge}
+        if horizontal_distance <= threshold and vertical_distance <= threshold:
+            self._drag_edges = {horizontal_edge, vertical_edge}
+        elif horizontal_distance <= threshold and self._fdtd_rect.top() - threshold <= point.y() <= self._fdtd_rect.bottom() + threshold:
+            self._drag_edges = {horizontal_edge}
+        elif vertical_distance <= threshold and self._fdtd_rect.left() - threshold <= point.x() <= self._fdtd_rect.right() + threshold:
+            self._drag_edges = {vertical_edge}
         elif self._fdtd_rect.contains(point):
             self._drag_edges = {"move"}
         else:
@@ -422,16 +532,7 @@ class CrossSectionDomainPreview(QWidget):
         if self._drag_edges:
             horizontal, vertical = self._world_at(point)
             self._drag_origin_world = (horizontal, vertical)
-            state = self.dialog.preview_state()
-            axis = self.dialog.preview_plane.currentText()
-            base_min, base_max = state["x_base"] if axis == "XZ" else state["y_base"]
-            key = axis.lower()[0]
-            self._drag_domain = (
-                base_min - state["padding"][key + "_min"],
-                base_max + state["padding"][key + "_max"],
-                state["z_base"][0] - state["padding"]["z_min"],
-                state["z_base"][1] + state["padding"]["z_max"],
-            )
+            self._drag_domain = domain
             event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt API
@@ -439,27 +540,47 @@ class CrossSectionDomainPreview(QWidget):
             return
         horizontal, vertical = self._world_at(event.position())
         state = self.dialog.preview_state()
-        axis = self.dialog.preview_plane.currentText()
-        base_min, base_max = state["x_base"] if axis == "XZ" else state["y_base"]
+        (
+            horizontal_axis,
+            vertical_axis,
+            horizontal_base,
+            vertical_base,
+            _domain,
+        ) = self._projection_state(state)
         if "move" in self._drag_edges and self._drag_origin_world is not None and self._drag_domain is not None:
             delta_h = horizontal - self._drag_origin_world[0]
-            delta_z = vertical - self._drag_origin_world[1]
-            original_h_min, original_h_max, original_z_min, original_z_max = self._drag_domain
-            key = axis.lower()[0]
-            self.dialog.padding_spin(key + "_min").setValue(base_min - (original_h_min + delta_h))
-            self.dialog.padding_spin(key + "_max").setValue((original_h_max + delta_h) - base_max)
-            self.dialog.padding_spin("z_min").setValue(state["z_base"][0] - (original_z_min + delta_z))
-            self.dialog.padding_spin("z_max").setValue((original_z_max + delta_z) - state["z_base"][1])
+            delta_v = vertical - self._drag_origin_world[1]
+            original_h_min, original_h_max, original_v_min, original_v_max = self._drag_domain
+            self.dialog.padding_spin(horizontal_axis + "_min").setValue(
+                float(horizontal_base[0]) - (original_h_min + delta_h)
+            )
+            self.dialog.padding_spin(horizontal_axis + "_max").setValue(
+                (original_h_max + delta_h) - float(horizontal_base[1])
+            )
+            self.dialog.padding_spin(vertical_axis + "_min").setValue(
+                float(vertical_base[0]) - (original_v_min + delta_v)
+            )
+            self.dialog.padding_spin(vertical_axis + "_max").setValue(
+                (original_v_max + delta_v) - float(vertical_base[1])
+            )
             self.update()
             return
-        if "min" in self._drag_edges:
-            self.dialog.padding_spin(axis.lower()[0] + "_min").setValue(base_min - horizontal)
-        if "max" in self._drag_edges:
-            self.dialog.padding_spin(axis.lower()[0] + "_max").setValue(horizontal - base_max)
-        if "z_min" in self._drag_edges:
-            self.dialog.padding_spin("z_min").setValue(state["z_base"][0] - vertical)
-        if "z_max" in self._drag_edges:
-            self.dialog.padding_spin("z_max").setValue(vertical - state["z_base"][1])
+        if horizontal_axis + "_min" in self._drag_edges:
+            self.dialog.padding_spin(horizontal_axis + "_min").setValue(
+                float(horizontal_base[0]) - horizontal
+            )
+        if horizontal_axis + "_max" in self._drag_edges:
+            self.dialog.padding_spin(horizontal_axis + "_max").setValue(
+                horizontal - float(horizontal_base[1])
+            )
+        if vertical_axis + "_min" in self._drag_edges:
+            self.dialog.padding_spin(vertical_axis + "_min").setValue(
+                float(vertical_base[0]) - vertical
+            )
+        if vertical_axis + "_max" in self._drag_edges:
+            self.dialog.padding_spin(vertical_axis + "_max").setValue(
+                vertical - float(vertical_base[1])
+            )
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt API
@@ -992,6 +1113,7 @@ class LumericalSweepDialog(QDialog):
         self.resize(1120, min(880, max(430, 250 + 52 * len(self.parameters))))
         self.setMinimumSize(920, 430)
         outer = QVBoxLayout(self)
+        self.outer_layout = outer
         explanation = QLabel(
             "Select the geometry parameters to sweep. Start and stop are inclusive; Points controls "
             "how many values are simulated on that axis. Multiple checked rows form a Cartesian grid. "
@@ -1007,6 +1129,7 @@ class LumericalSweepDialog(QDialog):
         speed_note.setWordWrap(True)
         speed_note.setStyleSheet("color:#0f766e; font-weight:600;")
         outer.addWidget(speed_note)
+        self.speed_note = speed_note
 
         self.table = QTableWidget(len(self.parameters), 7)
         self.table.setHorizontalHeaderLabels(
@@ -1022,9 +1145,12 @@ class LumericalSweepDialog(QDialog):
             str(axis.get("parameter", "")): axis
             for axis in self.saved.get("axes", [])
         }
+        component_kind = str(component.get("kind", ""))
         default_keys = (
             {"pitch", "duty_cycle", "fill_factor"}
-            if str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"}
+            if component_kind in {"Grating coupler", "GC-SOI"}
+            else {"mmi_length"}
+            if component_kind == "1x2 MMI"
             else ({str(self.parameters[0]["parameter"])} if self.parameters else set())
         )
         for row, metadata in enumerate(self.parameters):
@@ -1095,16 +1221,26 @@ class LumericalSweepDialog(QDialog):
         self.run_count.setWordWrap(True)
         outer.addWidget(self.run_count)
         output_note = QLabel(
-            "Grating result names include every selected value, for example CE-P=0.75-F=0.56.png. "
-            "A maximum-CE summary plot and CSV are generated after all runs."
+            (
+                "MMI result names include every selected value. Each case stores upper/input, "
+                "lower/input, total/input, and the 50/50 splitting fractions in linear power. "
+                "The sweep summary uses upper-branch power divided by measured input power."
+            )
+            if component_kind == "1x2 MMI"
+            else (
+                "Grating result names include every selected value, for example CE-P=0.75-F=0.56.png. "
+                "A maximum-CE summary plot and CSV are generated after all runs."
+            )
         )
         output_note.setWordWrap(True)
         outer.addWidget(output_note)
+        self.output_note = output_note
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Continue to stack and FDTD settings…")
         buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
+        self.buttons = buttons
         self._update_run_count()
 
     def _update_run_count(self, *_args) -> None:
@@ -1167,6 +1303,363 @@ class LumericalSweepDialog(QDialog):
         if self._accepted_spec is None:
             return normalize_lumerical_sweep_spec(self.component, self._raw_axes())
         return deepcopy(self._accepted_spec)
+
+
+class LumericalOptimizationDialog(QDialog):
+    """Choose adjoint geometry/alignment parameters and the target band."""
+
+    def __init__(
+        self,
+        component: dict[str, Any],
+        saved: dict[str, Any] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.component = component
+        self.saved = deepcopy(saved or {})
+        self.parameters = adjoint_optimizable_component_parameters(component)
+        self.editors: list[dict[str, Any]] = []
+        self._accepted_spec: dict[str, Any] | None = None
+        component_kind = str(component.get("kind", "component"))
+        self.setWindowTitle(f"Lumerical adjoint optimization — {component_kind}")
+        self.resize(1120, min(900, max(610, 390 + 52 * len(self.parameters))))
+        self.setMinimumSize(920, 610)
+
+        outer = QVBoxLayout(self)
+        explanation = QLabel(
+            "Select the continuous geometry or fiber-alignment parameters that the optimizer may change. "
+            "Minimum and maximum are hard bounds; Current is the initial value. The exact project "
+            "JSON parameter name is shown in brackets."
+        )
+        explanation.setWordWrap(True)
+        outer.addWidget(explanation)
+
+        speed_note = QLabel(
+            (
+                "Device-geometry variables use true shape-adjoint gradients. angle_theta and "
+                "fiber_offset use a bounded GPU forward-solve alignment stage, where the fiber, "
+                "source, and passive power plane move together, and are then frozen for LumOpt."
+            )
+            if component_kind in {"Grating coupler", "GC-SOI"}
+            else (
+                "True shape-adjoint mode uses one forward and one adjoint electromagnetic solve per "
+                "iteration, independent of the number of selected continuous geometry parameters."
+            )
+        )
+        speed_note.setWordWrap(True)
+        speed_note.setStyleSheet("color:#0f766e; font-weight:600;")
+        outer.addWidget(speed_note)
+
+        self.table = QTableWidget(len(self.parameters), 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Optimize", "Parameter [JSON name]", "Current", "Minimum", "Maximum"]
+        )
+        self.table.verticalHeader().setDefaultSectionSize(46)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column in (2, 3, 4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+
+        saved_parameters = {
+            str(row.get("parameter", "")): row
+            for row in self.saved.get("parameters", [])
+        }
+        default_keys = (
+            {"pitch", "duty_cycle", "fill_factor"}
+            if component_kind in {"Grating coupler", "GC-SOI"}
+            else {"mmi_length", "mmi_width"}
+            if component_kind == "1x2 MMI"
+            else set()
+        )
+        for row, metadata in enumerate(self.parameters):
+            key = str(metadata["parameter"])
+            nominal = float(metadata.get("nominal", metadata.get("initial", 0.0)))
+            saved_row = saved_parameters.get(key)
+            checked = bool(saved_row) or (not saved_parameters and key in default_keys)
+            check = QCheckBox()
+            check.setChecked(checked)
+            check.setToolTip("Allow the adjoint optimizer to change this geometry parameter")
+            self.table.setCellWidget(row, 0, check)
+
+            label = QTableWidgetItem(f"{metadata.get('label', key)}  [{key}]")
+            label.setToolTip(f"Exact project JSON key: {key}")
+            label.setFlags(label.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 1, label)
+            current = QTableWidgetItem(format(nominal, ".9g"))
+            current.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            current.setFlags(current.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 2, current)
+
+            if saved_row:
+                minimum_value = float(
+                    saved_row.get("minimum", saved_row.get("min", nominal))
+                )
+                maximum_value = float(
+                    saved_row.get("maximum", saved_row.get("max", nominal))
+                )
+            elif key in {"duty_cycle", "fill_factor"}:
+                minimum_value = max(0.001, nominal - 0.05)
+                maximum_value = min(0.999, nominal + 0.05)
+            else:
+                delta = max(abs(nominal) * 0.05, 0.01)
+                minimum_value = nominal - delta
+                maximum_value = nominal + delta
+                if component_kind == "1x2 MMI" and key == "mmi_width":
+                    # Both symmetric output tapers must fit across the MMI body:
+                    # mmi_width >= port_sep + taper_width.  The stock 6 um body
+                    # has only 50 nm of lower-side clearance, so a generic -5%
+                    # default would make the very first export fail preflight.
+                    required_width = float(
+                        component.get("params", {}).get("port_sep", 0.0)
+                    ) + float(component.get("params", {}).get("taper_width", 0.0))
+                    minimum_value = max(minimum_value, required_width)
+
+            minimum = QDoubleSpinBox()
+            maximum = QDoubleSpinBox()
+            for box, value in ((minimum, minimum_value), (maximum, maximum_value)):
+                box.setRange(-1e9, 1e9)
+                box.setDecimals(9)
+                box.setValue(float(value))
+                box.setMinimumWidth(145)
+                box.setKeyboardTracking(False)
+            self.table.setCellWidget(row, 3, minimum)
+            self.table.setCellWidget(row, 4, maximum)
+            self.editors.append(
+                {
+                    **metadata,
+                    "check": check,
+                    "minimum": minimum,
+                    "maximum": maximum,
+                    "initial": nominal,
+                }
+            )
+        outer.addWidget(self.table, 1)
+
+        objective_group = QWidget()
+        objective_form = QFormLayout(objective_group)
+        objective = dict(self.saved.get("objective", {}))
+        default_center_um = 1.55 if component_kind == "GC-SOI" else 1.30
+        center_um = float(
+            objective.get(
+                "center_wavelength_um",
+                self.saved.get("center_wavelength_um", default_center_um),
+            )
+        )
+        bandwidth_nm = float(
+            objective.get("bandwidth_nm", self.saved.get("bandwidth_nm", 100.0))
+        )
+        wavelength_points = int(
+            objective.get(
+                "wavelength_points",
+                self.saved.get("wavelength_points", 7 if bandwidth_nm > 0.0 else 1),
+            )
+        )
+        optimizer = dict(self.saved.get("optimizer", {}))
+
+        self.center_wavelength = QDoubleSpinBox()
+        self.center_wavelength.setRange(0.01, 1000.0)
+        self.center_wavelength.setDecimals(9)
+        self.center_wavelength.setValue(center_um)
+        self.center_wavelength.setSuffix(" µm")
+        self.center_wavelength.setMinimumWidth(180)
+        objective_form.addRow("Center wavelength", self.center_wavelength)
+
+        self.bandwidth = QDoubleSpinBox()
+        self.bandwidth.setRange(0.0, 1e6)
+        self.bandwidth.setDecimals(6)
+        self.bandwidth.setValue(max(0.0, bandwidth_nm))
+        self.bandwidth.setSuffix(" nm")
+        self.bandwidth.setSpecialValueText("Single wavelength")
+        self.bandwidth.setMinimumWidth(180)
+        objective_form.addRow("Optimization bandwidth", self.bandwidth)
+
+        self.wavelength_points = QSpinBox()
+        self.wavelength_points.setRange(1, 1001)
+        self.wavelength_points.setValue(max(1, wavelength_points))
+        self.wavelength_points.setMinimumWidth(180)
+        self.wavelength_points.setToolTip(
+            "Spectral samples used by the broadband adjoint objective. Keep this modest for 3D optimization."
+        )
+        objective_form.addRow("Objective wavelength samples", self.wavelength_points)
+
+        self.max_iterations = QSpinBox()
+        self.max_iterations.setRange(1, 10000)
+        self.max_iterations.setValue(
+            max(1, int(optimizer.get("max_iterations", self.saved.get("max_iterations", 30))))
+        )
+        self.max_iterations.setMinimumWidth(180)
+        objective_form.addRow("Maximum optimizer iterations", self.max_iterations)
+        outer.addWidget(objective_group)
+
+        objective_note = QLabel(
+            (
+                "Objective: maximize fiber-to-waveguide coupling efficiency across the selected band. "
+                "The final notebook also reports the measured forward-fiber normalization."
+            )
+            if component_kind in {"Grating coupler", "GC-SOI"}
+            else (
+                "Objective: maximize top/upper output-branch fundamental-TE power divided by input power. "
+                "The MMI parameterization remains mirror-symmetric, and both output branches are reported."
+            )
+        )
+        objective_note.setWordWrap(True)
+        outer.addWidget(objective_note)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Continue to stack and FDTD settings…"
+        )
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        outer.addWidget(buttons)
+
+        self.bandwidth.valueChanged.connect(self._bandwidth_changed)
+        self._bandwidth_changed(self.bandwidth.value())
+
+    def _bandwidth_changed(self, bandwidth_nm: float) -> None:
+        single_wavelength = float(bandwidth_nm) <= 0.0
+        if single_wavelength:
+            self.wavelength_points.setValue(1)
+        elif self.wavelength_points.value() < 2:
+            self.wavelength_points.setValue(7)
+        self.wavelength_points.setEnabled(not single_wavelength)
+
+    def _raw_parameters(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "parameter": str(editor["parameter"]),
+                "initial": float(editor["initial"]),
+                "minimum": float(editor["minimum"].value()),
+                "maximum": float(editor["maximum"].value()),
+            }
+            for editor in self.editors
+            if editor["check"].isChecked()
+        ]
+
+    def _normalized_spec(self) -> dict[str, Any]:
+        return normalize_lumerical_optimization_spec(
+            self.component,
+            self._raw_parameters(),
+            center_wavelength_um=float(self.center_wavelength.value()),
+            bandwidth_nm=float(self.bandwidth.value()),
+            wavelength_points=int(self.wavelength_points.value()),
+            max_iterations=int(self.max_iterations.value()),
+        )
+
+    def _validate_and_accept(self) -> None:
+        try:
+            self._accepted_spec = self._normalized_spec()
+        except Exception as exc:
+            QMessageBox.critical(self, "Invalid Lumerical optimization", str(exc))
+            return
+        self.accept()
+
+    def optimization_spec(self) -> dict[str, Any]:
+        if self._accepted_spec is None:
+            return self._normalized_spec()
+        return deepcopy(self._accepted_spec)
+
+
+class LumericalMultigpuSweepDialog(LumericalSweepDialog):
+    """Collect sweep axes plus the independent multi-A100 worker allocation."""
+
+    def __init__(
+        self,
+        component: dict[str, Any],
+        saved: dict[str, Any] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(component, saved=saved, parent=parent)
+        self.setWindowTitle(
+            f"Lumerical sweep-multithread — {component.get('kind', 'component')}"
+        )
+        self.resize(1120, min(940, max(650, 390 + 52 * len(self.parameters))))
+        self.setMinimumSize(920, 610)
+        self.speed_note.setText(
+            "Multi-GPU mode: independent persistent workers share one prepared model and distribute "
+            "sweep points across A100 nodes. This is a separate export and does not change the "
+            "single-session sequential sweep."
+        )
+
+        stored_parallel = dict(self.saved.get("parallel", {}))
+        self.parallel_panel = QWidget()
+        parallel_layout = QVBoxLayout(self.parallel_panel)
+        parallel_layout.setContentsMargins(0, 8, 0, 8)
+        heading = QLabel("Parallel A100 allocation")
+        heading.setStyleSheet("font-weight:700;")
+        parallel_layout.addWidget(heading)
+        parallel_form = QFormLayout()
+        self.a100_nodes = QSpinBox()
+        self.a100_nodes.setRange(1, 64)
+        self.a100_nodes.setValue(
+            max(1, min(64, int(stored_parallel.get("node_count", 8))))
+        )
+        self.a100_nodes.setSuffix(" A100 node(s)")
+        self.a100_nodes.setToolTip(
+            "Number of existing, idle, pre-authorized 1xA100 nodes made available to the exported notebook."
+        )
+        parallel_form.addRow("A100 nodes", self.a100_nodes)
+
+        self.simulations_per_gpu = QSpinBox()
+        # Production safety policy: each A100 owns exactly one independent
+        # FDTD process.  Do not honor older saved experiments that requested
+        # two processes on a GPU; safe sharing needs model-memory and licence
+        # preflight that the exporter does not implement yet.
+        self.simulations_per_gpu.setRange(1, 1)
+        self.simulations_per_gpu.setValue(1)
+        self.simulations_per_gpu.setEnabled(False)
+        self.simulations_per_gpu.setSuffix(" simulation(s) / GPU")
+        self.simulations_per_gpu.setToolTip(
+            "Fixed at one independent Lumerical FDTD process per A100. Multiple processes on one GPU "
+            "remain unavailable until model-memory and licence preflight is implemented."
+        )
+        parallel_form.addRow(
+            "Simulations per GPU (production limit)", self.simulations_per_gpu
+        )
+        parallel_layout.addLayout(parallel_form)
+
+        self.parallel_summary = QLabel()
+        self.parallel_summary.setWordWrap(True)
+        parallel_layout.addWidget(self.parallel_summary)
+        warning = QLabel(
+            "Production safeguard: each selected A100 runs exactly one independent simulation. "
+            "Multiple Lumerical processes on one GPU are intentionally unavailable until "
+            "model-memory and licence preflight is implemented."
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color:#0f766e; font-weight:600;")
+        parallel_layout.addWidget(warning)
+
+        insert_at = self.outer_layout.indexOf(self.output_note)
+        self.outer_layout.insertWidget(insert_at, self.parallel_panel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Continue to stack parameters…"
+        )
+        self.a100_nodes.valueChanged.connect(self._update_parallel_summary)
+        self.simulations_per_gpu.valueChanged.connect(self._update_parallel_summary)
+        self._update_parallel_summary()
+
+    def _update_parallel_summary(self, *_args) -> None:
+        slots = int(self.a100_nodes.value()) * int(self.simulations_per_gpu.value())
+        self.parallel_summary.setText(
+            f"Up to {slots} sweep simulations can run at the same time: one independent process "
+            "on each selected A100. The actual worker count is limited by the sweep-point count "
+            "and the A100 nodes available to the launcher."
+        )
+        self.parallel_summary.setStyleSheet("color:#0f766e; font-weight:600;")
+
+    def parallel_configuration(self) -> dict[str, int]:
+        node_count = int(self.a100_nodes.value())
+        simulations_per_gpu = 1
+        return {
+            "node_count": node_count,
+            "simulations_per_gpu": simulations_per_gpu,
+            "max_parallel_simulations": node_count * simulations_per_gpu,
+        }
 
 
 class LumericalExportDialog(QDialog):
@@ -1598,20 +2091,37 @@ class LumericalExportDialog(QDialog):
                 z_base_max = stack_ranges[-1][1]
         else:
             z_base_min, z_base_max = -1.0, 1.0
-        geometry_tops = [z1 for row, _, z1 in stack_ranges if str(row.get("role", "background")) == "geometry"]
-        device_top = max(geometry_tops, default=0.0)
+        geometry_ranges = [
+            (z0, z1)
+            for row, z0, z1 in stack_ranges
+            if str(row.get("role", "background")) == "geometry"
+        ]
+        device_top = max((z1 for _z0, z1 in geometry_ranges), default=0.0)
+        device_bottom = min((z0 for z0, _z1 in geometry_ranges), default=device_top)
+        device_z = 0.5 * (device_bottom + device_top)
         stack_top = stack_ranges[-1][2] if stack_ranges else device_top
         for component in self._preview_components():
             kind = str(component.get("kind", ""))
             params = component.get("params", {})
             if kind not in {"FDTD port", "Fiber-axis FDTD port", "Power monitor", "Mode expansion monitor", "Field profile monitor"}:
                 continue
-            if str(params.get("plane normal", "X")).upper() != "Z":
+            plane_normal = str(params.get("plane normal", "X")).upper()
+            if plane_normal == "Z":
+                reference_z = _stack_reference_z(params, stack_ranges, device_top, stack_top)
+                plane_z = reference_z + float(params.get("distance_um", 0.0))
+                z_base_min = min(z_base_min, plane_z)
+                z_base_max = max(z_base_max, plane_z)
                 continue
-            reference_z = _stack_reference_z(params, stack_ranges, device_top, stack_top)
-            port_z = reference_z + float(params.get("distance_um", 0.0))
-            z_base_min = min(z_base_min, port_z)
-            z_base_max = max(z_base_max, port_z)
+            z_span = max(
+                0.0,
+                float(params.get("z span", params.get("z_span_um", 2.0))),
+            )
+            if kind in {"Power monitor", "Mode expansion monitor", "Field profile monitor"} and str(
+                params.get("monitor geometry", "surface")
+            ).lower() == "line":
+                z_span = 0.0
+            z_base_min = min(z_base_min, device_z - 0.5 * z_span)
+            z_base_max = max(z_base_max, device_z + 0.5 * z_span)
         padding = {key: spin.value() for key, spin in self.domain_padding_spins.items()}
         return {
             "polygons": polygons,
@@ -1624,9 +2134,10 @@ class LumericalExportDialog(QDialog):
         }
 
     def _refresh_previews(self, *args) -> None:
-        if hasattr(self, "cross_section_preview"):
+        if hasattr(self, "cross_section_previews"):
             self._sync_domain_bounds()
-            self.cross_section_preview.update()
+            for preview in self.cross_section_previews:
+                preview.update()
 
     def _sync_domain_bounds(self) -> None:
         """Show the exact FDTD coordinates alongside the clearance controls."""
@@ -1646,6 +2157,18 @@ class LumericalExportDialog(QDialog):
             spin.blockSignals(True)
             spin.setValue(float(value))
             spin.blockSignals(False)
+        if hasattr(self, "domain_center_spins"):
+            for axis in ("x", "y", "z"):
+                minimum = float(values[axis + "_min"])
+                maximum = float(values[axis + "_max"])
+                center_spin = self.domain_center_spins[axis]
+                size_spin = self.domain_size_spins[axis]
+                center_spin.blockSignals(True)
+                size_spin.blockSignals(True)
+                center_spin.setValue(0.5 * (minimum + maximum))
+                size_spin.setValue(maximum - minimum)
+                center_spin.blockSignals(False)
+                size_spin.blockSignals(False)
 
     def _set_exact_domain_bound(self, key: str, value: float) -> None:
         """Convert an exact typed FDTD boundary back into geometry clearance."""
@@ -1654,7 +2177,38 @@ class LumericalExportDialog(QDialog):
         padding = float(base[0]) - value if key.endswith("_min") else value - float(base[1])
         self.domain_padding_spins[key].setValue(padding)
         self._sync_domain_bounds()
-        self.cross_section_preview.update()
+        for preview in self.cross_section_previews:
+            preview.update()
+
+    def _set_domain_center_or_size(
+        self,
+        axis: str,
+        *,
+        center: float | None = None,
+        size: float | None = None,
+    ) -> None:
+        """Update one exact FDTD center/span pair without changing geometry."""
+        state = self.preview_state()
+        base_min, base_max = state[axis + "_base"]
+        current_min = float(base_min) - float(state["padding"][axis + "_min"])
+        current_max = float(base_max) + float(state["padding"][axis + "_max"])
+        current_center = 0.5 * (current_min + current_max)
+        current_size = current_max - current_min
+        resolved_center = current_center if center is None else float(center)
+        resolved_size = current_size if size is None else max(1e-9, float(size))
+        new_min = resolved_center - 0.5 * resolved_size
+        new_max = resolved_center + 0.5 * resolved_size
+        minimum_padding = float(base_min) - new_min
+        maximum_padding = new_max - float(base_max)
+        minimum_spin = self.domain_padding_spins[axis + "_min"]
+        maximum_spin = self.domain_padding_spins[axis + "_max"]
+        minimum_spin.blockSignals(True)
+        maximum_spin.blockSignals(True)
+        minimum_spin.setValue(minimum_padding)
+        maximum_spin.setValue(maximum_padding)
+        minimum_spin.blockSignals(False)
+        maximum_spin.blockSignals(False)
+        self._refresh_previews()
 
     def _connect_stack_preview_signals(self) -> None:
         for row in range(self.stack_table.rowCount()):
@@ -1677,17 +2231,27 @@ class LumericalExportDialog(QDialog):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         top = QHBoxLayout()
-        self.preview_plane = QComboBox(); self.preview_plane.addItems(["XZ", "YZ"])
         reset_button = QPushButton("Reset domain clearances to λ/4")
         official_gc_button = QPushButton("Apply fast GC-SOI domain")
-        fit_preview_button = QPushButton("Fit preview")
+        fit_preview_button = QPushButton("Fit both views")
         show_3d_button = QPushButton("Show me a 3D version of the file I have built")
         show_3d_button.setMinimumHeight(44)
-        top.addWidget(QLabel("Cross-section plane")); top.addWidget(self.preview_plane)
+        top.addWidget(QLabel("Synchronized FDTD views: stack cross-section (XZ) + top/GDS layout (XY)"))
         top.addStretch(1); top.addWidget(fit_preview_button); top.addWidget(reset_button); top.addWidget(official_gc_button); top.addWidget(show_3d_button)
         layout.addLayout(top)
-        self.cross_section_preview = CrossSectionDomainPreview(self)
-        layout.addWidget(self.cross_section_preview, 1)
+        preview_row = QHBoxLayout()
+        self.xz_cross_section_preview = CrossSectionDomainPreview(self, "XZ")
+        self.xy_top_view_preview = CrossSectionDomainPreview(self, "XY")
+        self.cross_section_previews = (
+            self.xz_cross_section_preview,
+            self.xy_top_view_preview,
+        )
+        # Keep the historical attribute as an XZ alias for compatibility with
+        # callers that only need one preview reference.
+        self.cross_section_preview = self.xz_cross_section_preview
+        preview_row.addWidget(self.xz_cross_section_preview, 1)
+        preview_row.addWidget(self.xy_top_view_preview, 1)
+        layout.addLayout(preview_row, 1)
         bounds_grid = QGridLayout()
         bounds_grid.addWidget(QLabel("Exact FDTD bounds (µm)"), 0, 0, 1, 2)
         self.domain_bound_spins: dict[str, QDoubleSpinBox] = {}
@@ -1705,9 +2269,43 @@ class LumericalExportDialog(QDialog):
             bounds_grid.addWidget(QLabel(label), row, column)
             bounds_grid.addWidget(spin, row, column + 1)
         layout.addLayout(bounds_grid)
+        center_size_grid = QGridLayout()
+        center_size_grid.addWidget(QLabel("Direct FDTD center and size (µm)"), 0, 0, 1, 6)
+        self.domain_center_spins: dict[str, QDoubleSpinBox] = {}
+        self.domain_size_spins: dict[str, QDoubleSpinBox] = {}
+        for column_index, axis in enumerate(("x", "y", "z")):
+            center_spin = QDoubleSpinBox()
+            center_spin.setRange(-1e6, 1e6)
+            center_spin.setDecimals(6)
+            center_spin.setSuffix(" µm")
+            center_spin.setMinimumWidth(165)
+            size_spin = QDoubleSpinBox()
+            size_spin.setRange(1e-6, 2e6)
+            size_spin.setDecimals(6)
+            size_spin.setSuffix(" µm")
+            size_spin.setMinimumWidth(165)
+            center_spin.valueChanged.connect(
+                lambda value, domain_axis=axis: self._set_domain_center_or_size(
+                    domain_axis, center=value
+                )
+            )
+            size_spin.valueChanged.connect(
+                lambda value, domain_axis=axis: self._set_domain_center_or_size(
+                    domain_axis, size=value
+                )
+            )
+            self.domain_center_spins[axis] = center_spin
+            self.domain_size_spins[axis] = size_spin
+            grid_column = 2 * column_index
+            center_size_grid.addWidget(QLabel(axis.upper() + " center"), 1, grid_column)
+            center_size_grid.addWidget(center_spin, 1, grid_column + 1)
+            center_size_grid.addWidget(QLabel(axis.upper() + " size"), 2, grid_column)
+            center_size_grid.addWidget(size_spin, 2, grid_column + 1)
+        layout.addLayout(center_size_grid)
         instructions = QLabel(
             "Drag inside the red FDTD box to move its center; drag an edge/corner to resize, or type exact X/Y/Z bounds. "
-            "Switch between XZ and YZ to resize all six domain boundaries. "
+            "The left XZ view looks through the material stack and edits X/Z. The right XY view is the true top/GDS view of the selected exported polygons and edits X/Y. "
+            "Both views share the same X-min/X-max values, so an X drag in either view updates both immediately. "
             "Boundaries are unrestricted and may be placed inside Air or other layers. The material stack remains fixed while the red box moves independently."
         )
         instructions.setWordWrap(True); layout.addWidget(instructions)
@@ -1716,6 +2314,10 @@ class LumericalExportDialog(QDialog):
         def reset_domain() -> None:
             quarter_wave = 0.25 * min(self.wavelength_start.value(), self.wavelength_stop.value())
             for spin in self.domain_padding_spins.values(): spin.setValue(quarter_wave)
+
+        def fit_cross_section_previews() -> None:
+            for preview in self.cross_section_previews:
+                preview.reset_view()
 
         def apply_official_gc_domain() -> None:
             """Place the editable FDTD box like the official 3D SOI example."""
@@ -1791,7 +2393,8 @@ class LumericalExportDialog(QDialog):
                 self.domain_padding_spins[key].setValue(padding)
             self.official_gc_domain.setChecked(True)
             self._sync_domain_bounds()
-            self.cross_section_preview.reset_view()
+            for preview in self.cross_section_previews:
+                preview.reset_view()
 
         def show_3d() -> None:
             preview_dialog = QDialog(self)
@@ -1850,9 +2453,8 @@ class LumericalExportDialog(QDialog):
 
         reset_button.clicked.connect(reset_domain)
         official_gc_button.clicked.connect(apply_official_gc_domain)
-        fit_preview_button.clicked.connect(self.cross_section_preview.reset_view)
+        fit_preview_button.clicked.connect(fit_cross_section_previews)
         show_3d_button.clicked.connect(show_3d)
-        self.preview_plane.currentTextChanged.connect(lambda *_: self.cross_section_preview.reset_view())
         self.scope.currentIndexChanged.connect(self._refresh_previews)
         self.geometry_table.itemChanged.connect(self._refresh_previews)
         self.stack_table.itemChanged.connect(self._refresh_previews)
