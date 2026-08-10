@@ -8,6 +8,8 @@ import tempfile
 import unittest
 import zipfile
 
+from build_windows_bundle import bundle_payload
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_CMD = ROOT / "Max Layout Windows.cmd"
@@ -234,7 +236,10 @@ class WindowsBundleTests(unittest.TestCase):
                 names = set(archive.namelist())
                 self.assertEqual(names, set(BUNDLE_FILES))
                 for archive_name, source_path in BUNDLE_FILES.items():
-                    self.assertEqual(archive.read(archive_name), source_path.read_bytes())
+                    self.assertEqual(
+                        archive.read(archive_name),
+                        bundle_payload(source_path, archive_name),
+                    )
 
                 for archive_name in names:
                     path = PurePosixPath(archive_name)
@@ -256,7 +261,7 @@ class WindowsBundleTests(unittest.TestCase):
             for archive_name, source_path in BUNDLE_FILES.items():
                 self.assertEqual(
                     archive.read(archive_name),
-                    source_path.read_bytes(),
+                    bundle_payload(source_path, archive_name),
                     "%s is stale in the tracked Windows ZIP" % archive_name,
                 )
 

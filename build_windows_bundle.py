@@ -42,6 +42,28 @@ BUNDLE_FILES = (
 )
 
 
+def bundle_payload(source: Path, archive_name: str) -> bytes:
+    """Return platform-independent bytes for one public bundle entry.
+
+    Git may check text files out with CRLF on Windows and LF on macOS.  Keep
+    Python/docs/license files as LF, and make the two Windows command formats
+    explicitly CRLF, so rebuilding or verifying the release is deterministic
+    on either operating system.
+    """
+    data = source.read_bytes()
+    lower_name = archive_name.casefold()
+    is_text = (
+        lower_name == "license"
+        or lower_name.endswith((".cmd", ".ps1", ".py", ".txt"))
+    )
+    if not is_text:
+        return data
+    normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    if lower_name.endswith((".cmd", ".ps1")):
+        return normalized.replace(b"\n", b"\r\n")
+    return normalized
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
@@ -59,7 +81,7 @@ def main() -> int:
         compresslevel=9,
     ) as archive:
         for source, archive_name in BUNDLE_FILES:
-            archive.write(source, archive_name)
+            archive.writestr(archive_name, bundle_payload(source, archive_name))
 
     size_kb = args.output.stat().st_size / 1024.0
     print(f'wrote "{args.output}" ({size_kb:.0f} KB)')
