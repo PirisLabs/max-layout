@@ -7,6 +7,16 @@
 # Claude Code local settings
 .claude/settings.local.json
 
+# Private Lambda/Lumerical launcher credentials
+**/LUMERICAL.txt
+**/lumerical-*.json
+**/remote-token.json
+**/.lambda-ssh/
+**/piris_alik
+**/piris_alik.pub
+**/piris_3d_*
+**/piris_windows_*
+
 # Python
 __pycache__/
 *.py[cod]

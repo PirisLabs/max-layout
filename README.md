@@ -9,23 +9,29 @@ Version 1 (V1) · **Built by Ali Khalatpour — Piris Labs** · MIT licensed
 
 ## Quick start
 
-**1. Download** [`Max Layout.pyz`](https://github.com/PirisLabs/max-layout/raw/main/Max%20Layout.pyz)
-— that one file is the whole application.
+### Windows — recommended one-click package
 
-**2. Run it** from the folder where you saved it:
+1. Download [`Max Layout Windows.zip`](https://github.com/PirisLabs/max-layout/raw/main/Max%20Layout%20Windows.zip).
+2. Choose **Extract All** in File Explorer. Do not run it from inside the ZIP.
+3. Double-click **Max Layout Windows.cmd** in the extracted folder.
+
+The first launch finds a compatible 64-bit Python or installs Python 3.12,
+creates a private Max Layout environment, installs `PySide6`, `numpy`, and
+`gdstk`, and opens the editor. Later launches reuse that environment and
+normally open immediately. No command line or separate dependency installation
+is required.
+
+### macOS / Linux
+
+Download [`Max Layout.pyz`](https://github.com/PirisLabs/max-layout/raw/main/Max%20Layout.pyz),
+then run it from the folder where you saved it:
 
 ```bash
-python3 "Max Layout.pyz"        # macOS / Linux
-py "Max Layout.pyz"             # Windows
+python3 "Max Layout.pyz"
 ```
 
-That is all. On first launch Max Layout installs the Python packages it needs
-(`PySide6`, `numpy`, `gdstk`) automatically, so the first start takes longer
-than later ones.
-
-Only Python 3.9 or newer is required up front. If you do not have it, install
-from [python.org](https://www.python.org/downloads/) — on Windows, check
-**Add Python to PATH** during installation.
+The cross-platform archive installs its three runtime packages automatically on
+first launch. Python 3.9 or newer is required up front for this manual route.
 
 More detail: [macOS](#macos-step-by-step) · [Windows](#windows-step-by-step) ·
 [Troubleshooting](#troubleshooting) · [Building from source](#building-from-source)
@@ -34,13 +40,13 @@ More detail: [macOS](#macos-step-by-step) · [Windows](#windows-step-by-step) ·
 
 ## What file do I run?
 
-```text
-Max Layout.pyz
-```
+On Windows, extract `Max Layout Windows.zip` and double-click
+`Max Layout Windows.cmd`. On macOS or Linux, run `Max Layout.pyz` with Python.
 
-The `.pyz` contains every Max Layout program file: component generators, menus,
-defaults, Boolean tools, lattice tools, and GDS/project export code. You do not
-need to download anything else to run it.
+The `.pyz` inside the Windows package is the same complete application archive:
+component generators, menus, defaults, Boolean tools, lattice tools, and
+GDS/project export code. The other small Windows files provide the first-run
+installer and double-click entry points.
 
 The readable source for that archive lives in `src/`. See
 [Building from source](#building-from-source) if you want to modify the program.
@@ -83,26 +89,51 @@ python3 -m pip install --user PySide6 numpy gdstk
 
 ## Windows step by step
 
-1. Install Python 3.9 or newer from
-   [python.org](https://www.python.org/downloads/). During installation, check
-   **Add Python to PATH**.
-2. Open **PowerShell** in the folder containing `Max Layout.pyz`.
-3. Run Max Layout:
+1. Download [`Max Layout Windows.zip`](https://github.com/PirisLabs/max-layout/raw/main/Max%20Layout%20Windows.zip).
+2. Right-click the downloaded ZIP and choose **Extract All**.
+3. Open the extracted folder and double-click `Max Layout Windows.cmd`.
+4. Keep the setup window open during the first launch. It closes the setup work
+   after the editor has started; any error remains visible and points to its log.
+
+Max Layout keeps its private Windows environment and setup logs under:
+
+```text
+%LOCALAPPDATA%\PirisLabs\MaxLayout
+```
+
+The launcher installs Python for the current Windows user if no compatible
+64-bit version exists. Administrator rights are not normally required. If you
+prefer the manual route, download `Max Layout.pyz` and run:
 
 ```powershell
 py "Max Layout.pyz"
 ```
 
-You can also use the complete path:
+### Start a Lambda node / 3D simulation on Windows
 
-```powershell
-py "C:\Users\YOUR_NAME\Desktop\Max Layout\Max Layout.pyz"
-```
+The same extracted package includes
+`Start Piris 3D Simulations Windows.cmd`. Double-click it to start the project,
+notebook, Lambda-node, browser, result-sync, and one-hour idle-termination
+workflow used by the Mac launcher.
 
-4. Only if the automatic dependency install fails:
+The confidential **Piris 3D Launcher** folder is deliberately not included in
+this public repository or ZIP because it contains company credentials. On first
+launch, Windows searches common locations and then asks you to select that
+private folder. Its location is remembered locally. The setup installs the
+Google Drive packages and Windows OpenSSH Client when needed; it does not copy
+credentials into Max Layout or GitHub.
 
-```powershell
-py -m pip install PySide6 numpy gdstk
+For SSH access, the launcher offers the Ali shared key from
+`%USERPROFILE%\.ssh\piris_alik` (or the path in
+`PIRIS_SHARED_SSH_PRIVATE_KEY`). It can instead create a new key dedicated to
+that Windows computer; the new public key is registered and the matching
+private key is used immediately for the selected Lambda node. Private keys are
+never included in the public repository or Windows ZIP.
+
+Its setup logs are stored under:
+
+```text
+%LOCALAPPDATA%\PirisLabs\3DLauncher\logs
 ```
 
 ## Troubleshooting
@@ -116,8 +147,16 @@ py -m pip install PySide6 numpy gdstk
 
 **The window does not appear, or PySide6 fails to import**
 
-Install the packages manually with the `pip` command for your platform above,
-then run Max Layout again.
+For a manual Windows `.pyz` launch, run
+`py -m pip install PySide6 numpy gdstk`. On macOS, use the `python3` command
+shown above. Then run Max Layout again.
+
+**The Windows first-run setup stops**
+
+Read the final message in the setup window, then open the newest log under
+`%LOCALAPPDATA%\PirisLabs\MaxLayout\logs`. For the Lambda launcher, use
+`%LOCALAPPDATA%\PirisLabs\3DLauncher\logs`. Make sure the complete ZIP was
+extracted before double-clicking either launcher.
 
 **Large layouts feel slow**
 
@@ -377,8 +416,20 @@ python3 build.py
 ```
 
 That byte-compiles every module, then writes `Max Layout.pyz` as a zipapp with
-`src/__main__.py` as the entry point. To run straight from source without
-building:
+`src/__main__.py` as the entry point.
+
+After rebuilding the `.pyz`, create the extract-and-double-click Windows
+distribution with:
+
+```bash
+python3 build_windows_bundle.py
+```
+
+That writes `Max Layout Windows.zip` from an explicit public-file allowlist.
+The bundle contains both Windows launchers and their bootstrap files, but never
+the private Piris 3D Launcher, Lambda tokens, Google credentials, or SSH keys.
+
+To run straight from source without building:
 
 ```bash
 python3 src

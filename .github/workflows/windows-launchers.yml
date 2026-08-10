@@ -1,0 +1,50 @@
+name: Windows launchers
+
+on:
+  pull_request:
+    paths:
+      - "Max Layout Windows.cmd"
+      - "Max Layout Windows.zip"
+      - "Max Layout.pyz"
+      - "LICENSE"
+      - ".gitignore"
+      - "Start Piris 3D Simulations Windows.cmd"
+      - "windows/**"
+      - "build_windows_bundle.py"
+      - "tests/test_windows_launchers.py"
+      - ".github/workflows/windows-launchers.yml"
+  push:
+    paths:
+      - "Max Layout Windows.cmd"
+      - "Max Layout Windows.zip"
+      - "Max Layout.pyz"
+      - "LICENSE"
+      - ".gitignore"
+      - "Start Piris 3D Simulations Windows.cmd"
+      - "windows/**"
+      - "build_windows_bundle.py"
+      - "tests/test_windows_launchers.py"
+      - ".github/workflows/windows-launchers.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  launcher-contracts:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Parse Windows PowerShell files
+        shell: powershell
+        run: |
+          Get-ChildItem -LiteralPath windows -Filter *.ps1 | ForEach-Object {
+            [void][scriptblock]::Create((Get-Content -LiteralPath $_.FullName -Raw))
+          }
+      - name: Run launcher and bundle tests
+        run: python -m unittest discover -s tests -p test_windows_launchers.py
+      - name: Build the public Windows ZIP
+        run: python build_windows_bundle.py --output "${{ runner.temp }}\Max Layout Windows.zip"
