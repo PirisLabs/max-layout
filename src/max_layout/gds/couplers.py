@@ -127,6 +127,7 @@ def add_parent_focusing_gc(
         gds_file=None,
         tolerance=float(p.get("gc_tolerance", p.get("tolerance", 0.0005))),
         L_extra=float(p.get("gc_L_extra", p.get("L_extra", 0.0))),
+        tooth_shape=str(p.get("gc_tooth_shape", p.get("tooth_shape", "curved"))),
     )
 
     connector_local = np.array(
@@ -184,6 +185,9 @@ def add_soi_grating_coupler(
     additional 100 nm silicon.  With the matching stack preset this reproduces
     the example's 220 nm device layer and 100 nm partial etch.
     """
+    tooth_shape = str(p.get("tooth_shape", "curved")).strip().lower()
+    if tooth_shape not in {"curved", "rectangular"}:
+        raise ValueError("GC-SOI tooth_shape must be 'curved' or 'rectangular'.")
     pitch = float(
         _required_grating_parameter(
             p,
@@ -226,7 +230,11 @@ def add_soi_grating_coupler(
     # grating, the terminal sector begins after the final tooth's own gap.
     grating_length = period_count * pitch + float(gap_widths[-1])
     half_angle = float(np.arcsin(0.5 * y_span / radius))
-    taper_length = radius * float(np.cos(half_angle))
+    taper_length = (
+        radius * float(np.cos(half_angle))
+        if tooth_shape == "curved"
+        else radius
+    )
     focus = np.array([wg_length, 0.0], dtype=float)
 
     def transformed(points: np.ndarray, layer: int, datatype: int) -> gdstk.Polygon:
@@ -243,6 +251,23 @@ def add_soi_grating_coupler(
         outer_points = focus + np.column_stack((outer * np.cos(angles), outer * np.sin(angles)))
         inner_points = focus + np.column_stack((inner * np.cos(angles[::-1]), inner * np.sin(angles[::-1])))
         return transformed(np.vstack((outer_points, inner_points)), layer, datatype)
+
+    def rectangular(
+        x_min: float, x_max: float, layer: int, datatype: int
+    ) -> gdstk.Polygon:
+        return transformed(
+            np.asarray(
+                [
+                    [x_min, -y_span / 2.0],
+                    [x_max, -y_span / 2.0],
+                    [x_max, y_span / 2.0],
+                    [x_min, y_span / 2.0],
+                ],
+                dtype=float,
+            ),
+            layer,
+            datatype,
+        )
 
     waveguide = np.array(
         [[0.0, -wg_width / 2.0], [wg_length, -wg_width / 2.0],
@@ -266,15 +291,45 @@ def add_soi_grating_coupler(
     for layer, datatype in ((slab_layer, slab_datatype), (etched_layer, etched_datatype)):
         top.add(transformed(waveguide, layer, datatype))
         top.add(transformed(taper, layer, datatype))
-        top.add(annular(taper_length, radius, layer, datatype))
-        top.add(annular(radius + grating_length, radius + grating_length + extra_length, layer, datatype))
+        if tooth_shape == "curved":
+            top.add(annular(taper_length, radius, layer, datatype))
+            top.add(annular(radius + grating_length, radius + grating_length + extra_length, layer, datatype))
+        elif extra_length > 0.0:
+            top.add(
+                rectangular(
+                    float(focus[0] + radius + grating_length),
+                    float(focus[0] + radius + grating_length + extra_length),
+                    layer,
+                    datatype,
+                )
+            )
 
     # The residual slab is continuous beneath every etched grating period.
-    top.add(annular(radius, radius + grating_length, slab_layer, slab_datatype))
+    if tooth_shape == "curved":
+        top.add(annular(radius, radius + grating_length, slab_layer, slab_datatype))
+    else:
+        top.add(
+            rectangular(
+                float(focus[0] + radius),
+                float(focus[0] + radius + grating_length),
+                slab_layer,
+                slab_datatype,
+            )
+        )
     for index in range(period_count):
         inner = radius + index * pitch + float(gap_widths[index])
         outer = inner + float(tooth_widths[index])
-        top.add(annular(inner, outer, etched_layer, etched_datatype))
+        if tooth_shape == "curved":
+            top.add(annular(inner, outer, etched_layer, etched_datatype))
+        else:
+            top.add(
+                rectangular(
+                    float(focus[0] + inner),
+                    float(focus[0] + outer),
+                    etched_layer,
+                    etched_datatype,
+                )
+            )
 
 
 def add_routed_parent_gc(

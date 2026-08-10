@@ -320,7 +320,13 @@ FOM from the final best-design forward validation and record the optimizer,
 bounds, derived editor patch, and retained artifact paths.
 Grating-coupler exports use only standard waveguide and Z-axis FDTD ports,
 with the Z-axis port passing through a separate 7° fiber geometry group. The
-starter fiber axis is placed on the grating side using the editable **Fiber
+standard grating and GC-SOI property panels include **Grating tooth geometry**:
+**curved** preserves the focusing arcs, while **rectangular** replaces the
+curved face with a straight taper and makes every tooth span exactly the
+taper-end width. Pitch, tooth count, uniform or apodized fill factors, terminal
+extension, fiber alignment, and simulation ports remain unchanged when this
+geometry choice is switched.
+With either choice, the starter fiber axis is placed on the grating side using the editable **Fiber
 offset (µm)** parameter (project JSON key `fiber_offset`). It is a signed
 distance on the component's local X axis from the geometry-exact first flare
 boundary to the fiber bottom center; local Y remains zero. The standard grating

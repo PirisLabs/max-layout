@@ -120,6 +120,7 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
  'Grating coupler': {'pitch': 0.8,
                      'fill_factor': 0.5,
                      'fill_factors': '',
+                     'tooth_shape': 'curved',
                      'N': 30,
                      'alpha_t': 25.0,
                      'taper_L': 22.0,
@@ -772,6 +773,7 @@ DEFAULT_COMPONENT_VALUES["GC-SOI"] = {
     "etch_depth": 0.10,
     "duty_cycle": 0.3992,
     "fill_factors": "",
+    "tooth_shape": "curved",
     "pitch": 0.6713,
     "radius": 25.0,
     "y_span": 15.0,
@@ -941,7 +943,7 @@ DEFAULT_COMPONENT_VALUES["Photonic test block"] = {
     "datatype": DEFAULT_DATATYPE,
 }
 
-CHOICE_PARAMETERS = {"reference_branch": ["upper", "lower"], "profile": ["linear", "exponential", "klopfenstein"], "input_profile": ["linear", "exponential", "klopfenstein"], "output_profile": ["linear", "exponential", "klopfenstein"], "rf_input_taper_profile": ["linear", "exponential", "klopfenstein"], "rf_output_taper_profile": ["linear", "exponential", "klopfenstein"], "taper_test_center": ["CPW", "T electrode"], "resonator_side": ["upper", "lower"], "grating_route": ["straight", "up", "down"], "gc_input_route": ["straight", "up", "down"], "gc_output_route": ["straight", "up", "down"], "gc_upper_output_route": ["straight", "up", "down"], "gc_lower_output_route": ["straight", "up", "down"], "gc_vertical_side": ["up", "down"], "input_s_bend_direction": ["up", "down"], "output_s_bend_direction": ["up", "down"], "start_corner": ["top-left", "top-right", "bottom-left", "bottom-right"], "primary_axis": ["x", "y"]}
+CHOICE_PARAMETERS = {"reference_branch": ["upper", "lower"], "profile": ["linear", "exponential", "klopfenstein"], "input_profile": ["linear", "exponential", "klopfenstein"], "output_profile": ["linear", "exponential", "klopfenstein"], "rf_input_taper_profile": ["linear", "exponential", "klopfenstein"], "rf_output_taper_profile": ["linear", "exponential", "klopfenstein"], "taper_test_center": ["CPW", "T electrode"], "resonator_side": ["upper", "lower"], "tooth_shape": ["curved", "rectangular"], "grating_route": ["straight", "up", "down"], "gc_input_route": ["straight", "up", "down"], "gc_output_route": ["straight", "up", "down"], "gc_upper_output_route": ["straight", "up", "down"], "gc_lower_output_route": ["straight", "up", "down"], "gc_vertical_side": ["up", "down"], "input_s_bend_direction": ["up", "down"], "output_s_bend_direction": ["up", "down"], "start_corner": ["top-left", "top-right", "bottom-left", "bottom-right"], "primary_axis": ["x", "y"]}
 
 CHOICE_PARAMETERS["cpw_profile"] = ["linear", "exponential", "klopfenstein"]
 

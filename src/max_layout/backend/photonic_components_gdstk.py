@@ -57,6 +57,7 @@ def make_focusing_gc_gds(
     gds_file="focusing_gc.gds",
     tolerance=0.0005,
     L_extra=0.0,
+    tooth_shape="curved",
 ):
     """
     Generate a focusing grating coupler.
@@ -80,6 +81,11 @@ def make_focusing_gc_gds(
 
         tooth_width = pitch * fill_factor
         gap_width   = pitch * (1 - fill_factor)
+
+    tooth_shape:
+        ``"curved"`` keeps the focusing annular sectors. ``"rectangular"``
+        replaces the curved taper face and every tooth with straight polygons;
+        each tooth spans the exact transverse width at the taper endpoint.
 
     All dimensions are in micrometers.
 
@@ -115,6 +121,10 @@ def make_focusing_gc_gds(
 
     if L_extra < 0:
         raise ValueError("L_extra cannot be negative.")
+
+    tooth_shape = str(tooth_shape).strip().lower()
+    if tooth_shape not in {"curved", "rectangular"}:
+        raise ValueError("tooth_shape must be 'curved' or 'rectangular'.")
 
     alpha_rad = np.deg2rad(alpha_t)
     orientation_rad = np.deg2rad(orientation_deg)
@@ -190,16 +200,29 @@ def make_focusing_gc_gds(
         datatype=datatype,
     )
 
-    # Focusing taper.
-    taper = gdstk.ellipse(
-        center=tuple(focus_local),
-        radius=taper_L,
-        initial_angle=-alpha_rad / 2,
-        final_angle=alpha_rad / 2,
-        layer=layer,
-        datatype=datatype,
-        tolerance=tolerance,
-    )
+    taper_end_x = float(focus_local[0] + taper_L)
+    taper_end_half_width = float(taper_L * np.sin(alpha_rad / 2))
+    if tooth_shape == "curved":
+        taper = gdstk.ellipse(
+            center=tuple(focus_local),
+            radius=taper_L,
+            initial_angle=-alpha_rad / 2,
+            final_angle=alpha_rad / 2,
+            layer=layer,
+            datatype=datatype,
+            tolerance=tolerance,
+        )
+    else:
+        taper = gdstk.Polygon(
+            [
+                (wg_length, -wg_width / 2),
+                (taper_end_x, -taper_end_half_width),
+                (taper_end_x, taper_end_half_width),
+                (wg_length, wg_width / 2),
+            ],
+            layer=layer,
+            datatype=datatype,
+        )
 
     input_geometry = gdstk.boolean(
         [waveguide, taper],
@@ -228,16 +251,24 @@ def make_focusing_gc_gds(
         inner_radius = radius
         outer_radius = inner_radius + tooth
 
-        tooth_polygon = gdstk.ellipse(
-            center=tuple(focus_local),
-            radius=outer_radius,
-            inner_radius=inner_radius,
-            initial_angle=-alpha_rad / 2,
-            final_angle=alpha_rad / 2,
-            layer=layer,
-            datatype=datatype,
-            tolerance=tolerance,
-        )
+        if tooth_shape == "curved":
+            tooth_polygon = gdstk.ellipse(
+                center=tuple(focus_local),
+                radius=outer_radius,
+                inner_radius=inner_radius,
+                initial_angle=-alpha_rad / 2,
+                final_angle=alpha_rad / 2,
+                layer=layer,
+                datatype=datatype,
+                tolerance=tolerance,
+            )
+        else:
+            tooth_polygon = gdstk.rectangle(
+                (float(focus_local[0] + inner_radius), -taper_end_half_width),
+                (float(focus_local[0] + outer_radius), taper_end_half_width),
+                layer=layer,
+                datatype=datatype,
+            )
 
         cell.add(tooth_polygon)
 
@@ -249,16 +280,27 @@ def make_focusing_gc_gds(
     # Optional solid terminal sector, matching the thick output arc in the
     # official Ansys SOI focusing-grating geometry.
     if L_extra > 0.0:
-        output_sector = gdstk.ellipse(
-            center=tuple(focus_local),
-            radius=radius + float(L_extra),
-            inner_radius=radius,
-            initial_angle=-alpha_rad / 2,
-            final_angle=alpha_rad / 2,
-            layer=layer,
-            datatype=datatype,
-            tolerance=tolerance,
-        )
+        if tooth_shape == "curved":
+            output_sector = gdstk.ellipse(
+                center=tuple(focus_local),
+                radius=radius + float(L_extra),
+                inner_radius=radius,
+                initial_angle=-alpha_rad / 2,
+                final_angle=alpha_rad / 2,
+                layer=layer,
+                datatype=datatype,
+                tolerance=tolerance,
+            )
+        else:
+            output_sector = gdstk.rectangle(
+                (float(focus_local[0] + radius), -taper_end_half_width),
+                (
+                    float(focus_local[0] + radius + float(L_extra)),
+                    taper_end_half_width,
+                ),
+                layer=layer,
+                datatype=datatype,
+            )
         cell.add(output_sector)
 
     # ── Rotate and translate complete grating coupler ────────────────────────
@@ -336,6 +378,8 @@ def make_focusing_gc_gds(
         "fill_factor": fill_array,
         "gap_widths": gap_widths,
         "tooth_widths": tooth_widths,
+        "tooth_shape": tooth_shape,
+        "taper_end_width": 2.0 * taper_end_half_width,
 
         "grating_length": float(np.sum(pitch_array)),
         "L_extra": float(L_extra),

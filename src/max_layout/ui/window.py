@@ -1818,6 +1818,7 @@ class NativeLayoutWindow(QMainWindow):
                     params = component.setdefault("params", {})
                     migrate_grating_fiber_offset_parameter(component)
                     params.setdefault("fill_factors", "")
+                    params.setdefault("tooth_shape", "curved")
                     if abs(float(params.get("tolerance", 0.005)) - 0.0005) <= 1e-12:
                         params["tolerance"] = 0.005
                     if abs(float(params.get("fdtd_port_offset_from_waveguide_end_um", 2.0)) - 3.0) <= 1e-12:
@@ -1826,6 +1827,7 @@ class NativeLayoutWindow(QMainWindow):
                     params = component.setdefault("params", {})
                     migrate_grating_fiber_offset_parameter(component)
                     params.setdefault("fill_factors", "")
+                    params.setdefault("tooth_shape", "curved")
                     if abs(float(params.get("waveguide_monitor_span_um", 3.0)) - 2.5) <= 1e-12:
                         params["waveguide_monitor_span_um"] = 3.0
                     if abs(float(params.get("fdtd_port_offset_from_waveguide_end_um", 2.0)) - 3.0) <= 1e-12:
@@ -3354,6 +3356,7 @@ class NativeLayoutWindow(QMainWindow):
             migrate_grating_fiber_offset_parameter(component)
             grating_params = component.setdefault("params", {})
             grating_params.setdefault("fill_factors", "")
+            grating_params.setdefault("tooth_shape", "curved")
             if (
                 component.get("kind") == "Grating coupler"
                 and abs(float(grating_params.get("waveguide_monitor_span_um", 3.0)) - 2.5) <= 1e-12
@@ -3462,6 +3465,7 @@ class NativeLayoutWindow(QMainWindow):
                 else "Allowed effective-index difference" if key == "waveguide_neff_tolerance"
                 else "Waveguide modes to search" if key == "waveguide_mode_search_count"
                 else "Apodized fill factors (one per tooth)" if key == "fill_factors"
+                else "Grating tooth geometry" if key == "tooth_shape"
                 else "Number of grating teeth (N)" if key == "N" and component.get("kind") == "Grating coupler"
                 else "Uniform fill factor" if key == "fill_factor" and component.get("kind") == "Grating coupler"
                 else "Uniform duty cycle" if key == "duty_cycle" and component.get("kind") == "GC-SOI"
@@ -7034,7 +7038,7 @@ ENDFLOW
                 groups.append((name, available))
 
         gc_keys = (
-            "pitch", "fill_factor", "duty_cycle", "fill_factors", "N", "target_length",
+            "pitch", "fill_factor", "duty_cycle", "fill_factors", "tooth_shape", "N", "target_length",
             "alpha_t", "taper_L", "L_extra", "wg_width", "wg_length",
             "gc_pitch", "gc_fill_factor", "gc_fill_factors", "gc_N", "gc_alpha_t", "gc_taper_L", "gc_wg_length",
         )

@@ -2303,6 +2303,7 @@ try:
         "fill_factor": ("Fill factor", ""),
         "duty_cycle": ("Duty cycle", ""),
         "fill_factors": ("Apodized fill factors", ""),
+        "tooth_shape": ("Tooth geometry", ""),
         "N": ("Number of grating periods", ""),
         "target_length": ("Target grating length", "um"),
         "h_total": ("Device-layer thickness", "um"),
