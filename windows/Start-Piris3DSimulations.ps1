@@ -197,9 +197,13 @@ function Ensure-OpenSshClient {
     if (Test-Path -LiteralPath $OpenSshPath) {
         $env:PATH = $OpenSshPath + ";" + $env:PATH
     }
-    $Missing = @("ssh.exe", "scp.exe", "ssh-keygen.exe") | Where-Object {
-        $null -eq (Get-Command $_ -ErrorAction SilentlyContinue)
-    }
+    # Windows PowerShell 5.1 collapses a zero/one-item pipeline result to
+    # $null/a scalar.  The outer @() guarantees Count is always available.
+    $Missing = @(
+        @("ssh.exe", "scp.exe", "ssh-keygen.exe") | Where-Object {
+            $null -eq (Get-Command $_ -ErrorAction SilentlyContinue)
+        }
+    )
     if ($Missing.Count -eq 0) {
         return
     }

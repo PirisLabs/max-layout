@@ -130,6 +130,8 @@ class WindowsPowerShellBootstrapTests(unittest.TestCase):
             "short-lived jupyter url token",
             "$transcriptstarted = $false",
             "x64 python is still unavailable",
+            "$missing = @(",
+            "windows powershell 5.1 collapses",
         ):
             self.assertIn(required, lower)
         self.assertNotIn('"-3.9"', lower)
