@@ -35,6 +35,8 @@ from .lumerical import (
     _item_vertical_reference,
     _notebook_cell,
     _notebook_literal_assignments,
+    _quick_run_options_cell,
+    _runtime_setup_source,
     _stack_vertical_levels,
     generate_lumerical_notebook,
     sweep_parameter_label,
@@ -789,6 +791,22 @@ def _fiber_pose_contract(
                 "base_axis_height_um": float(z_um - fiber_z_um),
                 "center_um": list(map(float, port.get("center", (0.0, 0.0)))),
                 "mode_number": max(0, int(port.get("mode number", 0))),
+                "selected_mode_order": [
+                    int(mode_number)
+                    for mode_number in port.get("selected mode order", [])
+                    if int(mode_number) > 0
+                ],
+                "candidate_mode_numbers": [
+                    int(mode_number)
+                    for mode_number in port.get("candidate mode numbers", [1, 2])
+                    if int(mode_number) > 0
+                ],
+                "mode_degeneracy_tolerance": max(
+                    0.0, float(port.get("mode degeneracy tolerance", 0.01))
+                ),
+                "minimum_local_te_fraction": float(
+                    port.get("minimum local TE fraction", 0.8)
+                ),
             }
         )
     params = component.get("params", {})
@@ -943,6 +961,7 @@ _LUMOPT_RUNTIME_REMOTE = r'''# Run a genuine bundled-LumOpt 3D shape-adjoint opt
 import inspect
 import json
 import os
+import re
 import threading
 import time
 import numpy as np
@@ -973,6 +992,157 @@ alignment_parameter_bounds = np.asarray([
 ], dtype=float)
 if len(all_parameter_rows) < 1:
     raise RuntimeError("No optimization parameters were embedded")
+
+
+def _numeric_source_mode_label(value):
+    """Return canonical ``mode N`` text or fail before any solver launch."""
+    text = str(value).strip()
+    match = re.fullmatch(r"mode\s+([1-9][0-9]*)", text, flags=re.IGNORECASE)
+    if match is None:
+        raise RuntimeError(
+            "The resolved optimization source mode must be numeric 'mode N'; received %r. "
+            "The 3D seed build must finish its two-mode fiber-polarization selection first."
+            % text
+        )
+    return "mode %d" % int(match.group(1))
+
+
+def _require_numeric_source_mode():
+    """Validate and canonicalize the one source-mode label used by all solves."""
+    source_mode = _numeric_source_mode_label(
+        OPT_OBJECTIVE_PORTS.get("source_mode", "")
+    )
+    OPT_OBJECTIVE_PORTS["source_mode"] = source_mode
+    return source_mode
+
+
+def _positive_unique_modes(values):
+    result = []
+    for value in values or []:
+        try:
+            mode_number = int(value)
+        except Exception:
+            continue
+        if mode_number > 0 and mode_number not in result:
+            result.append(mode_number)
+    return result
+
+
+def _resolved_runtime_port_mode(port_contract):
+    """Resolve the selected HE11 partner and winner-first retained pair."""
+    port_name = str(port_contract["name"])
+    selections = globals().get("PORT_MODE_SELECTIONS", {})
+    selection = dict(selections.get(port_name, {})) if isinstance(selections, dict) else {}
+    ports_by_name = {
+        str(port.get("name", "")): port
+        for port in globals().get("PORTS", [])
+    }
+    runtime_port = dict(ports_by_name.get(port_name, {}))
+
+    selected_mode = max(
+        0,
+        int(selection.get(
+            "mode number",
+            runtime_port.get("mode number", port_contract.get("mode_number", 0)),
+        )),
+    )
+    selected_order = _positive_unique_modes(
+        selection.get(
+            "selected mode order",
+            runtime_port.get(
+                "selected mode order",
+                port_contract.get("selected_mode_order", []),
+            ),
+        )
+    )
+    candidates = _positive_unique_modes(
+        selection.get(
+            "candidate mode numbers",
+            runtime_port.get(
+                "candidate mode numbers",
+                port_contract.get("candidate_mode_numbers", [1, 2]),
+            ),
+        )
+    )
+
+    if selected_mode <= 0:
+        analysis = globals().get("GRATING_ANALYSIS") or {}
+        analysis_key = (
+            "fiber_source_mode"
+            if bool(port_contract.get("is_source", False))
+            else "fiber_measurement_mode"
+        )
+        try:
+            selected_mode = int(
+                _numeric_source_mode_label(analysis.get(analysis_key, "")).split()[1]
+            )
+        except Exception:
+            selected_mode = 0
+    if selected_mode <= 0:
+        raise RuntimeError(
+            "No resolved numeric local-TE fiber mode is available for optimization port %s"
+            % port_name
+        )
+
+    retained = [selected_mode]
+    retained.extend(
+        mode_number
+        for mode_number in [*selected_order, *candidates]
+        if mode_number != selected_mode and mode_number not in retained
+    )
+    if len(retained) < 2:
+        raise RuntimeError(
+            "Optimization port %s must retain both near-degenerate fiber modes; resolved %r"
+            % (port_name, retained)
+        )
+    return int(selected_mode), retained[:2]
+
+
+def _synchronize_resolved_fiber_mode_contract():
+    """Copy seed-build mode choices into the persistent optimization contract."""
+    if not OPT_FIBER_POSE:
+        if str(OPT_OBJECTIVE_PORTS.get("kind", "")).startswith("grating"):
+            source_mode_number, selected_order = _resolved_runtime_port_mode({
+                "name": str(OPT_OBJECTIVE_PORTS["source_port"]),
+                "is_source": True,
+                "mode_number": 0,
+                "selected_mode_order": [],
+                "candidate_mode_numbers": [1, 2],
+            })
+            source_mode = "mode %d" % source_mode_number
+            OPT_OBJECTIVE_PORTS["source_mode"] = source_mode
+            if globals().get("GRATING_ANALYSIS"):
+                GRATING_ANALYSIS["fiber_source_mode"] = source_mode
+                GRATING_ANALYSIS["fiber_source_mode_number"] = source_mode_number
+                GRATING_ANALYSIS["fiber_source_selected_mode_order"] = list(
+                    selected_order
+                )
+        _require_numeric_source_mode()
+        return
+
+    source_mode_number = 0
+    for port_contract in OPT_FIBER_POSE.get("ports", []):
+        selected_mode, selected_order = _resolved_runtime_port_mode(port_contract)
+        port_contract["mode_number"] = selected_mode
+        port_contract["selected_mode_order"] = list(selected_order)
+        if bool(port_contract.get("is_source", False)):
+            source_mode_number = selected_mode
+
+    if source_mode_number <= 0:
+        raise RuntimeError("The optimization fiber-pose contract has no source port")
+    source_mode = "mode %d" % source_mode_number
+    OPT_OBJECTIVE_PORTS["source_mode"] = source_mode
+    if globals().get("GRATING_ANALYSIS"):
+        GRATING_ANALYSIS["fiber_source_mode"] = source_mode
+        GRATING_ANALYSIS["fiber_source_mode_number"] = source_mode_number
+        GRATING_ANALYSIS["fiber_source_selected_mode_order"] = list(
+            next(
+                port["selected_mode_order"]
+                for port in OPT_FIBER_POSE.get("ports", [])
+                if bool(port.get("is_source", False))
+            )
+        )
+    _require_numeric_source_mode()
 
 REMOTE_OPT_PROGRESS_FILE = globals().get(
     "REMOTE_OPT_PROGRESS_FILE",
@@ -1192,6 +1362,18 @@ def _fiber_pose_updates(alignment_parameters, shape_parameters=None):
                 * np.tan(np.deg2rad(theta_deg))
             ),
             "mode_number": int(port.get("mode_number", 0)),
+            "selected_mode_order": list(port.get("selected_mode_order", [])),
+            "candidate_mode_numbers": list(
+                port.get("candidate_mode_numbers", [1, 2])
+            ),
+            "mode_degeneracy_tolerance": float(
+                port.get("mode_degeneracy_tolerance", 0.01)
+            ),
+            "minimum_local_te_fraction": float(
+                port.get("minimum_local_te_fraction", 0.8)
+            ),
+            "is_source": bool(port.get("is_source", False)),
+            "role": str(port.get("role", "")),
         })
     return updates
 
@@ -1234,23 +1416,108 @@ def _apply_fiber_pose_to_session(
         )
         if update_modes:
             fdtd_session.select(port_path)
-            mode_number = max(0, int(port["mode_number"]))
-            if mode_number:
-                fdtd_session.updateportmodes(mode_number)
+            selection = None
+            selector = globals().get("_select_fiber_local_te_mode")
+            if callable(selector):
+                selection = dict(selector(
+                    fdtd_session,
+                    port_path,
+                    {
+                        "name": str(port["name"]),
+                        "angle phi": float(port["phi_deg"]),
+                        "candidate mode numbers": list(
+                            port.get("candidate_mode_numbers", [1, 2])
+                        ),
+                        "mode degeneracy tolerance": float(
+                            port.get("mode_degeneracy_tolerance", 0.01)
+                        ),
+                        "minimum local TE fraction": float(
+                            port.get("minimum_local_te_fraction", 0.8)
+                        ),
+                    },
+                ))
+                mode_number = max(0, int(selection.get("mode number", 0)))
+                mode_order = _positive_unique_modes(
+                    selection.get("selected mode order", [])
+                )
             else:
-                fdtd_session.updateportmodes()
+                # Isolated unit tests and legacy imported runtimes may not
+                # contain the build helper.  Preserve the already validated
+                # winner-first pair; never invent a fixed mode-2/Ey fallback.
+                mode_number = max(0, int(port["mode_number"]))
+                mode_order = _positive_unique_modes(
+                    port.get("selected_mode_order", [])
+                )
+            if mode_number <= 0:
+                raise RuntimeError(
+                    "Fiber port %s has no resolved numeric local-TE mode" % port["name"]
+                )
+            mode_order = [mode_number] + [
+                candidate
+                for candidate in (
+                    mode_order
+                    + _positive_unique_modes(port.get("candidate_mode_numbers", []))
+                )
+                if candidate != mode_number
+            ]
+            mode_order = _positive_unique_modes(mode_order)
+            if len(mode_order) < 2:
+                raise RuntimeError(
+                    "Fiber port %s must retain both near-degenerate modes; resolved %r"
+                    % (port["name"], mode_order)
+                )
+            mode_order = mode_order[:2]
+            if selection is None:
+                update_status = fdtd_session.updateportmodes(
+                    np.asarray(mode_order, dtype=int)
+                )
+                if isinstance(update_status, (bool, np.bool_)) and not bool(update_status):
+                    raise RuntimeError(
+                        "Lumerical rejected the retained mode pair %r for fiber port %s"
+                        % (mode_order, port["name"])
+                    )
+                selection = {
+                    "mode number": mode_number,
+                    "selected mode order": list(mode_order),
+                    "candidate mode numbers": list(
+                        port.get("candidate_mode_numbers", mode_order)
+                    ),
+                    "polarization": "local TE",
+                }
+            port["mode_number"] = mode_number
+            port["selected_mode_order"] = list(mode_order)
+            for contract in OPT_FIBER_POSE.get("ports", []):
+                if str(contract.get("name", "")) == str(port["name"]):
+                    contract["mode_number"] = mode_number
+                    contract["selected_mode_order"] = list(mode_order)
+            selections = globals().get("PORT_MODE_SELECTIONS")
+            if isinstance(selections, dict):
+                selections[str(port["name"])] = dict(selection)
+            if globals().get("GRATING_ANALYSIS"):
+                if bool(port.get("is_source", False)):
+                    GRATING_ANALYSIS["fiber_source_mode"] = "mode %d" % mode_number
+                    GRATING_ANALYSIS["fiber_source_mode_number"] = mode_number
+                    GRATING_ANALYSIS["fiber_selected_mode_order"] = list(mode_order)
+                else:
+                    GRATING_ANALYSIS["fiber_measurement_mode"] = "mode %d" % mode_number
+                    GRATING_ANALYSIS["fiber_measurement_mode_number"] = mode_number
+                    GRATING_ANALYSIS["fiber_measurement_selected_mode_order"] = list(
+                        mode_order
+                    )
+            if bool(port.get("is_source", False)):
+                OPT_OBJECTIVE_PORTS["source_mode"] = "mode %d" % mode_number
     fdtd_session.select("FDTD::ports")
     fdtd_session.set("source port", str(OPT_OBJECTIVE_PORTS["source_port"]))
-    fdtd_session.set("source mode", str(OPT_OBJECTIVE_PORTS.get("source_mode", "mode 1")))
+    fdtd_session.set("source mode", _require_numeric_source_mode())
 
 
 objective = dict(OPTIMIZATION_SPEC["objective"])
 optimizer_settings = dict(OPTIMIZATION_SPEC["optimizer"])
 REMOTE_OPTIMIZATION_DIR = os.path.join(REMOTE_WORK, "adjoint_optimization")
 os.makedirs(REMOTE_OPTIMIZATION_DIR, exist_ok=True)
-best_project_name = str(OPTIMIZATION_SPEC["best_project_file"])
-REMOTE_BEST_FSP = os.path.join(REMOTE_WORK, "fsp", best_project_name)
-os.makedirs(os.path.dirname(REMOTE_BEST_FSP), exist_ok=True)
+REMOTE_VALIDATION_FSP = os.path.join(
+    REMOTE_OPTIMIZATION_DIR, "_transient_best_validation.fsp"
+)
 
 
 def _history_arrays(history, parameter_count):
@@ -1343,6 +1610,7 @@ def _alignment_port_score(fdtd_session):
 def _alignment_loss(alignment_values, fdtd_session, shape_values):
     values = np.asarray(alignment_values, dtype=float).ravel()
     _apply_fiber_pose_to_session(values, fdtd_session, shape_values, update_modes=True)
+    _require_numeric_source_mode()
     fdtd_session.run("FDTD", "GPU")
     score = _alignment_port_score(fdtd_session)
     ALIGNMENT_EVALUATION_PARAMETERS.append(values.copy())
@@ -1350,7 +1618,7 @@ def _alignment_loss(alignment_values, fdtd_session, shape_values):
     return -score
 
 
-def _cached_alignment_score(values):
+def _nearest_alignment_score(values):
     """Return the already-solved score nearest SciPy's accepted iterate."""
     if not ALIGNMENT_EVALUATION_FOM:
         return float("nan")
@@ -1371,7 +1639,7 @@ def _alignment_iteration_callback(intermediate_result):
     ).ravel()
     objective_value = getattr(intermediate_result, "fun", None)
     if objective_value is None or not np.isfinite(float(objective_value)):
-        score = _cached_alignment_score(values)
+        score = _nearest_alignment_score(values)
     else:
         score = -float(objective_value)
     ALIGNMENT_ITERATION_PARAMETERS.append(values.copy())
@@ -1450,6 +1718,7 @@ def _import_lumopt2():
 
 def _run_lumopt2(module):
     """Official v261+ lumopt2 path; Parametrization returns object::property."""
+    _require_numeric_source_mode()
     required = (
         "Box", "Parametrization", "PortResults", "Fom", "PNorm", "Project",
         "FdtdSession", "LocalRunner", "ScipyOptimizer", "Optimization",
@@ -1565,7 +1834,10 @@ def _run_lumopt2(module):
         raise RuntimeError("lumopt2 returned %d parameters; expected %d" % (
             best_parameters.size, initial_params.size,
         ))
-    project.save_project(REMOTE_BEST_FSP, params=best_parameters)
+    # lumopt2 needs a file handoff between its owner and the dedicated final
+    # validation owner.  Keep that handoff private and transient; the public
+    # best FSP is written only after validation when cell 1 requests it.
+    project.save_project(REMOTE_VALIDATION_FSP, params=best_parameters)
     try:
         raw_history = lumopt2_optimization.get_history()
     except Exception:
@@ -1591,7 +1863,7 @@ def _run_lumopt2(module):
         hide=True,
         serverArgs={"threads": str(max(1, int(SETTINGS.get("build_cpu_threads", 30))))},
     )
-    validation_owner.load(REMOTE_BEST_FSP)
+    validation_owner.load(REMOTE_VALIDATION_FSP)
     return (
         validation_owner,
         best_parameters,
@@ -1604,6 +1876,7 @@ def _run_lumopt2(module):
 
 def _run_legacy_lumopt():
     """Verified bundled legacy API fallback; still a genuine shape adjoint."""
+    _require_numeric_source_mode()
     from lumopt.figures_of_merit.PortTransmission import PortTransmission
     from lumopt.geometries.parameterized_geometry import ParameterizedGeometry
     from lumopt.optimization import Optimization
@@ -1742,6 +2015,7 @@ def _run_legacy_lumopt():
 
 ADJOINT_FDTD_OWNER = None
 try:
+    _synchronize_resolved_fiber_mode_contract()
     REMOTE_OPTIMIZER_BASE_FSP = REMOTE_BASE_FSP
     best_alignment_params = alignment_initial_params.copy()
     best_alignment_fom = float("nan")
@@ -1804,7 +2078,8 @@ try:
     )
     ADJOINT_FDTD_OWNER.select("FDTD::ports")
     ADJOINT_FDTD_OWNER.set("source port", str(OPT_OBJECTIVE_PORTS["source_port"]))
-    ADJOINT_FDTD_OWNER.set("source mode", str(OPT_OBJECTIVE_PORTS.get("source_mode", "mode 1")))
+    ADJOINT_FDTD_OWNER.set("source mode", _require_numeric_source_mode())
+    _require_numeric_source_mode()
     ADJOINT_FDTD_OWNER.run("FDTD", "GPU")
 
     def _port_transmission(port_name):
@@ -1886,7 +2161,8 @@ try:
     os.makedirs(os.path.dirname(REMOTE_BEST_FSP), exist_ok=True)
     ADJOINT_FDTD_OWNER.save(REMOTE_BEST_FSP)
     if not os.path.isfile(REMOTE_BEST_FSP) or os.path.getsize(REMOTE_BEST_FSP) <= 0:
-        raise RuntimeError("LumOpt did not create the best-geometry FSP: " + REMOTE_BEST_FSP)
+        raise RuntimeError("LumOpt did not create the required best-geometry FSP: " + REMOTE_BEST_FSP)
+    print("Saved required best-design FSP:", REMOTE_BEST_FSP)
 
     best_parameters = {
         name: float(best_params[index]) for index, name in enumerate(parameter_names)
@@ -1947,6 +2223,9 @@ try:
             patch_parameters["fiber_offset"] = nominal_fiber_center - _standard_flare(best_flare_values)
             derived_parameter_names.append("fiber_offset")
 
+    complete_best_parameters = dict(OPT_COMPONENT_NOMINAL_PARAMS)
+    complete_best_parameters.update(patch_parameters)
+
     parameter_patch = {
         "component_uid": int(OPTIMIZATION_SPEC["component_uid"]),
         "component_kind": component_kind,
@@ -1962,6 +2241,7 @@ try:
         "spectral_objective": objective,
         "best_fom": best_fom if np.isfinite(best_fom) else None,
         "best_parameters": best_parameters,
+        "complete_best_parameters": complete_best_parameters,
         "best_alignment_parameters": alignment_best_parameters,
         "best_alignment_fom": best_alignment_fom if np.isfinite(best_alignment_fom) else None,
         "editor_parameter_patch": patch_parameters,
@@ -2022,6 +2302,7 @@ try:
         "pitch": ("Pitch", "um"),
         "fill_factor": ("Fill factor", ""),
         "duty_cycle": ("Duty cycle", ""),
+        "fill_factors": ("Apodized fill factors", ""),
         "N": ("Number of grating periods", ""),
         "target_length": ("Target grating length", "um"),
         "h_total": ("Device-layer thickness", "um"),
@@ -2033,6 +2314,7 @@ try:
         "L_extra": ("Thick-end extension", "um"),
         "wg_width": ("Waveguide width", "um"),
         "wg_length": ("Waveguide length", "um"),
+        "taper_exponent": ("Grating taper exponent", ""),
         "mmi_width": ("MMI width", "um"),
         "mmi_length": ("MMI length", "um"),
         "taper_width": ("MMI taper width", "um"),
@@ -2041,29 +2323,59 @@ try:
         "input_length": ("Input access length", "um"),
         "output_length": ("Output access length", "um"),
         "port_sep": ("Output branch separation", "um"),
+        "taper_power": ("MMI taper profile exponent", ""),
+        "taper_points": ("MMI taper discretization points", ""),
+        "input_reference_before_taper_um": ("Input power-reference distance before taper", "um"),
+        "fdtd_port_clearance_um": ("MMI access-port clearance from waveguide end", "um"),
         "fiber_offset": ("Fiber offset", "um"),
         "angle_theta": ("Fiber angle theta", "deg"),
+        "fiber_tox_offset_um": ("Fiber bottom offset above SiO2 cladding", "um"),
+        "fiber_core_diameter_um": ("Fiber core diameter", "um"),
+        "fiber_core_index": ("Fiber core refractive index", ""),
+        "fiber_cladding_diameter_um": ("Fiber cladding diameter", "um"),
+        "fiber_cladding_index": ("Fiber cladding refractive index", ""),
+        "fiber_length_um": ("Fiber length", "um"),
+        "fiber_power_monitor_below_source_um": ("Fiber power-plane distance below source", "um"),
+        "fdtd_port_offset_from_waveguide_end_um": ("Waveguide FDTD-port offset from waveguide end", "um"),
+        "waveguide_monitor_span_um": ("Waveguide mode-monitor transverse span", "um"),
+        "waveguide_total_power_before_mode_um": ("Total-power plane distance before waveguide mode plane", "um"),
         "waveguide_effective_index": ("Waveguide target effective index", ""),
         "waveguide_neff_tolerance": ("Waveguide effective-index tolerance", ""),
+        "waveguide_mode_search_count": ("Waveguide eigensolver modes searched", ""),
         "tolerance": ("Geometry build tolerance", "um"),
     }
+
+    def _text_parameter_value(value):
+        if isinstance(value, (dict, list, tuple)):
+            return _text_json(value)
+        if isinstance(value, str):
+            return value
+        return _text_number(value)
 
     def _append_text_major_parameters(lines, parameters, prefix="- "):
         parameters = dict(parameters or {})
         found = 0
+        shown = set()
         for key, (label, unit) in _text_parameter_details.items():
             if key not in parameters or parameters[key] in (None, ""):
                 continue
             suffix = (" " + unit) if unit else ""
-            lines.append("%s%s: %s%s" % (prefix, label, _text_number(parameters[key]), suffix))
+            lines.append("%s%s: %s%s" % (prefix, label, _text_parameter_value(parameters[key]), suffix))
             found += 1
-        if not found:
-            for key, value in parameters.items():
-                if isinstance(value, (bool, int, float, str)) and value not in (None, ""):
-                    lines.append("%s%s: %s" % (prefix, str(key).replace("_", " ").title(), str(value)))
-                    found += 1
-                if found >= 12:
-                    break
+            shown.add(key)
+        ignored = {"name", "layer", "datatype"}
+        for key, value in parameters.items():
+            if (
+                key in shown or key in ignored or key.endswith("_layer")
+                or key.endswith("_datatype") or value in (None, "")
+            ):
+                continue
+            if isinstance(value, (bool, int, float, str, list, tuple, dict)):
+                lines.append(
+                    "%s%s: %s"
+                    % (prefix, str(key).replace("_", " ").title(), _text_parameter_value(value))
+                )
+                found += 1
 
     objective_contract = dict(OPTIMIZATION_SPEC.get("objective", {}))
     center_wavelength_m = float(objective_contract.get("center_wavelength_um", 0.0)) * UM
@@ -2084,9 +2396,10 @@ try:
     text_lines.append("Nominal major device parameters (lengths in um; angles in deg):")
     _append_text_major_parameters(text_lines, OPT_COMPONENT_NOMINAL_PARAMS)
     text_lines.append("Exact nominal source parameters (JSON): %s" % _text_json(OPT_COMPONENT_NOMINAL_PARAMS))
-    text_lines.append("Best optimized parameters:")
-    _append_text_major_parameters(text_lines, best_parameters)
-    text_lines.append("Best optimized parameters (JSON): %s" % _text_json(best_parameters))
+    text_lines.append("Complete best-design geometry (optimized, derived, and unchanged nominal parameters):")
+    _append_text_major_parameters(text_lines, complete_best_parameters)
+    text_lines.append("Complete best-design source parameters (JSON): %s" % _text_json(complete_best_parameters))
+    text_lines.append("Parameters changed directly by the optimizer (JSON): %s" % _text_json(best_parameters))
     text_lines.append("Complete editor parameter patch, including derived reproducibility values: %s" % _text_json(patch_parameters))
 
     _text_section(text_lines, "OBJECTIVE AND BOUNDS")
@@ -2283,7 +2596,7 @@ try:
 
     _text_section(text_lines, "FSP PROVENANCE")
     text_lines.append(
-        "store_all_simulations=false. Only the final best-design FSP is saved; no per-iteration FSP is retained. The validated linear response above comes from the dedicated best-design forward GPU solve, not directly from the optimizer FOM history."
+        "store_all_simulations=false. No per-iteration FSP is retained. The final best-design FSP is always saved. The validated linear response above comes from the dedicated best-design forward GPU solve, not directly from the optimizer FOM history."
     )
     with open(REMOTE_OPT_TEXT_SUMMARY, "w", encoding="utf-8") as stream:
         stream.write("\n".join(text_lines).rstrip() + "\n")
@@ -2338,6 +2651,19 @@ finally:
             pass
     # The release cell still runs afterward to return all three roamed packs.
     fdtd = None
+    # Remove only transient optimizer files after the owner closes.  The
+    # inspection FSP is the persistent LumOpt seed and must remain available.
+    for _internal_seed in {
+        globals().get("REMOTE_ALIGNED_BASE_FSP", ""),
+        globals().get("REMOTE_VALIDATION_FSP", ""),
+        globals().get("REMOTE_RUNTIME_PROJECT_FILE", ""),
+    }:
+        if _internal_seed and os.path.isfile(_internal_seed):
+            try:
+                os.remove(_internal_seed)
+                print("Removed transient optimizer seed:", _internal_seed)
+            except Exception as _seed_cleanup_exc:
+                print("Transient optimizer-seed cleanup warning:", str(_seed_cleanup_exc)[:240])
 '''
 
 
@@ -2422,6 +2748,7 @@ def generate_lumerical_adjoint_notebook(
         "# Embedded nominal model and fixed-topology adjoint specification.\n"
         + f"EXPORT_SCOPE_LABEL = {payload['EXPORT_SCOPE_LABEL']!r}\n"
         + f"EXPORTED_COMPONENTS = {pprint.pformat(payload['EXPORTED_COMPONENTS'], width=120, sort_dicts=False)}\n"
+        + f"SOURCE_COMPONENTS_JSON = {pprint.pformat(payload['SOURCE_COMPONENTS_JSON'], width=160, compact=True, sort_dicts=False)}\n"
         + f"SETTINGS = {pprint.pformat(payload['SETTINGS'], width=120, sort_dicts=False)}\n"
         + f"MATERIAL_STACK = {pprint.pformat(payload['MATERIAL_STACK'], width=120, sort_dicts=False)}\n"
         + f"BOUNDING_BOX_UM = {pprint.pformat(payload['BOUNDING_BOX_UM'])}\n"
@@ -2440,6 +2767,7 @@ def generate_lumerical_adjoint_notebook(
         + f"OPTIMIZATION_VOLUME_UM = {pprint.pformat(volume_um)}\n"
         + f"EXPORT_WARNINGS = {pprint.pformat(warnings, width=120)}\n"
         + "for warning in EXPORT_WARNINGS:\n    print('Export note:', warning)\n"
+        + _runtime_setup_source(_BUILD_CELL)
     )
     build_source = (
         "# Build one GPU-configured seed model in the licensed persistent Lambda session.\n"
@@ -2448,6 +2776,7 @@ def generate_lumerical_adjoint_notebook(
         "    'REMOTE_WORK = ' + repr(REMOTE_WORK) + '\\n'\n"
         "    + 'EXPORT_SCOPE_LABEL = ' + repr(EXPORT_SCOPE_LABEL) + '\\n'\n"
         "    + 'EXPORTED_COMPONENTS = ' + repr(EXPORTED_COMPONENTS) + '\\n'\n"
+        "    + 'SOURCE_COMPONENTS_JSON = ' + repr(SOURCE_COMPONENTS_JSON) + '\\n'\n"
         "    + 'SETTINGS = ' + repr(SETTINGS) + '\\n'\n"
         "    + 'MATERIAL_STACK = ' + repr(MATERIAL_STACK) + '\\n'\n"
         "    + 'BOUNDING_BOX_UM = ' + repr(BOUNDING_BOX_UM) + '\\n'\n"
@@ -2466,18 +2795,27 @@ def generate_lumerical_adjoint_notebook(
         "    + 'OPT_SHAPE_SNAPSHOTS = ' + repr(OPT_SHAPE_SNAPSHOTS) + '\\n'\n"
         "    + 'OPTIMIZATION_VOLUME_UM = ' + repr(OPTIMIZATION_VOLUME_UM) + '\\n'\n"
         ")\n"
-        "run_remote_checked(_remote_payload + REMOTE_MODEL_BUILDER, 'Build 3D adjoint seed model', timeout=1800)\n"
+        "run_remote_checked(_remote_payload + REMOTE_MODEL_BUILDER, 'Build 3D adjoint seed model directly', timeout=1800)\n"
+        "print('Built the adjoint seed directly in memory.')\n"
     )
     opt_fields_source = (
         f"REMOTE_OPT_FIELDS_SETUP = {repr(_OPT_FIELDS_SETUP_REMOTE)}\n"
         "run_remote_checked(REMOTE_OPT_FIELDS_SETUP, 'Add uniform opt mesh and opt_fields', timeout=600)\n"
     )
-    resource_source = _find_code_cell(base_notebook, "REMOTE_RESOURCE_AND_SAVE =")
+    resource_source = (
+        _find_code_cell(base_notebook, "REMOTE_RESOURCE_AND_SAVE =")
+        + "\n# Use the required inspection FSP as LumOpt's seed; do not write a duplicate seed file.\n"
+        + "REMOTE_INTERNAL_SEED_FSP = REMOTE_INSPECTION_PROJECT_FILE\n"
+        + "print('LumOpt seed is the saved inspection FSP:', REMOTE_INTERNAL_SEED_FSP)\n"
+    )
     close_seed_source = (
         "# End seed ownership before LumOpt opens its single persistent FDTD owner.\n"
-        "run_remote_checked('fdtd.close()\\ndel fdtd\\nprint(\"Seed FDTD owner closed.\")', "
+        "_close_seed_code = 'fdtd.close()\\ndel fdtd\\nprint(\"Seed FDTD owner closed.\")'\n"
+        "if not SETTINGS.get('run_after_build', True):\n"
+        "    _close_seed_code += '\\nimport os\\n_p = globals().get(\"REMOTE_RUNTIME_PROJECT_FILE\", \"\")\\nif _p and os.path.isfile(_p): os.remove(_p)'\n"
+        "run_remote_checked(_close_seed_code, "
         "'Close seed FDTD owner', timeout=120)\n"
-        "REMOTE_BASE_FSP = REMOTE_PROJECT_FILE\n"
+        "REMOTE_BASE_FSP = REMOTE_INTERNAL_SEED_FSP if SETTINGS.get('run_after_build', True) else None\n"
     )
     optimize_source = (
         f"REMOTE_LUMOPT_RUNTIME = {repr(_LUMOPT_RUNTIME_REMOTE)}\n"
@@ -2491,38 +2829,48 @@ def generate_lumerical_adjoint_notebook(
         "    'REMOTE_BASE_FSP = ' + repr(REMOTE_BASE_FSP) + '\\n'\n"
         "    + 'REMOTE_OPT_PROGRESS_FILE = ' + repr(REMOTE_OPT_PROGRESS_FILE) + '\\n'\n"
         ")\n"
-        "solve_remote_checked(\n"
-        "    _remote_lumopt_payload + REMOTE_LUMOPT_RUNTIME,\n"
-        "    'GPU fiber alignment + LumOpt 3D shape-adjoint optimization',\n"
-        "    timeout=172800,\n"
-        "    progress_file=REMOTE_OPT_PROGRESS_FILE,\n"
-        ")\n"
+        "if SETTINGS.get('run_after_build', True):\n"
+        "    solve_remote_checked(\n"
+        "        _remote_lumopt_payload + REMOTE_LUMOPT_RUNTIME,\n"
+        "        'GPU fiber alignment + LumOpt 3D shape-adjoint optimization',\n"
+        "        timeout=172800,\n"
+        "        progress_file=REMOTE_OPT_PROGRESS_FILE,\n"
+        "    )\n"
+        "else:\n"
+        "    print('Optimization disabled by RUN_SIMULATION in cell 1.')\n"
     )
-    fetch_source = r'''# Fetch the one best FSP and compact CPU-generated optimization artifacts.
-REMOTE_OPT_ARTIFACTS = [
-    REMOTE_WORK + "/fsp/" + OPTIMIZATION_SPEC["best_project_file"],
-    REMOTE_WORK + "/adjoint_optimization_history.npz",
-    REMOTE_WORK + "/adjoint_optimization_summary.json",
-    REMOTE_WORK + "/adjoint_parameter_patch.json",
-    REMOTE_WORK + "/adjoint_optimization_history.png",
-    REMOTE_WORK + "/adjoint_live_progress.jsonl",
-    REMOTE_WORK + "/summary.txt",
-]
-_status = lam.get("{path: bool(os.path.isfile(path) and os.path.getsize(path) > 0) for path in %r}" % REMOTE_OPT_ARTIFACTS)
-FETCHED_OPTIMIZATION_ARTIFACTS = []
-for remote_path in REMOTE_OPT_ARTIFACTS:
-    if not _status.get(remote_path, False):
-        print("ERROR — optimization artifact missing:", remote_path)
-        continue
-    local_directory = PIRIS_FSP_DIR if remote_path.lower().endswith(".fsp") else PIRIS_RESULTS_DIR
-    local_path = local_directory / os.path.basename(remote_path)
-    fetched = lam.fetch(remote_path, str(local_path))
-    FETCHED_OPTIMIZATION_ARTIFACTS.append(fetched)
-    print("saved ->", fetched)
-from IPython.display import Image, display
-history_plot = PIRIS_RESULTS_DIR / "adjoint_optimization_history.png"
-if history_plot.is_file():
-    display(Image(filename=str(history_plot), width=1000))
+    fetch_source = r'''# Fetch compact CPU-generated optimization artifacts and the always-saved best FSP.
+if not SETTINGS.get("run_after_build", True):
+    print("Optimization was not run, so there are no optimization artifacts to fetch.")
+else:
+    REMOTE_OPT_ARTIFACTS = [
+        REMOTE_WORK + "/adjoint_optimization_history.npz",
+        REMOTE_WORK + "/adjoint_optimization_summary.json",
+        REMOTE_WORK + "/adjoint_parameter_patch.json",
+        REMOTE_WORK + "/adjoint_optimization_history.png",
+        REMOTE_WORK + "/adjoint_live_progress.jsonl",
+        REMOTE_WORK + "/summary.txt",
+    ]
+    REMOTE_OPT_ARTIFACTS.insert(
+        0, REMOTE_WORK + "/fsp/" + OPTIMIZATION_SPEC["best_project_file"]
+    )
+    _status = lam.get("{path: bool(os.path.isfile(path) and os.path.getsize(path) > 0) for path in %r}" % REMOTE_OPT_ARTIFACTS)
+    _missing = [path for path in REMOTE_OPT_ARTIFACTS if not _status.get(path, False)]
+    if _missing:
+        raise RuntimeError("Required optimization artifacts are missing: " + repr(_missing))
+    FETCHED_OPTIMIZATION_ARTIFACTS = []
+    for remote_path in REMOTE_OPT_ARTIFACTS:
+        local_directory = PIRIS_FSP_DIR if remote_path.lower().endswith(".fsp") else PIRIS_RESULTS_DIR
+        local_path = local_directory / os.path.basename(remote_path)
+        fetched = lam.fetch(remote_path, str(local_path))
+        if not local_path.is_file() or local_path.stat().st_size <= 0:
+            raise RuntimeError("Required optimization artifact was not fetched: " + str(local_path))
+        FETCHED_OPTIMIZATION_ARTIFACTS.append(fetched)
+        print("saved ->", fetched)
+    from IPython.display import Image, display
+    history_plot = PIRIS_RESULTS_DIR / "adjoint_optimization_history.png"
+    if history_plot.is_file():
+        display(Image(filename=str(history_plot), width=1000))
 '''
 
     parameter_names = ", ".join(
@@ -2551,16 +2899,22 @@ This notebook optimizes **{specification['component_kind']} (UID {specification[
 - The build stage uses up to 30 CPU threads. Fiber-alignment evaluations, forward solves, adjoint solves, and best-design validation use the saved GPU resource configuration. Plotting, JSON/NPZ serialization, and final artifact handling switch back to CPU.
 - During the blocking solve, the cell redraws a live table after every completed fiber-alignment or shape-adjoint iteration. Each row reports the current linear objective and the complete selected JSON parameter vector; no extra FDTD solve is performed for reporting.
 - Exactly one FDTD owner exists at a time: the seed builder is closed before LumOpt opens its persistent owner. One Shared Web checkout surrounds the entire build/optimization/save workflow.
-- `store_all_simulations=False`: no per-iteration FSP is retained or fetched. The notebook saves one best-geometry FSP plus history NPZ, summary JSON, editor parameter-patch JSON, and a history graph.
+- `store_all_simulations=False`: no per-iteration FSP is retained or fetched. Compact history, summary, editor-patch, graph artifacts, the inspection FSP, and the best-geometry FSP are always saved.
 - `angle_theta` drives the fiber core/cladding, source port, and passive fiber-power plane together. `fiber_offset` moves that entire concentric assembly along the grating local X axis. Both are frozen at their best forward-solve values during the shape-adjoint stage.
 - Integer tooth counts, device topology, waveguide receivers, material stack, and process thicknesses remain fixed. GC-SOI keeps exactly **{specification.get('fixed_period_count', 'N/A')}** periods.
-- The geometry callback uses exact nominal/minimum/maximum editor-built polygons and fixed-topology, nominal-centered piecewise-linear interpolation. This is genuine adjoint optimization, but it is not a symbolic reimplementation of every editor geometry formula. Keep bounds moderate and inspect both seed and best FSP files, especially for parameters that move an access interface relative to fixed ports.
+- The geometry callback uses exact nominal/minimum/maximum editor-built polygons and fixed-topology, nominal-centered piecewise-linear interpolation. This is genuine adjoint optimization, but it is not a symbolic reimplementation of every editor geometry formula. Keep bounds moderate; inspection and best-design FSP files are stored automatically.
 - Always run the final release cell after success, failure, or interruption.
 """
 
     notebook = {
         "cells": [
-            _notebook_cell("code", _PIRIS_PATHS_CELL),
+            _notebook_cell(
+                "code",
+                _quick_run_options_cell(
+                    {**base_configuration, "run_after_build": True},
+                    workflow="adjoint optimization",
+                ),
+            ),
             _notebook_cell("markdown", intro),
             _notebook_cell("markdown", "## 1 · Connect to Lambda\n"),
             _notebook_cell("code", _LAMBDA_CONNECT_CELL),
@@ -2572,14 +2926,14 @@ This notebook optimizes **{specification['component_kind']} (UID {specification[
             _notebook_cell("code", build_source),
             _notebook_cell("markdown", "## 5 · Add co-located uniform optimization mesh and `opt_fields`\n"),
             _notebook_cell("code", opt_fields_source),
-            _notebook_cell("markdown", "## 6 · Configure GPU resources and save/review the seed FSP\n"),
+            _notebook_cell("markdown", "## 6 · Configure GPU resources and prepare the internal optimizer seed\n"),
             _notebook_cell("code", resource_source),
-            _notebook_cell("code", "from IPython.display import FileLink, display\ndisplay(FileLink(str(LOCAL_PROJECT_FILE)))\n"),
+            _notebook_cell("code", "from IPython.display import FileLink, display\ndisplay(FileLink(str(LOCAL_INSPECTION_PROJECT_FILE)))\n"),
             _notebook_cell("markdown", "## 7 · Transfer ownership from the seed builder to LumOpt\n"),
             _notebook_cell("code", close_seed_source),
             _notebook_cell("markdown", "## 8 · Run bounded 3D GPU shape adjoint\n"),
             _notebook_cell("code", optimize_source),
-            _notebook_cell("markdown", "## 9 · Fetch the best design and CPU-generated history\n"),
+            _notebook_cell("markdown", "## 9 · Fetch compact history and the required best-design FSP\n"),
             _notebook_cell("code", fetch_source),
             _notebook_cell("markdown", "## 10 · Release FDTD and return all roamed HPC Packs\n\nAlways run this cell, including after an interrupted optimization.\n"),
             _notebook_cell("code", _RELEASE_LICENSES_CELL),

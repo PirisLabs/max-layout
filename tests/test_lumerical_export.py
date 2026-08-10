@@ -193,6 +193,10 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn('("pitch", "Pitch", "um")', save_source)
         self.assertIn('("fiber_offset", "Fiber offset", "um")', save_source)
         self.assertIn('("angle_theta", "Fiber angle theta", "deg")', save_source)
+        self.assertIn('("fiber_power_monitor_below_source_um", "Fiber power-plane distance below source", "um")', save_source)
+        self.assertIn('("mmi_length", "MMI length", "um")', save_source)
+        self.assertIn('("taper_power", "MMI taper profile exponent", "")', save_source)
+        self.assertIn('("input_reference_before_taper_um", "Input power-reference distance before taper", "um")', save_source)
         self.assertIn("slab_extent", save_source)
         self.assertIn("geometry/PML overlap", save_source)
         self.assertIn("Generic numeric providers saved", save_source)
@@ -217,6 +221,8 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("Peak-best case:", sequential_source)
         self.assertIn("Peak-best exact source parameters (JSON):", sequential_source)
         self.assertIn("Target-best case at", sequential_source)
+        self.assertIn("Target-best major parameters:", sequential_source)
+        self.assertIn("Target-best exact source parameters (JSON):", sequential_source)
         self.assertIn("SWEEP DEFINITION", sequential_source)
         self.assertIn("FSP PROVENANCE", sequential_source)
         self.assertIn("per_case_fsp_saved=false", sequential_source)
@@ -244,7 +250,14 @@ class LumericalExportTests(unittest.TestCase):
                     "values": {"pitch": 0.77},
                     "source_parameters": {
                         "pitch": 0.77, "fill_factor": 0.43, "N": 31,
+                        "alpha_t": 22.0, "taper_L": 23.0,
+                        "L_extra": 10.0, "wg_width": 1.2, "wg_length": 5.0,
                         "fiber_offset": 4.8, "angle_theta": 7.0,
+                        "fiber_power_monitor_below_source_um": 0.1,
+                        "waveguide_effective_index": 2.0,
+                        "waveguide_neff_tolerance": 0.3,
+                        "waveguide_mode_search_count": 20,
+                        "tolerance": 0.0005,
                     },
                     "display_label": "P=0.77",
                     "result_stem": "CE-P=0.77",
@@ -254,7 +267,14 @@ class LumericalExportTests(unittest.TestCase):
                     "values": {"pitch": 0.81},
                     "source_parameters": {
                         "pitch": 0.81, "fill_factor": 0.43, "N": 31,
+                        "alpha_t": 22.0, "taper_L": 23.0,
+                        "L_extra": 10.0, "wg_width": 1.2, "wg_length": 5.0,
                         "fiber_offset": 4.8, "angle_theta": 7.0,
+                        "fiber_power_monitor_below_source_um": 0.1,
+                        "waveguide_effective_index": 2.0,
+                        "waveguide_neff_tolerance": 0.3,
+                        "waveguide_mode_search_count": 20,
+                        "tolerance": 0.0005,
                     },
                     "display_label": "P=0.81",
                     "result_stem": "CE-P=0.81",
@@ -327,8 +347,19 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("- Pitch: 0.81 um", summary)
         self.assertIn("- Fill factor: 0.43", summary)
         self.assertIn("- Number of grating periods: 31", summary)
+        self.assertIn("- Aperture angle: 22 deg", summary)
+        self.assertIn("- Taper length: 23 um", summary)
+        self.assertIn("- Thick-end extension: 10 um", summary)
+        self.assertIn("- Waveguide width: 1.2 um", summary)
+        self.assertIn("- Waveguide length: 5 um", summary)
         self.assertIn("- Fiber offset: 4.8 um", summary)
         self.assertIn("- Fiber angle theta: 7 deg", summary)
+        self.assertIn("- Fiber power-plane distance below source: 0.1 um", summary)
+        self.assertIn("- Waveguide target effective index: 2", summary)
+        self.assertIn("- Waveguide eigensolver modes searched: 20", summary)
+        self.assertIn("- Geometry build tolerance: 0.0005 um", summary)
+        self.assertIn("Target-best major parameters:\n- Pitch: 0.77 um", summary)
+        self.assertIn("Target-best exact source parameters (JSON):", summary)
         self.assertIn('"fill_factor":0.43', summary)
         self.assertIn('"fiber_offset":4.8', summary)
         self.assertIn('"angle_theta":7.0', summary)
@@ -540,6 +571,43 @@ class LumericalExportTests(unittest.TestCase):
         )
         self.assertEqual(cross_section["sidewall_angle_deg"], 79.0)
 
+        from max_layout.ui.window import grating_lumerical_export_settings
+
+        automatic = grating_lumerical_export_settings({})
+        self.assertEqual(automatic["stack_preset"], "TFLN on SiO2")
+        self.assertTrue(
+            all(row["mesh_factor"] == 0.0 for row in automatic["material_stack"])
+        )
+
+        legacy = grating_lumerical_export_settings(
+            {
+                "stack_preset": "TFLN on SiO2",
+                "material_stack": lumerical.default_stack("TFLN on SiO2"),
+                "frequency_points": 17,
+            }
+        )
+        self.assertTrue(
+            all(row["mesh_factor"] == 0.0 for row in legacy["material_stack"])
+        )
+        self.assertEqual(legacy["frequency_points"], 17)
+
+        customized_stack = lumerical.default_stack("TFLN on SiO2")
+        customized_stack[2]["mesh_factor"] = 0.1
+        preserved = grating_lumerical_export_settings(
+            {
+                "stack_preset": "TFLN on SiO2",
+                "material_stack": customized_stack,
+            }
+        )
+        self.assertEqual(preserved["material_stack"][2]["mesh_factor"], 0.1)
+
+        dialog_source = Path("src/max_layout/ui/lumerical_dialog.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Use Lumerical automatic mesh", dialog_source)
+        self.assertIn("def use_lumerical_automatic_mesh", dialog_source)
+        self.assertIn("mesh_factor.setValue(0.0)", dialog_source)
+
     def test_mmi_default_stack_is_three_micron_bottom_oxide_without_silicon(self) -> None:
         stack = lumerical.default_stack("TFLN MMI (3 um SiO2)")
         self.assertEqual(stack[0]["name"], "Bottom SiO2")
@@ -721,9 +789,120 @@ class LumericalExportTests(unittest.TestCase):
             lumerical._BUILD_CELL,
         )
         self.assertIn(
+            "geometry_bounds_um[0] - pml_geometry_overlap_um",
+            lumerical._BUILD_CELL,
+        )
+        self.assertIn(
+            'fdtd.set("x span", (material_x_max_um - material_x_min_um) * UM)',
+            lumerical._BUILD_CELL,
+        )
+        self.assertIn(
+            "Keep the FDTD bounds unchanged and independently enlarge the material",
+            lumerical._BUILD_CELL,
+        )
+        self.assertIn(
             "_conformal_fill_start(z_ranges, row_index, z0)",
             lumerical._GEOMETRY_PROJECTIONS_REMOTE,
         )
+
+    def test_material_stack_covers_geometry_outside_clipped_solver_bounds(self) -> None:
+        import ast
+
+        helper_names = {
+            "_layer_builder_geometry",
+            "_conformal_fill_start",
+            "_add_material_stack",
+        }
+        build_tree = ast.parse(lumerical._BUILD_CELL)
+        helper_nodes = [
+            node
+            for node in build_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helper_nodes}, helper_names)
+
+        geometry = [
+            {
+                "layer": layer,
+                "datatype": 0,
+                "vertices_um": [
+                    [-2.0, -4.0],
+                    [2.0, -4.0],
+                    [2.0, 4.0],
+                    [-2.0, 4.0],
+                ],
+            }
+            for layer in (1, 2)
+        ]
+        namespace = {"np": np, "UM": 1e-6, "GEOMETRY": geometry}
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=helper_nodes, type_ignores=[])
+                ),
+                "<material-stack-union-extent>",
+                "exec",
+            ),
+            namespace,
+        )
+
+        class FakeFDTD:
+            def __init__(self) -> None:
+                self.layer_builder: dict[str, object] = {}
+                self.rectangles: list[dict[str, object]] = []
+                self._active = self.layer_builder
+
+            def addlayerbuilder(self):
+                self._active = self.layer_builder
+
+            def addrect(self):
+                self.rectangles.append({})
+                self._active = self.rectangles[-1]
+
+            def set(self, name, value):
+                self._active[name] = value
+
+            def addlayer(self, _name):
+                return None
+
+            def setlayer(self, _name, _property, _value):
+                return None
+
+        solver_bounds_um = [-3.0, 0.0, 3.0, 5.0]
+        original_solver_bounds_um = list(solver_bounds_um)
+        overlap_um = 1.0
+        fake_fdtd = FakeFDTD()
+        namespace["_add_material_stack"](
+            fake_fdtd,
+            _anchored_stack_ranges(
+                lumerical.default_stack("SOI grating coupler (Ansys)")
+            ),
+            solver_bounds_um,
+            -4.0,
+            2.0,
+            overlap_um,
+        )
+
+        # The solver clips the negative-Y half of the symmetric geometry, but
+        # material objects cover the union of solver and geometry bounds plus
+        # the requested overlap: X [-4, 4] um and Y [-5, 6] um.
+        expected_center_m = np.asarray([0.0, 0.5]) * 1e-6
+        expected_span_m = np.asarray([8.0, 11.0]) * 1e-6
+        material_objects = [fake_fdtd.layer_builder, *fake_fdtd.rectangles]
+        self.assertGreater(len(fake_fdtd.rectangles), 0)
+        self.assertTrue(
+            any("SiO2 TOX" in str(item.get("name", "")) for item in fake_fdtd.rectangles)
+        )
+        for material_object in material_objects:
+            self.assertAlmostEqual(material_object["x"], expected_center_m[0], places=12)
+            self.assertAlmostEqual(material_object["y"], expected_center_m[1], places=12)
+            self.assertAlmostEqual(
+                material_object["x span"], expected_span_m[0], places=12
+            )
+            self.assertAlmostEqual(
+                material_object["y span"], expected_span_m[1], places=12
+            )
+        self.assertEqual(solver_bounds_um, original_solver_bounds_um)
 
     def test_automatic_soi_grating_uses_one_source_and_waveguide_monitors(self) -> None:
         from max_layout.ui.window import NativeLayoutWindow
@@ -756,8 +935,11 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(diagnostic_port["params"]["plane normal"], "Z")
         self.assertTrue(diagnostic_port["params"]["align to fiber axis"])
         self.assertEqual(diagnostic_port["params"]["fiber plane role"], "input power measurement")
-        self.assertEqual(diagnostic_port["params"]["mode number"], 2)
-        self.assertEqual(diagnostic_port["params"]["polarization"], "Ey")
+        self.assertEqual(diagnostic_port["params"]["mode number"], 0)
+        self.assertEqual(diagnostic_port["params"]["polarization"], "local TE")
+        self.assertEqual(
+            diagnostic_port["params"]["candidate mode numbers"], [1, 2]
+        )
         waveguide_power = next(
             item for item in companions
             if item["kind"] == "Power monitor"
@@ -780,8 +962,11 @@ class LumericalExportTests(unittest.TestCase):
             and item.get("simulation_parent_port") != "fiber_input_power"
         )
         self.assertEqual(fiber_source_component["params"]["mode"], "user select")
-        self.assertEqual(fiber_source_component["params"]["mode number"], 2)
-        self.assertEqual(fiber_source_component["params"]["polarization"], "Ey")
+        self.assertEqual(fiber_source_component["params"]["mode number"], 0)
+        self.assertEqual(fiber_source_component["params"]["polarization"], "local TE")
+        self.assertEqual(
+            fiber_source_component["params"]["candidate mode numbers"], [1, 2]
+        )
         notebook, _warnings = generate_lumerical_notebook(
             [grating, *companions],
             {
@@ -810,6 +995,269 @@ class LumericalExportTests(unittest.TestCase):
         self.assertAlmostEqual(
             measurement["center"][0] - fiber["center"][0],
             (0.65 * np.cos(np.deg2rad(10.0)) - 0.1) * np.tan(np.deg2rad(10.0)),
+        )
+
+    def test_fiber_local_te_selects_near_degenerate_partner_after_rotation(self) -> None:
+        import ast
+
+        helper_names = {
+            "_mode_profile_vector",
+            "_fiber_local_te_score",
+            "_fiber_candidate_neff",
+            "_select_fiber_local_te_mode",
+        }
+        build_tree = ast.parse(lumerical._BUILD_CELL)
+        helper_nodes = [
+            node
+            for node in build_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helper_nodes}, helper_names)
+        namespace = {"np": np}
+        helper_module = ast.Module(body=helper_nodes, type_ignores=[])
+        exec(
+            compile(helper_module, "<fiber-mode-selection>", "exec"),
+            namespace,
+        )
+        select_fiber_mode = namespace["_select_fiber_local_te_mode"]
+
+        ex_mode = np.zeros((3, 4, 3), dtype=complex)
+        ey_mode = np.zeros((3, 4, 3), dtype=complex)
+        ex_mode[..., 0] = 1.0
+        ey_mode[..., 1] = 1.0
+
+        class FakeFdtd:
+            def __init__(self) -> None:
+                self.selected = []
+                self.mode_updates = []
+
+            def select(self, path):
+                self.selected.append(path)
+
+            def updateportmodes(self, modes):
+                self.mode_updates.append(np.asarray(modes, dtype=int).tolist())
+
+            def getresult(self, _path, result_name):
+                if result_name == "mode profiles":
+                    return {"E1": ex_mode, "E2": ey_mode}
+                if result_name == "neff":
+                    return {
+                        "neff1": np.asarray([1.447000]),
+                        "neff2": np.asarray([1.447004]),
+                    }
+                raise AssertionError(result_name)
+
+        base_port = {
+            "name": "fiber_source",
+            "candidate mode numbers": [1, 2],
+            "minimum local TE fraction": 0.8,
+            "mode degeneracy tolerance": 0.01,
+        }
+
+        unrotated_fdtd = FakeFdtd()
+        unrotated = select_fiber_mode(
+            unrotated_fdtd,
+            "FDTD::ports::fiber_source",
+            {**base_port, "angle phi": 0.0},
+        )
+        self.assertEqual(unrotated["mode number"], 2)
+        self.assertEqual(unrotated["selected mode order"], [1, 2])
+        self.assertEqual(unrotated["target polarization xy"], [0.0, 1.0])
+        self.assertAlmostEqual(unrotated["local TE scores"]["1"], 0.0)
+        self.assertAlmostEqual(unrotated["local TE scores"]["2"], 1.0)
+        self.assertLess(unrotated["neff degeneracy delta"], 0.01)
+        self.assertEqual(unrotated_fdtd.mode_updates, [[1, 2]])
+
+        rotated_fdtd = FakeFdtd()
+        rotated = select_fiber_mode(
+            rotated_fdtd,
+            "FDTD::ports::fiber_source",
+            {**base_port, "angle phi": 90.0},
+        )
+        self.assertEqual(rotated["mode number"], 1)
+        self.assertEqual(rotated["selected mode order"], [1, 2])
+        self.assertAlmostEqual(rotated["target polarization xy"][0], -1.0)
+        self.assertAlmostEqual(rotated["target polarization xy"][1], 0.0, places=12)
+        self.assertAlmostEqual(rotated["local TE scores"]["1"], 1.0)
+        self.assertAlmostEqual(rotated["local TE scores"]["2"], 0.0, places=12)
+        self.assertLess(rotated["neff degeneracy delta"], 0.01)
+        self.assertEqual(rotated_fdtd.mode_updates, [[1, 2]])
+
+    def test_fiber_port_export_defaults_request_both_local_te_candidates(self) -> None:
+        defaults = DEFAULT_COMPONENT_VALUES["Fiber-axis FDTD port"]
+        self.assertEqual(defaults["mode number"], 0)
+        self.assertEqual(defaults["polarization"], "local TE")
+        self.assertEqual(defaults["candidate mode numbers"], [1, 2])
+        self.assertEqual(defaults["mode degeneracy tolerance"], 0.01)
+        self.assertEqual(defaults["minimum local TE fraction"], 0.8)
+
+    def test_passive_fiber_plane_reuses_and_verifies_source_ey_winner(self) -> None:
+        import ast
+
+        helper_names = {
+            "_mode_profile_vector",
+            "_fiber_local_te_score",
+            "_select_fiber_local_te_mode",
+            "_reuse_verified_fiber_local_te_mode",
+        }
+        build_tree = ast.parse(lumerical._BUILD_CELL)
+        helper_nodes = [
+            node for node in build_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helper_nodes}, helper_names)
+        namespace = {"np": np}
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=helper_nodes, type_ignores=[])
+                ),
+                "<passive-fiber-mode-reuse>",
+                "exec",
+            ),
+            namespace,
+        )
+
+        ey_mode = np.zeros((3, 4, 3), dtype=complex)
+        ey_mode[..., 1] = 1.0
+
+        class FakeFdtd:
+            def __init__(self) -> None:
+                self.mode_updates = []
+
+            def select(self, _path):
+                return None
+
+            def updateportmodes(self, modes):
+                self.mode_updates.append(np.asarray(modes, dtype=int).tolist())
+
+            def getresult(self, _path, result_name):
+                if result_name == "mode profiles":
+                    return {"E2": ey_mode}
+                raise AssertionError(result_name)
+
+        fake_fdtd = FakeFdtd()
+        selection = namespace["_reuse_verified_fiber_local_te_mode"](
+            fake_fdtd,
+            "FDTD::ports::fiber_measurement",
+            {
+                "name": "fiber_measurement",
+                "angle phi": 0.0,
+                "candidate mode numbers": [1, 2],
+                "minimum local TE fraction": 0.8,
+            },
+            {
+                "mode number": 2,
+                "selected mode order": [1, 2],
+                "candidate mode numbers": [1, 2],
+                "local TE scores": {"1": 0.0, "2": 1.0},
+            },
+        )
+        self.assertEqual(fake_fdtd.mode_updates, [2])
+        self.assertEqual(selection["mode number"], 2)
+        self.assertEqual(selection["selected mode order"], [2])
+        self.assertTrue(selection["inherited from source mode"])
+        self.assertAlmostEqual(selection["local TE scores"]["2"], 1.0)
+
+    def test_sweep_fiber_fallback_reselects_pair_and_reaches_multigpu_worker(self) -> None:
+        import ast
+
+        helper_names = {
+            "_sweep_mode_profile_vector",
+            "_sweep_reselect_fiber_local_te",
+        }
+        sweep_tree = ast.parse(lumerical._SWEEP_RUNTIME_REMOTE)
+        helper_nodes = [
+            node
+            for node in sweep_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helper_nodes}, helper_names)
+
+        ex_mode = np.zeros((3, 4, 3), dtype=complex)
+        ey_mode = np.zeros((3, 4, 3), dtype=complex)
+        ex_mode[..., 0] = 1.0
+        ey_mode[..., 1] = 1.0
+
+        class FakeFdtd:
+            def __init__(self) -> None:
+                self.mode_updates = []
+
+            def select(self, _path):
+                return None
+
+            def updateportmodes(self, modes):
+                self.mode_updates.append(np.asarray(modes, dtype=int).tolist())
+
+            def getresult(self, _path, result_name):
+                if result_name == "mode profiles":
+                    return {"E1": ex_mode, "E2": ey_mode}
+                if result_name == "neff":
+                    return {
+                        "neff1": np.asarray([1.447000]),
+                        "neff2": np.asarray([1.447004]),
+                    }
+                raise AssertionError(result_name)
+
+        def sweep_selection(phi_deg):
+            fake_fdtd = FakeFdtd()
+            namespace = {"np": np, "fdtd": fake_fdtd}
+            helper_module = ast.Module(body=helper_nodes, type_ignores=[])
+            exec(
+                compile(helper_module, "<sweep-fiber-mode-selection>", "exec"),
+                namespace,
+            )
+            previous = {
+                "mode number": 2,
+                "selected mode order": [2, 1],
+                "candidate mode numbers": [1, 2],
+            }
+            selected = namespace["_sweep_reselect_fiber_local_te"](
+                "FDTD::ports::fiber_source",
+                {
+                    "name": "fiber_source",
+                    "angle phi": phi_deg,
+                    "candidate mode numbers": [1, 2],
+                    "minimum local TE fraction": 0.8,
+                    "mode degeneracy tolerance": 0.01,
+                },
+                previous,
+            )
+            return selected, fake_fdtd.mode_updates
+
+        unrotated, unrotated_updates = sweep_selection(0.0)
+        self.assertEqual(unrotated["mode number"], 2)
+        self.assertEqual(unrotated["selected mode order"], [1, 2])
+        self.assertEqual(unrotated_updates, [[1, 2]])
+
+        rotated, rotated_updates = sweep_selection(90.0)
+        self.assertEqual(rotated["mode number"], 1)
+        self.assertEqual(rotated["selected mode order"], [1, 2])
+        self.assertEqual(rotated_updates, [[1, 2]])
+
+        sweep_cases, spec = soi_sweep_cases()
+        notebook, _warnings = lumerical.generate_lumerical_multigpu_sweep_notebook(
+            sweep_cases,
+            {
+                "included_layers": [[1, 0], [2, 0]],
+                "material_stack": lumerical.default_stack(
+                    "SOI grating coupler (Ansys)"
+                ),
+                "resource_mode": "GPU",
+                "run_after_build": True,
+            },
+            spec,
+        )
+        orchestration_cell = cell_source_containing(notebook, "def _worker_payload")
+        self.assertIn(
+            "+ 'SWEEP_FIBER_MODE_SELECTIONS = ' + "
+            "repr(SWEEP_FIBER_MODE_SELECTIONS) + '\\n'",
+            orchestration_cell,
+        )
+        self.assertIn(
+            "SWEEP_FIBER_MODE_SELECTIONS = dict("
+            "_MULTIGPU_BUILD_STATE.get('port_modes') or {})",
+            "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"]),
         )
 
     def test_generic_grating_has_editable_terminal_output_arc(self) -> None:
@@ -976,11 +1424,30 @@ class LumericalExportTests(unittest.TestCase):
         self.assertTrue(any("Layout origin moved" in warning for warning in warnings))
         self.assertEqual(notebook["metadata"]["max_layout"]["point_count"], 4)
         self.assertFalse(notebook["metadata"]["max_layout"]["per_point_fsp"])
+        first_source = "".join(notebook["cells"][0]["source"])
+        self.assertIn("RUN_SIMULATION = True", first_source)
+        self.assertIn(
+            "One pre-solve inspection FSP and one solved/best FSP are always stored.",
+            first_source,
+        )
         all_source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
         for index, cell in enumerate(notebook["cells"]):
             if cell["cell_type"] == "code":
                 compile("".join(cell["source"]), f"<sweep notebook cell {index}>", "exec")
+        # The nominal model is constructed exactly once.  The sweep loop
+        # hot-swaps geometry without a cache-load constructor or another FDTD
+        # owner.
         self.assertEqual(all_source.count("lumapi.FDTD("), 1)
+        self.assertNotIn("MODEL_CACHE_HIT", all_source)
+        self.assertNotIn("MODEL_CACHE_KEY", all_source)
+        self.assertNotIn("REMOTE_MODEL_CACHE_FSP", all_source)
+        self.assertNotIn("REUSE_EXACT_MODEL_CACHE", all_source)
+        self.assertNotIn("SAVE_EXACT_MODEL_CACHE_ON_MISS", all_source)
+        self.assertIn("SETTINGS['save_inspection_fsp'] = True", all_source)
+        self.assertIn("SETTINGS['save_final_fsp'] = True", all_source)
+        self.assertIn("save_verified_project(REMOTE_INSPECTION_PROJECT_FILE)", all_source)
+        self.assertIn("fdtd.save(REMOTE_BEST_SWEEP_FSP)", all_source)
+        self.assertIn("The required winning sweep FSP was not created", all_source)
         self.assertIn("one persistent Lumerical/GPU session", all_source)
         self.assertIn("_layer_builder_geometry(layer_x_um, layer_y_um, GEOMETRY)", all_source)
         self.assertIn('fdtd.run("FDTD", resource_mode)', all_source)
@@ -988,8 +1455,25 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("no per-point FSP is saved", all_source)
         self.assertIn("All sweep solves complete; post-processing resource is CPU", all_source)
         self.assertIn('fdtd.setresource("FDTD", 1, "active", False)', all_source)
+        self.assertIn("Sweep was not run, so there are no sweep results to fetch.", all_source)
+        self.assertNotIn("lam.fetch(REMOTE_MODEL_CACHE_FSP", all_source)
         self.assertIn("CE-maximum-", all_source)
+        self.assertIn("_responses_db", all_source)
+        self.assertIn("_maximum_db", all_source)
+        self.assertIn("10.0 * np.log10", all_source)
+        self.assertIn("maximum_response_db", all_source)
+        self.assertIn("target_response_db", all_source)
+        self.assertIn("coupling efficiency [dB]", all_source)
+        self.assertIn("Maximum CE across wavelength — dB", all_source)
+        self.assertIn("Maximum CE for each parameter combination — dB", all_source)
         self.assertIn("result_stems", all_source)
+        self.assertIn("sweep_live_progress.jsonl", all_source)
+        self.assertIn("progress_mode='sweep'", all_source)
+        self.assertIn("current_fraction", all_source)
+        self.assertIn('"progress_type": "sweep"', all_source)
+        self.assertIn('"completed"', all_source)
+        self.assertIn('"peak_response"', all_source)
+        self.assertEqual(len(assignment_value(notebook, "SWEEP_CODE_FINGERPRINT")), 64)
 
         payload_source = cell_source_containing(notebook, "_SWEEP_CASES_B64")
         encoded = assignment_value(notebook, "_SWEEP_CASES_B64")
@@ -1086,13 +1570,21 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("Reusing completed sweep checkpoint", all_source)
         self.assertIn("os.path.isfile(case_path)", all_source)
         self.assertIn('fdtd.setresource("FDTD", 1, "active", False)', all_source)
-        self.assertIn("finally:\n    for record in MULTIGPU_WORKER_RECORDS", all_source)
+        self.assertRegex(
+            all_source,
+            r"finally:\n\s+for record in MULTIGPU_WORKER_RECORDS",
+        )
         self.assertIn("_cleanup_worker(record)", all_source)
         self.assertIn("FDTD STOP UNCONFIRMED; HPC Packs were NOT returned", all_source)
         self.assertIn("_finalize_sweep_results", all_source)
         self.assertIn("MULTIGPU_FATAL_ERRORS", all_source)
         self.assertIn("checkpoint_schema", all_source)
         self.assertIn("SWEEP_RUNTIME_VERSION", all_source)
+        self.assertIn("SWEEP_CODE_FINGERPRINT", all_source)
+        self.assertIn("_report_multigpu_progress", all_source)
+        self.assertIn("Multi-GPU sweep [", all_source)
+        self.assertIn("finished | failed", all_source)
+        self.assertIn("peak_response", all_source)
         self.assertIn("socket.gethostname()", all_source)
         self.assertIn("uuid.uuid4().hex", all_source)
         self.assertIn("stop_work_processes(timeout=25)", all_source)
@@ -1104,6 +1596,9 @@ class LumericalExportTests(unittest.TestCase):
         )
         self.assertIn("one simulation per gpu", lower_source)
         self.assertIn("same-gpu oversubscription is intentionally disabled", lower_source)
+        self.assertIn("Multi-GPU sweep disabled by RUN_SIMULATION in cell 1.", all_source)
+        self.assertIn("shutil.copy2(", all_source)
+        self.assertIn("WORKER_RUNTIME_FSP", all_source)
 
         inventory_cell = next(
             "".join(cell["source"])
@@ -1140,7 +1635,7 @@ class LumericalExportTests(unittest.TestCase):
         shared_fsp_cell_index = next(
             index
             for index, cell in enumerate(notebook["cells"])
-            if "SHARED_NOMINAL_FSP = REMOTE_PROJECT_FILE" in "".join(cell.get("source", []))
+            if "Every worker needs one shared seed" in "".join(cell.get("source", []))
         )
         orchestration_cell_index = next(
             index
@@ -1189,7 +1684,10 @@ class LumericalExportTests(unittest.TestCase):
         self.assertLess(loop_break, cpu_reset)
         self.assertLess(cpu_reset, final_schema_guard)
         self.assertLess(final_schema_guard, final_raise)
-        self.assertIn("if schema_failure is None:\n    _finalize_sweep_results(failures)", source)
+        self.assertIn(
+            "if schema_failure is None:\n    best_sweep_index = _finalize_sweep_results(failures)",
+            source,
+        )
 
     def test_multigpu_sweep_preflights_one_result_schema_before_queue_submission(self) -> None:
         sweep_cases, spec = soi_sweep_cases()
@@ -1275,6 +1773,57 @@ class LumericalExportTests(unittest.TestCase):
                 sweep_cases, configuration, spec
             )
 
+    def test_live_sweep_formatter_reports_overall_progress_eta_and_peak(self) -> None:
+        import ast
+
+        tree = ast.parse(lumerical._LAMBDA_CONNECT_CELL)
+        formatter = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_format_live_sweep_rows"
+        )
+        namespace = {}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[formatter], type_ignores=[])),
+                "<live sweep formatter>",
+                "exec",
+            ),
+            namespace,
+        )
+        lines = namespace["_format_live_sweep_rows"](
+            [
+                {
+                    "sequence": 0,
+                    "status": "running",
+                    "case_index": 0,
+                    "completed_count": 0,
+                    "failed_count": 0,
+                    "total_count": 4,
+                    "values": {"pitch": 0.75, "fill_factor": 0.5},
+                    "display_label": "P=0.75, F=0.5",
+                },
+                {
+                    "sequence": 1,
+                    "status": "completed",
+                    "case_index": 0,
+                    "completed_count": 1,
+                    "failed_count": 0,
+                    "total_count": 4,
+                    "values": {"pitch": 0.75, "fill_factor": 0.5},
+                    "display_label": "P=0.75, F=0.5",
+                    "peak_response": 0.437445,
+                    "peak_wavelength_nm": 1314.935,
+                },
+            ],
+            elapsed_seconds=120.0,
+        )
+        rendered = "\n".join(lines)
+        self.assertIn("1/4 finished ( 25.00%)", rendered)
+        self.assertIn("ETA 6.0 min", rendered)
+        self.assertIn("P=0.75, F=0.5", rendered)
+        self.assertIn("peak 0.437445 at 1314.935 nm", rendered)
+
     def test_sweep_checkpoint_rejects_nonfinite_or_wrong_objective(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             checkpoint_directory = Path(temporary_directory) / "checkpoints"
@@ -1301,6 +1850,11 @@ class LumericalExportTests(unittest.TestCase):
             namespace["_save_sweep_case"](
                 0, "coupling_efficiency", wavelength, response, {}
             )
+            self.assertTrue(namespace["_sweep_case_is_complete"](0))
+            original_fingerprint = namespace["SWEEP_CODE_FINGERPRINT"]
+            namespace["SWEEP_CODE_FINGERPRINT"] = "changed-exporter-code"
+            self.assertFalse(namespace["_sweep_case_is_complete"](0))
+            namespace["SWEEP_CODE_FINGERPRINT"] = original_fingerprint
             self.assertTrue(namespace["_sweep_case_is_complete"](0))
 
             checkpoint = Path(namespace["_sweep_case_npz"](0))
@@ -1367,6 +1921,8 @@ class LumericalExportTests(unittest.TestCase):
                     "waveguide_modal_direction": "Tbackward",
                     "fiber_input_measurement_port_name": "uid_1_fiber_input_power",
                     "fiber_measurement_expansion_result_name": "expansion for port monitor",
+                    "fiber_measurement_mode_number": 1,
+                    "fiber_measurement_selected_mode_order": [1],
                 },
                 "fdtd": fake_fdtd,
             }
@@ -1436,6 +1992,8 @@ class LumericalExportTests(unittest.TestCase):
                     "waveguide_expansion_result_name": "waveguide_power",
                     "waveguide_modal_direction": "Tbackward",
                     "fiber_input_measurement_port_name": "uid_1_fiber_input_power",
+                    "fiber_measurement_mode_number": 1,
+                    "fiber_measurement_selected_mode_order": [1],
                 },
                 "fdtd": fake_fdtd,
             }
@@ -1449,6 +2007,176 @@ class LumericalExportTests(unittest.TestCase):
             ("uid_1_waveguide_mode", "expansion for uid_1_waveguide_mode"),
             fake_fdtd.calls,
         )
+
+    def test_grating_sweep_extracts_verified_ey_mode_not_first_modal_column(self) -> None:
+        wavelength_m = np.asarray([1.50e-6, 1.55e-6, 1.60e-6])
+
+        class FakeFDTD:
+            def getresult(self, path, result_name=None):
+                path = str(path)
+                if path == "uid_1_waveguide_total_power" and result_name == "T":
+                    return {"lambda": wavelength_m, "T": np.asarray([0.31, 0.41, 0.36])}
+                if path == "uid_1_waveguide_mode":
+                    if result_name is None:
+                        return "expansion for waveguide_power"
+                    if result_name == "expansion for waveguide_power":
+                        return {
+                            "lambda": wavelength_m,
+                            "Tbackward": np.asarray([0.30, 0.40, 0.35]),
+                        }
+                if (
+                    path in {
+                        "FDTD::ports::uid_1_fiber_input_power",
+                        "::model::FDTD::ports::uid_1_fiber_input_power",
+                    }
+                    and result_name == "expansion for port monitor"
+                ):
+                    return {
+                        "lambda": wavelength_m,
+                        "n": np.asarray([1, 2]),
+                        # Mode 1 is Ex and nearly dark. Mode 2 is the verified
+                        # Ey/local-TE receiver mode and carries the source.
+                        "T_in": np.asarray([
+                            [1e-5, 1.0],
+                            [1e-5, 1.0],
+                            [1e-5, 1.0],
+                        ]),
+                        "T_out": np.asarray([
+                            [0.0, 0.01],
+                            [0.0, 0.02],
+                            [0.0, 0.01],
+                        ]),
+                    }
+                raise RuntimeError("Can not find result %r" % result_name)
+
+        with TemporaryDirectory() as temporary_directory:
+            namespace = {
+                "REMOTE_WORK": temporary_directory,
+                "SWEEP_HASH": "verified-ey-column",
+                "SWEEP_CASES": [],
+                "SWEEP_SPEC": {},
+                "SETTINGS": {},
+                "PORTS": [],
+                "MONITORS": [],
+                "MMI_ANALYSIS": None,
+                "GRATING_ANALYSIS": {
+                    "waveguide_power_monitor_name": "uid_1_waveguide_total_power",
+                    "waveguide_mode_monitor_name": "uid_1_waveguide_mode",
+                    "waveguide_expansion_result_name": "waveguide_power",
+                    "waveguide_modal_direction": "Tbackward",
+                    "fiber_input_measurement_port_name": "uid_1_fiber_input_power",
+                    "fiber_measurement_expansion_result_name": "expansion for port monitor",
+                    "fiber_measurement_mode_number": 2,
+                    "fiber_measurement_selected_mode_order": [2, 1],
+                },
+                "fdtd": FakeFDTD(),
+            }
+            exec(lumerical._SWEEP_RUNTIME_REMOTE, namespace)
+            primary_name, _, response, arrays = namespace["_extract_sweep_result"]()
+
+        self.assertEqual(primary_name, "coupling_efficiency")
+        np.testing.assert_allclose(response, [0.30, 0.40, 0.35])
+        np.testing.assert_allclose(arrays["fiber_forward_power"], 1.0)
+        np.testing.assert_allclose(arrays["fiber_reflected_power"], [0.01, 0.02, 0.01])
+
+    def test_single_grating_analysis_extracts_verified_ey_mode_by_n_coordinate(self) -> None:
+        import ast
+
+        tree = ast.parse(lumerical._GRATING_ANALYSIS_REMOTE)
+        wanted = {"_normalized_result_key", "_find_result_key", "_one_spectrum"}
+        functions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name in wanted
+        }
+        self.assertEqual(set(functions), wanted)
+        module = ast.Module(
+            body=[functions[name] for name in (
+                "_normalized_result_key", "_find_result_key", "_one_spectrum"
+            )],
+            type_ignores=[],
+        )
+        namespace = {"np": np}
+        exec(
+            compile(ast.fix_missing_locations(module), "<single-ey-spectrum>", "exec"),
+            namespace,
+        )
+        wavelength_m = np.asarray([1.50e-6, 1.55e-6, 1.60e-6])
+        dataset = {
+            "lambda": wavelength_m,
+            "n": np.asarray([1, 2]),
+            "T_in": np.asarray([
+                [8e-6, 0.99],
+                [9e-6, 1.00],
+                [7e-6, 0.98],
+            ]),
+        }
+        returned_wavelength, selected = namespace["_one_spectrum"](
+            dataset,
+            "T_in",
+            selected_mode_number=2,
+            selected_mode_order=[2, 1],
+        )
+        np.testing.assert_allclose(returned_wavelength, wavelength_m)
+        np.testing.assert_allclose(selected, [0.99, 1.00, 0.98])
+
+    def test_sweep_reapplies_reselected_ey_source_mode_to_port_group(self) -> None:
+        class FakeFDTD:
+            def __init__(self) -> None:
+                self.selected = None
+                self.group = {}
+
+            def select(self, path):
+                self.selected = str(path)
+
+            def set(self, name, value):
+                self.group[str(name)] = value
+
+            def get(self, name):
+                return self.group[str(name)]
+
+        with TemporaryDirectory() as temporary_directory:
+            fake_fdtd = FakeFDTD()
+            namespace = {
+                "REMOTE_WORK": temporary_directory,
+                "SWEEP_HASH": "source-mode-refresh",
+                "SWEEP_CASES": [],
+                "SWEEP_SPEC": {},
+                "SETTINGS": {},
+                "PORTS": [
+                    {"name": "fiber_source"},
+                    {"name": "fiber_measurement"},
+                ],
+                "MONITORS": [],
+                "MMI_ANALYSIS": None,
+                "GRATING_ANALYSIS": {
+                    "fiber_port_name": "fiber_source",
+                    "fiber_input_measurement_port_name": "fiber_measurement",
+                },
+                "SWEEP_FIBER_MODE_SELECTIONS": {
+                    "fiber_source": {
+                        "mode number": 2,
+                        "selected mode order": [2, 1],
+                        "candidate mode numbers": [1, 2],
+                    },
+                    "fiber_measurement": {
+                        "mode number": 2,
+                        "selected mode order": [2, 1],
+                        "candidate mode numbers": [1, 2],
+                    },
+                },
+                "fdtd": fake_fdtd,
+            }
+            exec(lumerical._SWEEP_RUNTIME_REMOTE, namespace)
+            self.assertEqual(fake_fdtd.group["source port"], "fiber_source")
+            self.assertEqual(fake_fdtd.group["source mode"], "mode 2")
+
+            namespace["SWEEP_FIBER_MODE_SELECTIONS"]["fiber_source"].update({
+                "mode number": 1,
+                "selected mode order": [1, 2],
+            })
+            namespace["_restore_sweep_fiber_mode_contract"]()
+            self.assertEqual(fake_fdtd.group["source mode"], "mode 1")
 
     def test_grating_sweep_expansion_failure_lists_available_results(self) -> None:
         wavelength_m = np.asarray([1.50e-6, 1.55e-6])
@@ -1561,14 +2289,10 @@ class LumericalExportTests(unittest.TestCase):
             arrays["output_1_ratio"] + arrays["output_2_ratio"], 1.0
         )
 
-    def test_transient_mode_seed_is_removed_before_nominal_fsp_save(self) -> None:
+    def test_layer_builder_is_committed_in_memory_without_a_mode_seed_fsp(self) -> None:
         build_source = lumerical._BUILD_CELL
-        self.assertIn('"_max_layout_mode_seed.fsp"', build_source)
-        self.assertIn("os.remove(mode_seed_project)", build_source)
-        self.assertLess(
-            build_source.index("fdtd.save(mode_seed_project)"),
-            build_source.index("os.remove(mode_seed_project)"),
-        )
+        self.assertIn("fdtd.runsetup()", build_source)
+        self.assertNotIn("fdtd.save(mode_seed_project)", build_source)
 
     def test_accepting_sweep_parameters_opens_stack_dialog(self) -> None:
         from max_layout.ui import window as window_module
@@ -1875,7 +2599,27 @@ class LumericalExportTests(unittest.TestCase):
             runtime_source = cell_source_containing(notebook, "REMOTE_SWEEP_RUNTIME")
             self.assertIn('return "output_1_over_input"', runtime_source)
             self.assertIn('"output_2_over_input": output_2_over_input', runtime_source)
-            self.assertIn("SWEEP_CHECKPOINT_SCHEMA = 4", runtime_source)
+            self.assertIn("SWEEP_CHECKPOINT_SCHEMA = 5", runtime_source)
+            self.assertIn('"code_fingerprint"', runtime_source)
+            self.assertIn('"mmi_width": ("MMI width", "um")', runtime_source)
+            self.assertIn('"mmi_length": ("MMI length", "um")', runtime_source)
+            self.assertIn('"taper_power": ("MMI taper profile exponent", "")', runtime_source)
+            self.assertIn('"input_reference_before_taper_um": ("Input power-reference distance before taper", "um")', runtime_source)
+            self.assertIn("Target-best exact source parameters (JSON):", runtime_source)
+            nominal = assignment_value(notebook, "SWEEP_NOMINAL_PARAMETERS")
+            self.assertEqual(nominal["mmi_width"], 6.0)
+            self.assertEqual(nominal["mmi_length"], 29.0)
+            self.assertEqual(nominal["wg_width"], 1.2)
+            self.assertEqual(nominal["taper_width"], 2.7)
+            self.assertEqual(nominal["input_taper_length"], 10.0)
+            self.assertEqual(nominal["output_taper_length"], 10.0)
+            self.assertEqual(nominal["input_length"], 6.0)
+            self.assertEqual(nominal["output_length"], 6.0)
+            self.assertEqual(nominal["port_sep"], 3.25)
+            self.assertEqual(nominal["taper_power"], 1.0)
+            self.assertEqual(nominal["taper_points"], 41)
+            self.assertEqual(nominal["fdtd_port_clearance_um"], 2.0)
+            self.assertEqual(nominal["input_reference_before_taper_um"], 2.0)
             preview_source = cell_source_containing(notebook, "REMOTE_PORT_MODE_PROFILES")
             self.assertIn('elif MMI_ANALYSIS:', preview_source)
             self.assertIn('"MMI input"', preview_source)
@@ -2144,8 +2888,9 @@ class LumericalExportTests(unittest.TestCase):
             0.9 * np.tan(np.deg2rad(10.0)),
         )
         self.assertEqual(input_port["fiber plane role"], "passive fiber measurement")
-        self.assertEqual(input_port["mode number"], 2)
-        self.assertEqual(input_port["polarization"], "Ey")
+        self.assertEqual(input_port["mode number"], 0)
+        self.assertEqual(input_port["polarization"], "local TE")
+        self.assertEqual(input_port["candidate mode numbers"], [1, 2])
         self.assertFalse(any(monitor["name"] == "fiber_input_power" for monitor in monitors))
         self.assertAlmostEqual(
             source_port["rotation offset_um"],
@@ -2228,6 +2973,9 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn('set("alpha",0.35);', build_source)
         self.assertIn("fdtd.updateportmodes()", build_source)
         self.assertIn("fdtd.updateportmodes(requested_mode_number)", build_source)
+        self.assertIn("_select_fiber_local_te_mode", build_source)
+        self.assertIn("candidate mode numbers", build_source)
+        self.assertIn("selected mode order", build_source)
         self.assertIn("Verified fiber/port concentricity", build_source)
         self.assertIn("is not concentric", build_source)
         self.assertIn("no source or port was created", build_source)
@@ -2247,8 +2995,9 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(analysis["fiber_input_measurement_port_name"], "fiber_input_power")
         self.assertEqual(analysis["fiber_measurement_expansion_result_name"], "expansion for port monitor")
         self.assertIsNone(analysis["fiber_input_monitor_name"])
-        self.assertEqual(analysis["fiber_source_mode"], "mode 2")
-        self.assertEqual(analysis["fiber_polarization"], "Ey")
+        self.assertEqual(analysis["fiber_source_mode"], "auto local TE")
+        self.assertEqual(analysis["fiber_polarization"], "local TE")
+        self.assertEqual(analysis["fiber_mode_candidates"], [1, 2])
         self.assertEqual(analysis["frequency_points"], 31)
         settings = assignment_value(notebook, "SETTINGS")
         self.assertEqual(settings["resource_mode"], "GPU")
@@ -2265,14 +3014,24 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("REMOTE_SWITCH_TO_CPU_ANALYSIS", run_source)
         self.assertIn('fdtd.setresource("FDTD", 1, "active", False)', run_source)
         self.assertIn('fdtd.setresource("FDTD", 2, "threads", analysis_threads)', run_source)
-        resource_source = cell_source_containing(notebook, "saved pre-solve project ->")
+        resource_source = cell_source_containing(notebook, "REMOTE_RESOURCE_AND_SAVE =")
         self.assertIn('getlicenseestimate("FDTD", "1")', resource_source)
         self.assertIn('fdtd.set("source port", str(GRATING_ANALYSIS["fiber_port_name"]))', resource_source)
         self.assertIn('fdtd.set("source mode", fiber_source_mode)', resource_source)
-        self.assertIn('GRATING_ANALYSIS.get("fiber_source_mode", "mode 2")', resource_source)
-        self.assertIn('GRATING_ANALYSIS.get("fiber_polarization", "Ey")', resource_source)
+        self.assertIn('GRATING_ANALYSIS.get("fiber_source_mode", "auto local TE")', resource_source)
+        self.assertIn(
+            "The fiber source mode was not resolved from its near-degenerate pair",
+            resource_source,
+        )
         self.assertIn("Backward along the tilted Z-axis fiber port", resource_source)
-        self.assertIn("PIRIS_FSP_DIR / os.path.basename(REMOTE_PROJECT_FILE)", resource_source)
+        self.assertIn("LOCAL_INSPECTION_PROJECT_FILE", resource_source)
+        self.assertIn("REMOTE_INSPECTION_FSP_SAVED", resource_source)
+        self.assertIn("Saved required pre-solve inspection FSP", resource_source)
+        self.assertIn(
+            "The required pre-solve inspection FSP was not saved",
+            resource_source,
+        )
+        self.assertIn("lam.fetch(REMOTE_INSPECTION_PROJECT_FILE", resource_source)
         self.assertNotIn("_solve_code", resource_source)
         review_source = cell_source_containing(notebook, "OPEN_REMOTE_LUMERICAL_GUI")
         self.assertIn("FileLink", review_source)
@@ -2326,9 +3085,13 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("fiber_coupling = waveguide_mode_power_source_normalized / np.maximum", analysis_source)
         self.assertNotIn("np.abs(scattering) ** 2", analysis_source)
         self.assertIn("fiber_coupling", analysis_source)
-        self.assertNotIn("fiber_coupling_db", analysis_source)
-        self.assertNotIn("coupling efficiency [dB]", analysis_source)
+        self.assertIn("fiber_coupling_db", analysis_source)
+        self.assertIn("10.0 * np.log10", analysis_source)
+        self.assertIn("coupling efficiency [dB]", analysis_source)
+        self.assertIn("_grid[1, 0]", analysis_source)
+        self.assertIn("_grid[1, 1]", analysis_source)
         self.assertIn("Incident-normalized waveguide coupling efficiency (linear)", analysis_source)
+        self.assertIn("Incident-normalized waveguide coupling efficiency (dB)", analysis_source)
         self.assertIn("source-normalized linear power", analysis_source)
         self.assertIn("lam.fetch(_remote_grating_npz", analysis_source)
         self.assertIn("display(Image(filename=str(_local_response_png)", analysis_source)
@@ -2337,7 +3100,9 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn('status = fdtd.updatemodes()', build_source)
         self.assertNotIn('fdtd.seteigensolver("use max index", 1)', build_source)
         self.assertNotIn('fdtd.seteigensolver("number of trial modes", trial_mode_count)', build_source)
-        self.assertIn('mode_seed_project = os.path.join(REMOTE_WORK, "_max_layout_mode_seed.fsp")', build_source)
+        self.assertIn("fdtd.runsetup()", build_source)
+        self.assertIn("Committed geometry in memory", build_source)
+        self.assertNotIn('fdtd.save(mode_seed_project)', build_source)
         self.assertIn('geometry_by_layer = _layer_builder_geometry(layer_builder_x_um, layer_builder_y_um)', build_source)
         self.assertIn('(global_vertices_um - local_origin_um) * UM', build_source)
         self.assertNotIn('fdtd.seteigensolver("n", target_neff)', build_source)
@@ -2346,7 +3111,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertNotIn('REMOTE_WORK + "/grating_analysis.npz"', fetch_source)
         self.assertNotIn('REMOTE_WORK + "/grating_response.png"', fetch_source)
         self.assertIn("geometry_xyz_projections.png", fetch_source)
-        self.assertIn("PIRIS_FSP_DIR if remote_path == REMOTE_PROJECT_FILE", fetch_source)
+        self.assertIn('remote_path.lower().endswith(".fsp")', fetch_source)
         paths_source = cell_source_containing(notebook, "PIRIS_PROJECT_ROOT =")
         self.assertIn('PIRIS_FSP_DIR = PIRIS_PROJECT_ROOT / "fsp"', paths_source)
         self.assertIn("PIRIS_FSP_DIR.mkdir", paths_source)
@@ -2573,7 +3338,7 @@ class LumericalExportTests(unittest.TestCase):
 
         checkout = index("products checkout")
         build = index("run_remote_checked(_remote_payload + REMOTE_MODEL_BUILDER")
-        project_prefetch = index("saved pre-solve project ->")
+        resource_configuration = index("REMOTE_RESOURCE_AND_SAVE =")
         port_mode_preview = index("REMOTE_PORT_MODE_PROFILES")
         project_review = index("OPEN_REMOTE_LUMERICAL_GUI")
         solve = index("_solve_code")
@@ -2583,9 +3348,9 @@ class LumericalExportTests(unittest.TestCase):
         close = index("lam.close()")
         self.assertLess(checkout, build)
         self.assertLess(build, port_mode_preview)
-        self.assertLess(port_mode_preview, project_prefetch)
-        self.assertLess(build, project_prefetch)
-        self.assertLess(project_prefetch, project_review)
+        self.assertLess(port_mode_preview, resource_configuration)
+        self.assertLess(build, resource_configuration)
+        self.assertLess(resource_configuration, project_review)
         self.assertLess(project_review, solve)
         self.assertLess(solve, save)
         self.assertLess(save, fetch)
@@ -2602,6 +3367,122 @@ class LumericalExportTests(unittest.TestCase):
             notebook["metadata"]["max_layout"]["license_lifecycle"],
             "shared-web-3-hpc-packs-save-fetch-release",
         )
+
+    def test_first_cell_exposes_run_switches_and_mandatory_fsp_contract(self) -> None:
+        notebook, _ = generate_lumerical_notebook(
+            [component("Straight")],
+            {
+                "included_layers": [[1, 0]],
+                "run_after_build": True,
+                "reuse_model_cache": True,
+                "save_model_cache_on_miss": False,
+                "save_inspection_fsp": False,
+                "save_final_fsp": False,
+            },
+        )
+        first_source = "".join(notebook["cells"][0]["source"])
+        self.assertTrue(first_source.startswith("# ==="))
+        self.assertIn("# QUICK RUN OPTIONS", first_source)
+        self.assertIn("RUN_SIMULATION = True", first_source)
+        self.assertIn(
+            "One pre-solve inspection FSP and one solved/best FSP are always stored.",
+            first_source,
+        )
+        self.assertIn(
+            "Project-file saving is always enabled: inspection plus solved/best FSP.",
+            first_source,
+        )
+        self.assertIn("SHOW_GEOMETRY_PREVIEW = False", first_source)
+        self.assertIn("SHOW_PORT_MODE_PREVIEW = False", first_source)
+        self.assertIn("RUN_GPU_SYSTEM_CHECK = False", first_source)
+
+        all_source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"]
+        )
+        for removed_name in (
+            "REUSE_EXACT_MODEL_CACHE",
+            "SAVE_EXACT_MODEL_CACHE_ON_MISS",
+            "MODEL_CACHE_KEY",
+            "MODEL_CACHE_HIT",
+            "REMOTE_MODEL_CACHE_FSP",
+            "_save_model_cache_on_miss",
+        ):
+            self.assertNotIn(removed_name, all_source)
+        self.assertIn("SETTINGS['save_inspection_fsp'] = True", all_source)
+        self.assertIn("SETTINGS['save_final_fsp'] = True", all_source)
+        self.assertIn("save_verified_project(REMOTE_INSPECTION_PROJECT_FILE)", all_source)
+        self.assertIn("save_verified_project(REMOTE_PROJECT_FILE)", all_source)
+        self.assertIn("REMOTE_INSPECTION_FSP_SAVED = True", all_source)
+        self.assertIn("REMOTE_FINAL_FSP_SAVED = True", all_source)
+        self.assertIn("lam.fetch(REMOTE_INSPECTION_PROJECT_FILE", all_source)
+        self.assertIn("REMOTE_ARTIFACTS.insert(0, REMOTE_PROJECT_FILE)", all_source)
+        self.assertIn("if SHOW_GEOMETRY_PREVIEW:", all_source)
+        self.assertIn("if SHOW_PORT_MODE_PREVIEW:", all_source)
+        self.assertIn('if bool(SETTINGS.get("run_gpu_system_check", False)):', all_source)
+
+    def test_default_path_builds_once_without_a_reusable_model_cache(self) -> None:
+        notebook, _ = generate_lumerical_notebook(
+            [component("Straight")],
+            {"included_layers": [[1, 0]], "run_after_build": True},
+        )
+        first_source = "".join(notebook["cells"][0]["source"])
+        self.assertNotIn("REUSE_EXACT_MODEL_CACHE", first_source)
+        self.assertNotIn("SAVE_EXACT_MODEL_CACHE_ON_MISS", first_source)
+        self.assertIn("SHOW_GEOMETRY_PREVIEW = False", first_source)
+        self.assertIn("SHOW_PORT_MODE_PREVIEW = False", first_source)
+        self.assertIn("RUN_GPU_SYSTEM_CHECK = False", first_source)
+        build_source = cell_source_containing(notebook, "REMOTE_MODEL_BUILDER =")
+        self.assertNotIn("_save_model_cache_on_miss", build_source)
+        self.assertNotIn("MODEL_CACHE", build_source)
+        self.assertEqual(build_source.count("lumapi.FDTD("), 1)
+        self.assertEqual(lumerical._BUILD_CELL.count("fdtd.runsetup()"), 1)
+        self.assertIn("Closed the previous live FDTD model", lumerical._BUILD_CELL)
+
+    def test_legacy_cache_and_save_flags_are_ignored(self) -> None:
+        base_configuration = {
+            "included_layers": [[1, 0]],
+            "wavelength_start_um": 1.25,
+            "wavelength_stop_um": 1.35,
+            "mesh_accuracy": 2,
+            "resource_mode": "GPU",
+            "run_after_build": True,
+            "project_file": "one.fsp",
+        }
+        legacy_disabled = {
+            **base_configuration,
+            "reuse_model_cache": True,
+            "save_model_cache_on_miss": False,
+            "save_inspection_fsp": False,
+            "save_final_fsp": False,
+        }
+        legacy_enabled = {
+            **base_configuration,
+            "reuse_model_cache": False,
+            "save_model_cache_on_miss": True,
+            "save_inspection_fsp": True,
+            "save_final_fsp": True,
+        }
+        disabled_notebook, _ = generate_lumerical_notebook(
+            [component("Straight")], legacy_disabled
+        )
+        enabled_notebook, _ = generate_lumerical_notebook(
+            [component("Straight")], legacy_enabled
+        )
+        self.assertEqual(disabled_notebook, enabled_notebook)
+        settings = assignment_value(disabled_notebook, "SETTINGS")
+        self.assertTrue(settings["save_inspection_fsp"])
+        self.assertTrue(settings["save_final_fsp"])
+        all_source = "\n".join(
+            "".join(cell.get("source", [])) for cell in disabled_notebook["cells"]
+        )
+        for removed_name in (
+            "MODEL_CACHE_KEY",
+            "MODEL_CACHE_HIT",
+            "REMOTE_MODEL_CACHE_FSP",
+            "REUSE_EXACT_MODEL_CACHE",
+            "SAVE_EXACT_MODEL_CACHE_ON_MISS",
+        ):
+            self.assertNotIn(removed_name, all_source)
 
     def test_every_component_export_is_3d_and_gets_three_axis_verification(self) -> None:
         for kind in ("Straight", "Taper", "1x2 MMI", "CPW", "Tapered CPW"):

@@ -67,6 +67,12 @@ _MATERIAL_COLORS = {
     "Au (Gold) - CRC": QColor("#facc15"),
     "Al (Aluminium) - Palik": QColor("#cbd5e1"),
     "Ag (Silver) - Palik": QColor("#e2e8f0"),
+    "RF silicon": QColor("#475569"),
+    "RF SiO2": QColor("#7dd3fc"),
+    "RF LiNbO3": QColor("#2dd4bf"),
+    "RF FR4": QColor("#84a98c"),
+    "RF dielectric": QColor("#c4b5fd"),
+    "RF metal": QColor("#facc15"),
 }
 
 
@@ -831,7 +837,11 @@ class ThreeDModelPreview(QWidget):
                 painter.drawLine(start, stop)
                 painter.setPen(QPen(QColor(14, 116, 144, 110), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 painter.drawLine(start, stop)
-            elif kind in {"FDTD port", "Fiber-axis FDTD port", "Power monitor", "Mode expansion monitor", "Field profile monitor"} and self.show_ports:
+            elif kind in {
+                "FDTD port", "Fiber-axis FDTD port", "Power monitor",
+                "Mode expansion monitor", "Field profile monitor",
+                "RF mode port", "RF power monitor",
+            } and self.show_ports:
                 normal = str(params.get("plane normal", "X")).upper()
                 span = 0.5 * float(params.get("span_um", max(params.get("x span", 0.0), params.get("y span", 0.0), 2.5)))
                 if normal == "Z":
@@ -857,8 +867,15 @@ class ThreeDModelPreview(QWidget):
                     normal_angle = float(component.get("orientation_deg", 0.0)) + (90.0 if normal == "Y" else 0.0)
                     nearest = int(round(normal_angle / 90.0) * 90) % 360
                     normal = "X" if nearest in (0, 180) else "Y"
-                    port_z0 = max(z0, -0.5 * float(params.get("z_span_um", 2.25)))
-                    port_z1 = min(z1, 0.5 * float(params.get("z_span_um", 2.25)))
+                    plane_z_um = float(params.get("z center_um", 0.0))
+                    port_z0 = max(
+                        z0,
+                        plane_z_um - 0.5 * float(params.get("z_span_um", 2.25)),
+                    )
+                    port_z1 = min(
+                        z1,
+                        plane_z_um + 0.5 * float(params.get("z_span_um", 2.25)),
+                    )
                     if normal == "Y":
                         plane = [screen(raw((cx - span, cy, port_z0))), screen(raw((cx + span, cy, port_z0))),
                                  screen(raw((cx + span, cy, port_z1))), screen(raw((cx - span, cy, port_z1)))]
@@ -866,7 +883,15 @@ class ThreeDModelPreview(QWidget):
                         plane = [screen(raw((cx, cy - span, port_z0))), screen(raw((cx, cy + span, port_z0))),
                                  screen(raw((cx, cy + span, port_z1))), screen(raw((cx, cy - span, port_z1)))]
                 is_monitor = (
-                    kind in {"Power monitor", "Mode expansion monitor", "Field profile monitor"}
+                    kind in {
+                        "Power monitor", "Mode expansion monitor",
+                        "Field profile monitor", "RF power monitor",
+                    }
+                    or (
+                        kind == "RF mode port"
+                        and str(params.get("rf role", "")).strip().lower()
+                        != "source"
+                    )
                     or component.get("simulation_parent_port") == "fiber_input_power"
                     or str(params.get("fiber plane role", "")).lower() == "input power measurement"
                 )
@@ -886,7 +911,13 @@ class ThreeDModelPreview(QWidget):
             for first, second in edges: painter.drawLine(first, second)
         painter.setPen(QPen(QColor("#0f172a"), 1))
         painter.drawText(20, 28, "Pre-export 3D model · drag to orbit · Shift/right-drag to pan · wheel to zoom")
-        painter.drawText(20, 49, "Red wireframe = FDTD only; resizing it never scales the fixed device polygons")
+        solver_label = str(
+            state.get(
+                "solver_label",
+                "FDTD only; resizing it never scales the fixed device polygons",
+            )
+        )
+        painter.drawText(20, 49, "Red wireframe = " + solver_label)
 
         # Keep the material identity visible while the model is rotated. Each
         # active stack row receives a swatch and its exact Lumerical name.
@@ -913,7 +944,12 @@ class ThreeDModelPreview(QWidget):
             painter.setBrush(QBrush(swatch))
             painter.drawRect(QRectF(legend_x + 10.0, row_y + 3.0, 18.0, 16.0))
             painter.setPen(QPen(QColor("#1e293b"), 1))
-            label = f"{row.get('name', 'Layer')} — {row.get('material', '')}"
+            label = str(
+                row.get(
+                    "_preview_label",
+                    f"{row.get('name', 'Layer')} — {row.get('material', '')}",
+                )
+            )
             if str(row.get("role", "background")) == "geometry":
                 label += f" · sidewall {float(row.get('sidewall_angle_deg', 90.0)):.3g}°"
             painter.drawText(QRectF(legend_x + 36.0, row_y, legend_width - 46.0, 22.0), Qt.AlignmentFlag.AlignVCenter, label)
@@ -1123,8 +1159,9 @@ class LumericalSweepDialog(QDialog):
         outer.addWidget(explanation)
 
         speed_note = QLabel(
-            "Fast mode: one licence session, one static model build, one nominal FSP, then in-place "
-            "geometry updates and sequential GPU solves. Numerical spectra are downloaded once and all plots are made on CPU."
+            "Fast mode: one licence session, one live model build, then in-place geometry updates "
+            "and sequential GPU solves. No FSP is saved per point; one nominal inspection FSP "
+            "and the solved winning-design FSP are always stored."
         )
         speed_note.setWordWrap(True)
         speed_note.setStyleSheet("color:#0f766e; font-weight:600;")
@@ -1748,11 +1785,16 @@ class LumericalExportDialog(QDialog):
         load_button = QPushButton("Load preset")
         add_button = QPushButton("Add row")
         remove_button = QPushButton("Remove selected")
+        automatic_mesh_button = QPushButton("Use Lumerical automatic mesh")
+        automatic_mesh_button.setToolTip(
+            "Set every active stack row to Automatic, so Lumerical's FDTD mesh-accuracy setting controls meshing without per-layer overrides."
+        )
         controls.addWidget(QLabel("Starting stack"))
         controls.addWidget(self.preset, 1)
         controls.addWidget(load_button)
         controls.addWidget(add_button)
         controls.addWidget(remove_button)
+        controls.addWidget(automatic_mesh_button)
         layout.addLayout(controls)
         self.stack_table = QTableWidget(0, 11)
         self.stack_table.setHorizontalHeaderLabels(
@@ -1806,10 +1848,19 @@ class LumericalExportDialog(QDialog):
             )
         )
         remove_button.clicked.connect(self.remove_stack_rows)
+        automatic_mesh_button.clicked.connect(self.use_lumerical_automatic_mesh)
         stack = self.saved.get("material_stack") or default_stack(self.preset.currentText())
         for row in stack:
             self._append_stack_row(row)
         self.tabs.addTab(tab, "Material stack")
+
+    def use_lumerical_automatic_mesh(self) -> None:
+        """Disable every per-layer override and expose the Automatic label."""
+        for row in range(self.stack_table.rowCount()):
+            mesh_factor = self.stack_table.cellWidget(row, 8)
+            if isinstance(mesh_factor, QDoubleSpinBox):
+                mesh_factor.setValue(0.0)
+        self._refresh_previews()
 
     def _append_stack_row(self, data: dict[str, Any]) -> None:
         row = self.stack_table.rowCount()
@@ -1946,8 +1997,17 @@ class LumericalExportDialog(QDialog):
         self.tfln_crystal_cut = QComboBox(); self.tfln_crystal_cut.addItems(["X", "Y", "Z"]); self.tfln_crystal_cut.setCurrentText(str(self.saved.get("tfln_crystal_cut", "X")).upper())
         self.tfln_temperature = QDoubleSpinBox(); self.tfln_temperature.setRange(1.0, 2000.0); self.tfln_temperature.setDecimals(3); self.tfln_temperature.setSuffix(" K"); self.tfln_temperature.setValue(float(self.saved.get("tfln_temperature_K", 296.3)))
         self.project_file = QLineEdit(str(self.saved.get("project_file", "exported_component.fsp")))
-        self.hide_cad = QCheckBox("Start Lumerical without showing the CAD window"); self.hide_cad.setChecked(bool(self.saved.get("hide_cad", False)))
-        self.run_after_build = QCheckBox("Run automatically after building and saving the .fsp project"); self.run_after_build.setChecked(bool(self.saved.get("run_after_build", True)))
+        self.hide_cad = QCheckBox("Start Lumerical without showing the CAD window"); self.hide_cad.setChecked(bool(self.saved.get("hide_cad", True)))
+        self.run_after_build = QCheckBox("Run automatically after building the live model"); self.run_after_build.setChecked(bool(self.saved.get("run_after_build", True)))
+        self.show_geometry_preview = QCheckBox("Render the optional XY/XZ/YZ preview before solving")
+        self.show_geometry_preview.setChecked(bool(self.saved.get("show_geometry_preview", False)))
+        self.show_geometry_preview.setToolTip("Presentation-only diagnostic. Leave disabled for the fastest path; the model geometry is still built identically.")
+        self.show_port_mode_preview = QCheckBox("Render optional Ex/Ey port-mode images before solving")
+        self.show_port_mode_preview.setChecked(bool(self.saved.get("show_port_mode_preview", False)))
+        self.show_port_mode_preview.setToolTip("Presentation and boundary-confinement diagnostic. Required polarization and effective-index selection still run when disabled.")
+        self.run_gpu_system_check = QCheckBox("Run the optional GPU diagnostic before solving")
+        self.run_gpu_system_check.setChecked(bool(self.saved.get("run_gpu_system_check", False)))
+        self.run_gpu_system_check.setToolTip("Runs Lumerical's full GPU system and licence-estimate diagnostics. The actual solve explicitly requests GPU even when this is disabled.")
         self.official_gc_domain = QCheckBox("Use compact official Ansys GC-SOI FDTD settings")
         self.official_gc_domain.setChecked(bool(self.saved.get("official_gc_domain", False)))
         self.official_gc_domain.setToolTip(
@@ -1982,10 +2042,14 @@ class LumericalExportDialog(QDialog):
         form.addRow(self.official_gc_domain)
         form.addRow(self.use_y_antisymmetry)
         form.addRow(self.run_after_build)
+        form.addRow(self.show_geometry_preview)
+        form.addRow(self.show_port_mode_preview)
+        form.addRow(self.run_gpu_system_check)
         resource_note = QLabel(
             "GPU is the default for every 3D simulation. The notebook detects the GPU, sets its SM licence estimate, "
             "keeps the CPU row active for meshing, solves with run(\"FDTD\", \"GPU\"), then switches back to "
-            "the 30-thread CPU resource for result extraction and plotting."
+            "the 30-thread CPU resource for result extraction and plotting. One pre-solve and one solved/best "
+            "project are always stored."
         )
         resource_note.setWordWrap(True)
         form.addRow(resource_note)
@@ -2523,4 +2587,9 @@ class LumericalExportDialog(QDialog):
             "antisymmetry_boundary": symmetry_boundary,
             "gc_domain_version": 3,
             "run_after_build": self.run_after_build.isChecked(),
+            "save_inspection_fsp": True,
+            "save_final_fsp": True,
+            "show_geometry_preview": self.show_geometry_preview.isChecked(),
+            "show_port_mode_preview": self.show_port_mode_preview.isChecked(),
+            "run_gpu_system_check": self.run_gpu_system_check.isChecked(),
         }

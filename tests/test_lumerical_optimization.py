@@ -5,8 +5,11 @@ from copy import deepcopy
 import json
 import math
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 import unittest
+
+import numpy as np
 
 from max_layout.constants import DEFAULT_COMPONENT_VALUES
 from max_layout.lumerical import _LAMBDA_CONNECT_CELL, default_stack
@@ -367,6 +370,8 @@ class LumericalOptimizationTests(unittest.TestCase):
                 self.assertEqual(
                     sum(bool(port["is_source"]) for port in pose["ports"]), 1
                 )
+                for port in pose["ports"]:
+                    self.assertEqual(port["candidate_mode_numbers"], [1, 2])
 
                 source = "\n".join(
                     "".join(cell["source"])
@@ -375,6 +380,11 @@ class LumericalOptimizationTests(unittest.TestCase):
                 )
                 self.assertIn("OPT_FIBER_POSE", source)
                 self.assertIn("def _fiber_pose_updates", source)
+                self.assertIn("_synchronize_resolved_fiber_mode_contract()", source)
+                self.assertIn("_require_numeric_source_mode()", source)
+                self.assertIn('"selected_mode_order"', source)
+                self.assertIn("np.asarray(mode_order, dtype=int)", source)
+                self.assertIn('globals().get("_select_fiber_local_te_mode")', source)
                 self.assertIn("angle_theta", source)
                 self.assertIn("fiber_offset", source)
                 for property_name in (
@@ -385,6 +395,220 @@ class LumericalOptimizationTests(unittest.TestCase):
                     '"rotation offset"',
                 ):
                     self.assertIn(property_name, source)
+
+    def test_runtime_propagates_resolved_winner_first_fiber_mode_pair(self) -> None:
+        helper_names = {
+            "_numeric_source_mode_label",
+            "_require_numeric_source_mode",
+            "_positive_unique_modes",
+            "_resolved_runtime_port_mode",
+            "_synchronize_resolved_fiber_mode_contract",
+        }
+        parsed = ast.parse(_LUMOPT_RUNTIME_REMOTE)
+        helper_nodes = [
+            node
+            for node in parsed.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helper_nodes}, helper_names)
+        namespace = {
+            "re": re,
+            "OPT_OBJECTIVE_PORTS": {
+                "kind": "grating coupling efficiency",
+                "source_port": "fiber_source",
+                "source_mode": "auto local TE",
+            },
+            "OPT_FIBER_POSE": {
+                "ports": [
+                    {
+                        "name": "fiber_source",
+                        "is_source": True,
+                        "mode_number": 0,
+                        "selected_mode_order": [],
+                        "candidate_mode_numbers": [1, 2],
+                    },
+                    {
+                        "name": "fiber_measurement",
+                        "is_source": False,
+                        "mode_number": 0,
+                        "selected_mode_order": [],
+                        "candidate_mode_numbers": [1, 2],
+                    },
+                ]
+            },
+            "PORT_MODE_SELECTIONS": {
+                "fiber_source": {
+                    "mode number": 2,
+                    "selected mode order": [2, 1],
+                    "candidate mode numbers": [1, 2],
+                },
+                "fiber_measurement": {
+                    "mode number": 1,
+                    "selected mode order": [1, 2],
+                    "candidate mode numbers": [1, 2],
+                },
+            },
+            "PORTS": [],
+            "GRATING_ANALYSIS": {"fiber_port_name": "fiber_source"},
+        }
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=helper_nodes, type_ignores=[])),
+                "<fiber-mode-contract-helpers>",
+                "exec",
+            ),
+            namespace,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "numeric 'mode N'"):
+            namespace["_numeric_source_mode_label"]("auto local TE")
+        self.assertEqual(namespace["_numeric_source_mode_label"]("Mode 2"), "mode 2")
+
+        namespace["_synchronize_resolved_fiber_mode_contract"]()
+        self.assertEqual(
+            namespace["OPT_OBJECTIVE_PORTS"]["source_mode"], "mode 2"
+        )
+        self.assertEqual(
+            namespace["OPT_FIBER_POSE"]["ports"][0]["selected_mode_order"],
+            [2, 1],
+        )
+        self.assertEqual(
+            namespace["OPT_FIBER_POSE"]["ports"][1]["selected_mode_order"],
+            [1, 2],
+        )
+        self.assertEqual(
+            namespace["GRATING_ANALYSIS"]["fiber_source_mode"], "mode 2"
+        )
+        self.assertEqual(
+            namespace["GRATING_ANALYSIS"]["fiber_source_selected_mode_order"],
+            [2, 1],
+        )
+
+        apply_node = next(
+            node
+            for node in parsed.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_apply_fiber_pose_to_session"
+        )
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[apply_node], type_ignores=[])),
+                "<fiber-pose-mode-refresh>",
+                "exec",
+            ),
+            namespace,
+        )
+
+        namespace["UM"] = 1e-6
+        namespace["np"] = np
+        namespace["_set_named"] = (
+            lambda session, path, property_name, value:
+            session.setnamed(path, property_name, value)
+        )
+        namespace["_fiber_pose_updates"] = lambda *_args, **_kwargs: {
+            "fiber": {
+                "name": "fiber",
+                "center_um": [0.0, 0.0],
+                "theta_deg": 7.0,
+            },
+            "ports": [
+                {
+                    "name": "fiber_source",
+                    "center_um": [0.0, 0.0],
+                    "z_um": 1.0,
+                    "theta_deg": 7.0,
+                    "phi_deg": 0.0,
+                    "rotation_offset_um": 1.0,
+                    "mode_number": 2,
+                    "selected_mode_order": [2, 1],
+                    "candidate_mode_numbers": [1, 2],
+                    "mode_degeneracy_tolerance": 0.01,
+                    "minimum_local_te_fraction": 0.8,
+                    "is_source": True,
+                },
+                {
+                    "name": "fiber_measurement",
+                    "center_um": [0.0, 0.0],
+                    "z_um": 0.9,
+                    "theta_deg": 7.0,
+                    "phi_deg": 0.0,
+                    "rotation_offset_um": 1.0,
+                    "mode_number": 1,
+                    "selected_mode_order": [1, 2],
+                    "candidate_mode_numbers": [1, 2],
+                    "mode_degeneracy_tolerance": 0.01,
+                    "minimum_local_te_fraction": 0.8,
+                    "is_source": False,
+                },
+            ],
+        }
+
+        class FakeFdtdSession:
+            def __init__(self) -> None:
+                self.mode_updates: list[list[int]] = []
+                self.group_settings: dict[str, str] = {}
+
+            def switchtolayout(self) -> None:
+                pass
+
+            def setnamed(self, _path, _property_name, _value) -> None:
+                pass
+
+            def runsetup(self) -> None:
+                pass
+
+            def select(self, _path) -> None:
+                pass
+
+            def updateportmodes(self, mode_order):
+                self.mode_updates.append(np.asarray(mode_order, dtype=int).tolist())
+                return None
+
+            def set(self, property_name, value) -> None:
+                self.group_settings[str(property_name)] = str(value)
+
+        session = FakeFdtdSession()
+        namespace["_apply_fiber_pose_to_session"]([], session, update_modes=True)
+        self.assertEqual(session.mode_updates, [[2, 1], [1, 2]])
+        self.assertEqual(session.group_settings["source mode"], "mode 2")
+
+        selector_calls = []
+
+        def reselect_after_pose(_session, port_path, port):
+            selector_calls.append((port_path, dict(port)))
+            if str(port["name"]) == "fiber_source":
+                return {
+                    "mode number": 1,
+                    "selected mode order": [1, 2],
+                    "candidate mode numbers": [1, 2],
+                    "polarization": "local TE",
+                }
+            return {
+                "mode number": 2,
+                "selected mode order": [2, 1],
+                "candidate mode numbers": [1, 2],
+                "polarization": "local TE",
+            }
+
+        namespace["_select_fiber_local_te_mode"] = reselect_after_pose
+        rescored_session = FakeFdtdSession()
+        namespace["_apply_fiber_pose_to_session"](
+            [], rescored_session, update_modes=True
+        )
+        self.assertEqual(len(selector_calls), 2)
+        self.assertEqual(
+            namespace["OPT_OBJECTIVE_PORTS"]["source_mode"], "mode 1"
+        )
+        self.assertEqual(rescored_session.group_settings["source mode"], "mode 1")
+        self.assertEqual(
+            namespace["OPT_FIBER_POSE"]["ports"][0]["selected_mode_order"],
+            [1, 2],
+        )
+        self.assertEqual(
+            namespace["OPT_FIBER_POSE"]["ports"][1]["selected_mode_order"],
+            [2, 1],
+        )
 
     def test_mmi_longitudinal_snapshot_keeps_receiver_endpoint_fixed(self) -> None:
         mmi = component("1x2 MMI")
@@ -442,6 +666,26 @@ class LumericalOptimizationTests(unittest.TestCase):
             if cell["cell_type"] == "code":
                 compile("".join(cell["source"]), f"optimization-cell-{index}", "exec")
         source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+        first_source = "".join(notebook["cells"][0]["source"])
+        self.assertIn("RUN_SIMULATION = True", first_source)
+        self.assertIn(
+            "One pre-solve inspection FSP and one solved/best FSP are always stored.",
+            first_source,
+        )
+        for removed_name in (
+            "MODEL_CACHE_KEY",
+            "MODEL_CACHE_HIT",
+            "REMOTE_MODEL_CACHE_FSP",
+            "REUSE_EXACT_MODEL_CACHE",
+            "SAVE_EXACT_MODEL_CACHE_ON_MISS",
+        ):
+            self.assertNotIn(removed_name, source)
+        self.assertIn("SETTINGS['save_inspection_fsp'] = True", source)
+        self.assertIn("SETTINGS['save_final_fsp'] = True", source)
+        self.assertIn("save_verified_project(REMOTE_INSPECTION_PROJECT_FILE)", source)
+        self.assertIn(
+            "REMOTE_INTERNAL_SEED_FSP = REMOTE_INSPECTION_PROJECT_FILE", source
+        )
 
         # v261+ official API is primary, with a verified genuine-adjoint legacy
         # fallback.  There is no sweep fallback.
@@ -476,6 +720,7 @@ class LumericalOptimizationTests(unittest.TestCase):
             {
                 "REMOTE_BASE_FSP": "/remote/fsp/seed.fsp",
                 "REMOTE_WORK": "/remote/work",
+                "SETTINGS": {"run_after_build": True},
                 "solve_remote_checked": capture_remote,
             },
         )
@@ -497,13 +742,42 @@ class LumericalOptimizationTests(unittest.TestCase):
             "def _alignment_iteration_callback", 1
         )[1].split("def _optimize_fiber_alignment", 1)[0])
 
-        # One seed owner closes before LumOpt; one best design is retained.
+        disabled_calls = []
+        exec(
+            compile(optimize_cell, "<disabled adjoint optimize cell>", "exec"),
+            {
+                "REMOTE_BASE_FSP": None,
+                "REMOTE_WORK": "/remote/work",
+                "SETTINGS": {"run_after_build": False},
+                "solve_remote_checked": lambda *args, **kwargs: disabled_calls.append(
+                    (args, kwargs)
+                ),
+            },
+        )
+        self.assertEqual(disabled_calls, [])
+
+        # One seed owner closes before LumOpt.  LumOpt's internal handoff is
+        # transient, while the public best-design FSP is always retained.
         self.assertLess(source.index("Seed FDTD owner closed"), source.index("_run_lumopt2"))
-        self.assertIn("project.save_project(REMOTE_BEST_FSP, params=best_parameters)", source)
+        self.assertIn("project.save_project(REMOTE_VALIDATION_FSP, params=best_parameters)", source)
+        self.assertIn("ADJOINT_FDTD_OWNER.save(REMOTE_BEST_FSP)", source)
+        self.assertIn('"best_fsp": REMOTE_BEST_FSP', source)
+        self.assertIn("REMOTE_INTERNAL_SEED_FSP", source)
+        self.assertIn("REMOTE_VALIDATION_FSP", source)
+        self.assertIn('globals().get("REMOTE_RUNTIME_PROJECT_FILE", "")', source)
         self.assertIn("adjoint_optimization_history.npz", source)
         self.assertIn("adjoint_optimization_summary.json", source)
         self.assertIn('REMOTE_OPT_TEXT_SUMMARY = os.path.join(REMOTE_WORK, "summary.txt")', source)
         self.assertIn("Exact nominal source parameters (JSON)", source)
+        self.assertIn("complete_best_parameters = dict(OPT_COMPONENT_NOMINAL_PARAMS)", source)
+        self.assertIn("complete_best_parameters.update(patch_parameters)", source)
+        self.assertIn("Complete best-design geometry", source)
+        self.assertIn("Complete best-design source parameters (JSON)", source)
+        self.assertIn('"complete_best_parameters": complete_best_parameters', source)
+        self.assertIn('"mmi_width": ("MMI width", "um")', source)
+        self.assertIn('"taper_power": ("MMI taper profile exponent", "")', source)
+        self.assertIn('"input_reference_before_taper_um": ("Input power-reference distance before taper", "um")', source)
+        self.assertIn('"fiber_power_monitor_below_source_um": ("Fiber power-plane distance below source", "um")', source)
         optimization_headings = (
             "PROJECT",
             "PARAMETERS",

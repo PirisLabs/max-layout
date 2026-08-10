@@ -45,6 +45,11 @@ SIMULATION_COMPONENT_KINDS = {
     "Power monitor",
     "Mode expansion monitor",
     "Field profile monitor",
+    # RF-only sampling planes.  These remain visible/movable in the layout
+    # editor but are metadata for the dedicated CPW MODE/FDTD exporters and
+    # never become GDS polygons.
+    "RF mode port",
+    "RF power monitor",
 }
 
 RF_COMPONENT_KINDS = {
@@ -833,7 +838,12 @@ DEFAULT_COMPONENT_VALUES.update(
             "name": "opt_1", "dir": "Bidirectional", "loc": 0.5, "pos": "Top", "order": 1,
             "port geometry": "surface", "plane normal": "Z", "distance_um": 0.0, "z reference": "top of stack",
             "span_um": 20.0, "z_span_um": 0.0, "mode": "user select",
-            "mode number": 2, "polarization": "Ey",
+            # Zero means the exporter calculates the near-degenerate pair and
+            # selects the member polarized transverse to the grating axis.
+            "mode number": 0, "polarization": "local TE",
+            "candidate mode numbers": [1, 2],
+            "mode degeneracy tolerance": 0.01,
+            "minimum local TE fraction": 0.8,
             "angle theta": 7.0, "angle phi": 0.0,
             "align to fiber axis": True,
             "rotation offset_um": 4.420244193,
@@ -867,6 +877,19 @@ DEFAULT_COMPONENT_VALUES.update(
             "name": "field_profile", "monitor geometry": "surface", "plane normal": "X", "distance_um": 0.0,
             "x span": 0.0, "y span": 4.0, "z span": 2.0,
         },
+        "RF mode port": {
+            "name": "rf_port_1", "rf role": "Source", "order": 1,
+            "port geometry": "surface", "plane normal": "X", "distance_um": 0.0,
+            "span_um": 450.0, "z_span_um": 650.0,
+            "mode": "fundamental quasi-TEM mode", "reference impedance_ohm": 50.0,
+            "deembed_um": 0.0, "multifrequency mode injection": True,
+        },
+        "RF power monitor": {
+            "name": "rf_power_1", "rf role": "Output",
+            "monitor geometry": "surface", "plane normal": "X", "distance_um": 0.0,
+            "span_um": 450.0, "z_span_um": 650.0,
+            "expansion port": "",
+        },
     }
 )
 
@@ -877,6 +900,8 @@ INTEGER_PARAMETERS.add("waveguide_mode_search_count")
 INTEGER_PARAMETERS.add("mode search count")
 
 BOOL_PARAMETERS.add("align to fiber axis")
+
+BOOL_PARAMETERS.add("multifrequency mode injection")
 
 PHOTONIC_COMPONENT_KINDS = (
     set(DEFAULT_COMPONENT_VALUES)
@@ -931,6 +956,7 @@ CHOICE_PARAMETERS.update({
     "dir": ["Bidirectional", "Forward", "Backward"],
     "pos": ["Left", "Right", "Top", "Bottom"],
     "z reference": ["top of SiO2 cladding", "top of stack", "device top"],
+    "rf role": ["Source", "Input reference", "Output"],
 })
 
 COMPONENT_DISPLAY_NAMES={
@@ -958,6 +984,8 @@ COMPONENT_DISPLAY_NAMES={
     "Power monitor":"Power monitor",
     "Mode expansion monitor":"Mode expansion monitor",
     "Field profile monitor":"Field profile monitor",
+    "RF mode port":"RF modal source / port — CPW quasi-TEM",
+    "RF power monitor":"RF DFT power / mode-expansion plane",
 }
 
 

@@ -21,7 +21,7 @@ import numpy as np
 
 from PySide6.QtCore import QPoint, QPointF, QProcess, QRectF, QSettings, QSize, QTimer, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QImageReader, QKeySequence, QPainterPath, QPixmap
-from PySide6.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGraphicsItem, QGraphicsScene, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSpinBox, QStatusBar, QTableWidget, QTableWidgetItem, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGraphicsItem, QGraphicsScene, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSpinBox, QStatusBar, QTabWidget, QTableWidget, QTableWidgetItem, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
 from ..constants import CHOICE_PARAMETERS, COMPONENT_SPECS, DEFAULT_COMPONENT_VALUES, EBEAM_LAYER, GC_LAYER, LAYER_NAME_MAP, LEGACY_PHOTONIC_TEST_BLOCK_KINDS, MARKER_COMPONENT_KINDS, MARKER_LAYER, NATIVE_APP_VERSION, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, SIMULATION_COMPONENT_KINDS, SIMULATION_LAYER, component_display_name
 from ..gds.build import _add_component_geometry_to_cell, _canonicalize_component_layers, component_geometry_arrays, library_bbox_and_center, recenter_components_at_origin, resolve_and_build, rotate_components_layout, test_block_device_placements
@@ -39,8 +39,10 @@ from ..lumerical import (
     write_lumerical_sweep_notebook,
 )
 from ..lumerical_optimization import write_lumerical_adjoint_notebook
+from ..lumerical_rf import build_lumerical_rf_preview_state, write_lumerical_rf_notebook
 from ..params import resize_component_parameters
 from ..ports import PORT_ALIASES, component_global_ports, component_local_ports, solve_attachment
+from ..rf_defaults import RF_SIMULATABLE_COMPONENT_KINDS, RF_STACK_PRESETS, default_rf_configuration, normalize_rf_configuration
 from ..ui.dialogs import ArrayDialog, EbeamDialog, ModuleVariablesDialog
 from ..ui.items import ComponentGraphicsItem, EbeamContainerItem, LayoutView, WriteFieldItem, clear_preview_caches
 from ..ui.lumerical_dialog import (
@@ -48,6 +50,7 @@ from ..ui.lumerical_dialog import (
     LumericalMultigpuSweepDialog,
     LumericalOptimizationDialog,
     LumericalSweepDialog,
+    ThreeDModelPreview,
 )
 from ..ui.theme import _force_dark_popup, color_for_layer
 from ..utils import inclusive_sweep, numeric_list, parse_sequence, safe_json_copy
@@ -59,6 +62,7 @@ BOUNDARY_MARGINS_UM = {"Chip outline": CHIP_BOUNDARY_MARGIN_UM, "4-inch wafer ou
 BOUNDARY_COMPONENT_KINDS = set(BOUNDARY_MARGINS_UM)
 MMI_STACK_PRESET = "TFLN MMI (3 um SiO2)"
 MMI_STACK_VERSION = 1
+GRATING_AUTO_MESH_VERSION = 1
 
 
 def _material_stack_signature(stack: list[dict[str, Any]]) -> tuple[tuple[Any, ...], ...]:
@@ -105,6 +109,34 @@ def mmi_lumerical_export_settings(saved: dict[str, Any] | None) -> dict[str, Any
         settings["stack_preset"] = MMI_STACK_PRESET
         settings["material_stack"] = default_stack(MMI_STACK_PRESET)
     settings["mmi_stack_version"] = MMI_STACK_VERSION
+    return settings
+
+
+def grating_lumerical_export_settings(saved: dict[str, Any] | None) -> dict[str, Any]:
+    """Default a TFLN grating coupler to Lumerical's automatic mesh.
+
+    A zero per-layer mesh factor means that no layer mesh-override object is
+    created, leaving the 3D FDTD mesh accuracy setting in control.  Migrate
+    only the former untouched TFLN preset so user-edited stacks remain intact.
+    """
+    settings = copy.deepcopy(saved or {})
+    saved_stack = settings.get("material_stack")
+    legacy_default = (
+        int(settings.get("grating_auto_mesh_version", 0)) < GRATING_AUTO_MESH_VERSION
+        and str(settings.get("stack_preset", "TFLN on SiO2")) == "TFLN on SiO2"
+        and (
+            not saved_stack
+            or _material_stack_signature(list(saved_stack))
+            == _material_stack_signature(default_stack("TFLN on SiO2"))
+        )
+    )
+    if not settings or legacy_default:
+        automatic_stack = default_stack("TFLN on SiO2")
+        for row in automatic_stack:
+            row["mesh_factor"] = 0.0
+        settings["stack_preset"] = "TFLN on SiO2"
+        settings["material_stack"] = automatic_stack
+    settings["grating_auto_mesh_version"] = GRATING_AUTO_MESH_VERSION
     return settings
 
 
@@ -295,6 +327,681 @@ def read_fixed_default(spec: tuple[str, Any, bool, Any]) -> Any:
     if abs(widget.value() - float(original)) <= 0.5 * 10 ** -widget.decimals():
         return original
     return int(round(widget.value())) if flag else float(widget.value())
+
+
+RF_SIMULATION_OBJECT_KINDS = {"RF mode port", "RF power monitor"}
+
+
+def _rf_spin(
+    value: float,
+    minimum: float,
+    maximum: float,
+    decimals: int = 6,
+    step: float | None = None,
+) -> QDoubleSpinBox:
+    """Create a consistently sized RF-settings numeric control."""
+    widget = QDoubleSpinBox()
+    widget.setRange(float(minimum), float(maximum))
+    widget.setDecimals(int(decimals))
+    widget.setValue(float(value))
+    if step is not None:
+        widget.setSingleStep(float(step))
+    widget.setMinimumWidth(190)
+    return widget
+
+
+class RFLumericalExportDialog(QDialog):
+    """RF-specific MODE/FDTD setup following the official CPW examples.
+
+    Optical FDTD ports are intentionally ignored.  A 3D RF run uses explicit
+    ``RF mode port`` / ``RF power monitor`` objects from the selected scope,
+    with a clearly labelled component-endpoint fallback for early layouts.
+    """
+
+    MATERIAL_HEADERS = (
+        "Name",
+        "Role",
+        "Thickness (µm)",
+        "εr",
+        "εx",
+        "εy",
+        "εz",
+        "loss tan δ",
+        "conductivity (S/m)",
+        "GDS layer(s)",
+        "Metal model",
+    )
+
+    def __init__(
+        self,
+        components: list[dict[str, Any]],
+        target_component: dict[str, Any],
+        scope_options: list[tuple[str, list[int]]],
+        saved: dict[str, Any] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.components = components
+        self.target_component = target_component
+        self.kind = str(target_component.get("kind", ""))
+        defaults = default_rf_configuration(self.kind)
+        self.values = copy.deepcopy(defaults)
+        self.values.update(copy.deepcopy(saved or {}))
+        # Solver and hardware are determined by the official-example
+        # workflow, never inherited from an older optical export.
+        self.values["rf_workflow"] = defaults["rf_workflow"]
+        self.values["resource_mode"] = defaults["resource_mode"]
+        self._active_rf_preview_state: dict[str, Any] | None = None
+        self.setWindowTitle(f"Lumerical RF — {component_display_name(self.kind)}")
+        self.resize(1420, 860)
+        self.setMinimumSize(1180, 720)
+
+        root = QVBoxLayout(self)
+        title = QLabel(
+            "Straight CPW uses the official 2D MODE/FDE impedance workflow. "
+            "Tapers, bends, opens, shorts, and segmented electrodes use 3D FDTD S-parameters."
+        )
+        title.setWordWrap(True)
+        root.addWidget(title)
+
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, 1)
+        self._build_run_tab(scope_options)
+        self._build_material_tab()
+        self._build_mesh_tab()
+        self._build_preview_tab()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Save
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Export RF notebook")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _build_run_tab(self, scope_options: list[tuple[str, list[int]]]) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        scope_group = QGroupBox("Geometry and RF planes")
+        scope_form = QFormLayout(scope_group)
+        self.scope_combo = QComboBox()
+        for label, uids in scope_options:
+            self.scope_combo.addItem(str(label), list(map(int, uids)))
+        scope_form.addRow("Export geometry", self.scope_combo)
+        self.scope_report = QLabel()
+        self.scope_report.setWordWrap(True)
+        scope_form.addRow("Detected RF objects", self.scope_report)
+        self.endpoint_fallback = QCheckBox(
+            "If manual RF planes are missing, use the component input/output endpoints"
+        )
+        self.endpoint_fallback.setChecked(
+            bool(self.values.get("use_endpoint_reference_planes", True))
+        )
+        self.endpoint_fallback.setToolTip(
+            "This creates RF reference planes in the notebook only. It does not create optical ports or GDS geometry."
+        )
+        scope_form.addRow("Endpoint fallback", self.endpoint_fallback)
+        note = QLabel(
+            "Preferred: place RF mode port and RF power monitor objects from the left Ports & monitors section, "
+            "attach/select them with this CPW, and position them manually. Optical FDTD ports are never reused."
+        )
+        note.setWordWrap(True)
+        scope_form.addRow("Port policy", note)
+        layout.addWidget(scope_group)
+
+        sweep_group = QGroupBox("RF frequency sweep")
+        sweep_form = QFormLayout(sweep_group)
+        workflow = "2D MODE/FDE · quasi-TEM Z₀ and propagation" if self.values["rf_workflow"] == "fde" else "3D FDTD · S11, S21, insertion loss, and phase"
+        self.workflow_label = QLabel(workflow)
+        sweep_form.addRow("Official-example workflow", self.workflow_label)
+        self.frequency_start = _rf_spin(self.values.get("frequency_start_ghz", 1.0), 1e-6, 1e6, 6, 1.0)
+        self.frequency_stop = _rf_spin(self.values.get("frequency_stop_ghz", 100.0), 1e-6, 1e6, 6, 1.0)
+        self.target_frequency = _rf_spin(self.values.get("target_frequency_ghz", 30.0), 1e-6, 1e6, 6, 1.0)
+        self.frequency_points = QSpinBox()
+        self.frequency_points.setRange(2, 10001)
+        self.frequency_points.setValue(int(self.values.get("frequency_points", 25)))
+        self.frequency_points.setMinimumWidth(190)
+        sweep_form.addRow("Start frequency (GHz)", self.frequency_start)
+        sweep_form.addRow("Stop frequency (GHz)", self.frequency_stop)
+        sweep_form.addRow("Frequency samples", self.frequency_points)
+        sweep_form.addRow("Reported target frequency (GHz)", self.target_frequency)
+        layout.addWidget(sweep_group)
+
+        port_group = QGroupBox("RF plane defaults")
+        port_form = QFormLayout(port_group)
+        self.input_inset = _rf_spin(self.values.get("input_port_inset_um", 0.0), -1e7, 1e7, 6, 1.0)
+        self.output_inset = _rf_spin(self.values.get("output_port_inset_um", 0.0), -1e7, 1e7, 6, 1.0)
+        self.port_transverse_span = _rf_spin(self.values.get("port_transverse_span_um", 450.0), 1e-6, 1e7, 6, 10.0)
+        self.port_vertical_span = _rf_spin(self.values.get("port_vertical_span_um", 650.0), 1e-6, 1e7, 6, 10.0)
+        self.multifrequency_injection = QCheckBox("Calculate/inject the quasi-TEM mode across the frequency sweep")
+        self.multifrequency_injection.setChecked(bool(self.values.get("multifrequency_mode_injection", True)))
+        port_form.addRow("Input plane inset (µm)", self.input_inset)
+        port_form.addRow("Output plane inset (µm)", self.output_inset)
+        port_form.addRow("Transverse span (µm)", self.port_transverse_span)
+        port_form.addRow("Vertical span (µm)", self.port_vertical_span)
+        port_form.addRow("Broadband mode", self.multifrequency_injection)
+        if self.values["rf_workflow"] == "fde":
+            self.endpoint_fallback.setChecked(False)
+            self.endpoint_fallback.setEnabled(False)
+            for widget in (self.input_inset, self.output_inset):
+                widget.setEnabled(False)
+            self.scope_report.setToolTip("A uniform CPW FDE run solves one transverse cross-section and does not need longitudinal ports.")
+        layout.addWidget(port_group)
+        layout.addStretch(1)
+        self.tabs.addTab(page, "Run & ports")
+        self.scope_combo.currentIndexChanged.connect(self._update_scope_report)
+        self._update_scope_report()
+
+    def _build_material_tab(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("RF stack preset"))
+        self.stack_preset = QComboBox()
+        self.stack_preset.addItems(list(RF_STACK_PRESETS))
+        preset = str(self.values.get("rf_stack_preset", "TFLN CPW"))
+        if self.stack_preset.findText(preset) >= 0:
+            self.stack_preset.setCurrentText(preset)
+        reload_button = QPushButton("Load preset values")
+        reload_button.clicked.connect(self._load_selected_stack_preset)
+        preset_row.addWidget(self.stack_preset, 1)
+        preset_row.addWidget(reload_button)
+        layout.addLayout(preset_row)
+
+        help_label = QLabel(
+            "RF material values are relative permittivity and loss tangent, not optical refractive index. "
+            "For anisotropic media leave εr blank and fill εx, εy, and εz. The metal row maps the selected GDS layers to PEC or a finite-conductivity volume."
+        )
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+        self.material_table = QTableWidget(0, len(self.MATERIAL_HEADERS))
+        self.material_table.setHorizontalHeaderLabels(self.MATERIAL_HEADERS)
+        self.material_table.setAlternatingRowColors(True)
+        self.material_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.material_table.setMinimumHeight(430)
+        self.material_table.verticalHeader().setDefaultSectionSize(48)
+        self.material_table.horizontalHeader().setMinimumSectionSize(120)
+        for column, width in enumerate((205, 215, 165, 120, 120, 120, 120, 155, 205, 145, 185)):
+            self.material_table.horizontalHeader().setSectionResizeMode(
+                column, QHeaderView.ResizeMode.Interactive
+            )
+            self.material_table.setColumnWidth(column, width)
+        self.material_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.material_table, 1)
+
+        controls = QHBoxLayout()
+        add_dielectric = QPushButton("Add dielectric")
+        add_metal = QPushButton("Add metal")
+        remove = QPushButton("Remove selected row")
+        preview_button = QPushButton("Show RF 3D preview")
+        add_dielectric.clicked.connect(lambda: self._append_material_row({
+            "name": "New dielectric", "role": "dielectric", "thickness_um": 1.0,
+            "relative_permittivity": 1.0, "loss_tangent": 0.0,
+            "conductivity_s_per_m": 0.0,
+        }))
+        add_metal.clicked.connect(lambda: self._append_material_row({
+            "name": "RF metal", "role": "metal", "thickness_um": 1.0,
+            "metal_model": "Conductive 3D", "conductivity_s_per_m": 4.1e7,
+            "gds_layers": [4, 5],
+        }))
+        remove.clicked.connect(self._remove_selected_material_rows)
+        preview_button.clicked.connect(self._show_rf_3d_preview)
+        controls.addWidget(add_dielectric)
+        controls.addWidget(add_metal)
+        controls.addWidget(remove)
+        controls.addWidget(preview_button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+        self._set_material_stack(list(self.values.get("material_stack") or []))
+        self.tabs.addTab(page, "RF material stack")
+
+    def _build_mesh_tab(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        mesh_group = QGroupBox("Mesh")
+        mesh_form = QFormLayout(mesh_group)
+        self.mesh_edge = _rf_spin(self.values.get("mesh_edge_um", 0.25), 1e-6, 1e7, 6, 0.05)
+        self.mesh_vertical = _rf_spin(self.values.get("mesh_vertical_um", 0.10), 1e-6, 1e7, 6, 0.05)
+        self.mesh_bulk = _rf_spin(self.values.get("mesh_bulk_um", 5.0), 1e-6, 1e7, 6, 0.5)
+        mesh_form.addRow("Maximum metal-edge cell (µm)", self.mesh_edge)
+        mesh_form.addRow("Maximum vertical metal cell (µm)", self.mesh_vertical)
+        mesh_form.addRow("Maximum bulk dielectric cell (µm)", self.mesh_bulk)
+        mesh_note = QLabel("The metal-edge override controls CPW gaps and conductor corners; the bulk value controls the surrounding dielectric and air.")
+        mesh_note.setWordWrap(True)
+        mesh_form.addRow("Meaning", mesh_note)
+        layout.addWidget(mesh_group)
+
+        boundary_group = QGroupBox("Boundaries and run length")
+        boundary_form = QFormLayout(boundary_group)
+        self.boundary_type = QComboBox()
+        self.boundary_type.addItems([
+            "Metal transverse / PML propagation",
+            "PML all sides",
+            "PEC transverse / PML propagation",
+        ])
+        current_boundary = str(self.values.get("boundary_type", "Metal transverse / PML propagation"))
+        if self.boundary_type.findText(current_boundary) < 0:
+            self.boundary_type.addItem(current_boundary)
+        self.boundary_type.setCurrentText(current_boundary)
+        self.pml_layers = QSpinBox()
+        self.pml_layers.setRange(1, 256)
+        self.pml_layers.setValue(int(self.values.get("pml_layers", 28)))
+        self.port_clearance = _rf_spin(self.values.get("port_clearance_wavelengths", 0.25), 0.0, 100.0, 6, 0.05)
+        self.simulation_time = _rf_spin(self.values.get("simulation_time_ns", 40.0), 1e-6, 1e9, 6, 1.0)
+        self.auto_shutoff = _rf_spin(self.values.get("auto_shutoff", 1e-6), 1e-15, 1.0, 12)
+        self.backing_ground = QCheckBox("Add a conductor-backed ground plane below the RF stack")
+        self.backing_ground.setChecked(bool(self.values.get("backing_ground", False)))
+        self.snap_pec = QCheckBox("Snap zero-thickness PEC sheets to a Yee-cell boundary")
+        self.snap_pec.setChecked(bool(self.values.get("snap_pec_to_yee_cell_boundary", False)))
+        self.short_pulse = QCheckBox("Use the short-pulse RF FDTD optimization")
+        self.short_pulse.setChecked(bool(self.values.get("optimize_for_short_pulse", False)))
+        boundary_form.addRow("Boundary preset", self.boundary_type)
+        boundary_form.addRow("PML layers", self.pml_layers)
+        boundary_form.addRow("Port/discontinuity clearance (λ)", self.port_clearance)
+        boundary_form.addRow("Maximum simulation time (ns)", self.simulation_time)
+        boundary_form.addRow("Auto shutoff", self.auto_shutoff)
+        boundary_form.addRow("Backing conductor", self.backing_ground)
+        boundary_form.addRow("PEC mesh alignment", self.snap_pec)
+        boundary_form.addRow("Pulse optimization", self.short_pulse)
+        layout.addWidget(boundary_group)
+
+        execution_group = QGroupBox("Execution and saved files")
+        execution_form = QFormLayout(execution_group)
+        self.build_threads = QSpinBox()
+        self.build_threads.setRange(1, max(256, CPU_COUNT))
+        self.build_threads.setValue(int(self.values.get("build_cpu_threads", min(30, CPU_COUNT))))
+        self.resource_mode = QComboBox()
+        self.resource_mode.addItems(["CPU", "GPU"])
+        self.resource_mode.setCurrentText(str(self.values.get("resource_mode", "CPU")))
+        self.resource_mode.setEnabled(False)
+        self.run_after_build = QCheckBox("Run immediately after constructing the model")
+        self.run_after_build.setChecked(bool(self.values.get("run_after_build", True)))
+        project_suffix = ".lms" if self.values["rf_workflow"] == "fde" else ".fsp"
+        execution_form.addRow("Model-build CPU threads", self.build_threads)
+        execution_form.addRow("Solver resource", self.resource_mode)
+        execution_form.addRow("Solve", self.run_after_build)
+        resource_note = QLabel(
+            f"MODE/FDE is CPU-only. Three-dimensional RF FDTD is configured for GPU; plotting and report generation return to CPU. "
+            f"The inspection and final {project_suffix} projects are always saved."
+        )
+        resource_note.setWordWrap(True)
+        execution_form.addRow("Resource policy", resource_note)
+        layout.addWidget(execution_group)
+        layout.addStretch(1)
+        self.tabs.addTab(page, "Mesh & boundaries")
+
+    def _build_preview_tab(self) -> None:
+        """Add the same interactive pre-export inspection used by photonics."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        description = QLabel(
+            "Inspect the RF material volumes, exact conductor polygons, manual or endpoint RF planes, "
+            "and solver region before exporting. Every visible value is rebuilt from the controls in "
+            "this window, so changing the stack, frequency range, mesh, or port spans changes this view."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        workflow_note = QLabel(
+            "Straight CPW uses a two-dimensional MODE/FDE cross-section; the preview gives that section "
+            "a 1 µm visual extrusion only. CPW tapers, bends, opens, shorts, and segmented electrodes show "
+            "the actual three-dimensional RF FDTD region."
+        )
+        workflow_note.setWordWrap(True)
+        workflow_note.setStyleSheet("color:#0f766e; font-weight:600;")
+        layout.addWidget(workflow_note)
+
+        show_button = QPushButton("Show me a 3D version of the RF file I have built")
+        show_button.setMinimumHeight(48)
+        show_button.clicked.connect(self._show_rf_3d_preview)
+        layout.addWidget(show_button)
+        layout.addStretch(1)
+        self.tabs.addTab(page, "RF 3D preview")
+
+    def preview_state(self) -> dict[str, Any]:
+        """Return one stable state while the interactive preview is open."""
+        if self._active_rf_preview_state is not None:
+            return self._active_rf_preview_state
+        return build_lumerical_rf_preview_state(
+            self.components,
+            self.configuration(validate_ports=False),
+        )
+
+    def _show_rf_3d_preview(self) -> None:
+        """Open an orbitable RF stack/conductor/plane/solver preview."""
+        try:
+            state = build_lumerical_rf_preview_state(
+                self.components,
+                self.configuration(validate_ports=False),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not build RF 3D preview", str(exc))
+            return
+
+        self._active_rf_preview_state = state
+        preview_dialog = QDialog(self)
+        preview_dialog.setWindowTitle("Pre-export 3D Lumerical RF model")
+        preview_dialog.resize(1250, 860)
+        preview_dialog.setMinimumSize(1100, 760)
+        preview_layout = QVBoxLayout(preview_dialog)
+
+        visibility_row = QHBoxLayout()
+        visibility_row.addWidget(QLabel("Show/hide:"))
+        preview = ThreeDModelPreview(self)
+        preview.show_fiber = False
+        for label, attribute in (
+            ("RF metal geometry", "show_device"),
+            ("RF material stack", "show_stack"),
+            ("RF ports & monitors", "show_ports"),
+            ("Solver region", "show_fdtd"),
+        ):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(
+                lambda checked, name=attribute: (
+                    setattr(preview, name, bool(checked)),
+                    preview.update(),
+                )
+            )
+            visibility_row.addWidget(checkbox)
+        visibility_row.addStretch(1)
+        reset_view = QPushButton("Reset 3D view")
+        reset_view.clicked.connect(
+            lambda: (
+                setattr(preview, "azimuth_deg", 35.0),
+                setattr(preview, "elevation_deg", 20.0),
+                setattr(preview, "zoom_factor", 1.0),
+                setattr(preview, "pan", QPointF(0.0, 0.0)),
+                preview.update(),
+            )
+        )
+        visibility_row.addWidget(reset_view)
+        preview_layout.addLayout(visibility_row)
+
+        bounds = state["solver_bounds_um"]
+        bounds_label = QLabel(
+            "%s · X %.6g to %.6g µm · Y %.6g to %.6g µm · Z %.6g to %.6g µm"
+            % (state["solver_label"], *map(float, bounds))
+        )
+        bounds_label.setWordWrap(True)
+        preview_layout.addWidget(bounds_label)
+
+        warnings = list(state.get("warnings", []))
+        if warnings:
+            warning_label = QLabel("Preview notes: " + "  •  ".join(map(str, warnings)))
+            warning_label.setWordWrap(True)
+            warning_label.setStyleSheet("color:#b45309;")
+            preview_layout.addWidget(warning_label)
+
+        layer_grid = QGridLayout()
+        layer_grid.addWidget(QLabel("Individual RF stack rows:"), 0, 0, 1, 3)
+
+        def set_layer_visible(row_id: int, visible: bool) -> None:
+            if visible:
+                preview.hidden_stack_rows.discard(row_id)
+            else:
+                preview.hidden_stack_rows.add(row_id)
+            preview.update()
+
+        for index, (row, _z0, _z1) in enumerate(state["stack_ranges"]):
+            row_id = int(row.get("_preview_id", index))
+            layer_checkbox = QCheckBox(
+                str(
+                    row.get(
+                        "_preview_label",
+                        f"{row.get('name', 'Layer')} — {row.get('material', '')}",
+                    )
+                )
+            )
+            layer_checkbox.setChecked(True)
+            layer_checkbox.toggled.connect(
+                lambda checked, rid=row_id: set_layer_visible(rid, checked)
+            )
+            layer_grid.addWidget(layer_checkbox, 1 + index // 3, index % 3)
+        preview_layout.addLayout(layer_grid)
+        preview_layout.addWidget(preview, 1)
+
+        close_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_buttons.rejected.connect(preview_dialog.reject)
+        preview_layout.addWidget(close_buttons)
+        try:
+            preview_dialog.exec()
+        finally:
+            self._active_rf_preview_state = None
+
+    @staticmethod
+    def _cell_text(table: QTableWidget, row: int, column: int) -> str:
+        item = table.item(row, column)
+        return item.text().strip() if item is not None else ""
+
+    def _append_material_row(self, material: dict[str, Any]) -> None:
+        row = self.material_table.rowCount()
+        self.material_table.insertRow(row)
+        self.material_table.setItem(row, 0, QTableWidgetItem(str(material.get("name", "Layer"))))
+        role = QComboBox()
+        role.addItem("Dielectric / background", "dielectric")
+        role.addItem("Metal from GDS", "metal")
+        role_value = "metal" if str(material.get("role", "dielectric")).lower() == "metal" else "dielectric"
+        role.setCurrentIndex(max(0, role.findData(role_value)))
+        role.setMinimumSize(190, 38)
+        self.material_table.setCellWidget(row, 1, role)
+        self.material_table.setItem(row, 2, QTableWidgetItem(f"{float(material.get('thickness_um', 0.0)):g}"))
+        anisotropic = bool(material.get("anisotropic", False))
+        isotropic_epsilon = "" if anisotropic or role_value == "metal" else f"{float(material.get('relative_permittivity', 1.0)):g}"
+        self.material_table.setItem(row, 3, QTableWidgetItem(isotropic_epsilon))
+        for column, key in zip((4, 5, 6), ("relative_permittivity_x", "relative_permittivity_y", "relative_permittivity_z")):
+            value = material.get(key)
+            self.material_table.setItem(row, column, QTableWidgetItem("" if value is None else f"{float(value):g}"))
+        self.material_table.setItem(row, 7, QTableWidgetItem(f"{float(material.get('loss_tangent', 0.0)):g}"))
+        self.material_table.setItem(row, 8, QTableWidgetItem(f"{float(material.get('conductivity_s_per_m', 0.0)):g}"))
+        raw_layers = material.get("gds_layers", [])
+        if isinstance(raw_layers, (int, float, str)):
+            raw_layers = [raw_layers]
+        layers_text = ", ".join(str(int(float(value))) for value in raw_layers) if raw_layers else ""
+        self.material_table.setItem(row, 9, QTableWidgetItem(layers_text))
+        metal_model = QComboBox()
+        metal_model.addItems(["Conductive 3D", "PEC"])
+        requested_model = str(material.get("metal_model", "Conductive 3D"))
+        if metal_model.findText(requested_model) < 0:
+            metal_model.addItem(requested_model)
+        metal_model.setCurrentText(requested_model)
+        metal_model.setMinimumSize(165, 38)
+        self.material_table.setCellWidget(row, 10, metal_model)
+
+    def _set_material_stack(self, stack: list[dict[str, Any]]) -> None:
+        self.material_table.setRowCount(0)
+        for material in stack:
+            self._append_material_row(dict(material))
+
+    def _load_selected_stack_preset(self) -> None:
+        preset = self.stack_preset.currentText()
+        self._set_material_stack(copy.deepcopy(RF_STACK_PRESETS[preset]))
+        self.backing_ground.setChecked(preset == "Official Ansys conductor-backed FR4")
+
+    def _remove_selected_material_rows(self) -> None:
+        rows = sorted({index.row() for index in self.material_table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.material_table.removeRow(row)
+
+    def _material_stack(self) -> list[dict[str, Any]]:
+        stack: list[dict[str, Any]] = []
+        for row in range(self.material_table.rowCount()):
+            name = self._cell_text(self.material_table, row, 0) or f"Layer {row + 1}"
+            role_widget = self.material_table.cellWidget(row, 1)
+            role = str(role_widget.currentData()) if isinstance(role_widget, QComboBox) else "dielectric"
+            thickness = float(self._cell_text(self.material_table, row, 2) or 0.0)
+            material: dict[str, Any] = {
+                "name": name,
+                "role": role,
+                "thickness_um": thickness,
+                "loss_tangent": float(self._cell_text(self.material_table, row, 7) or 0.0),
+                "conductivity_s_per_m": float(self._cell_text(self.material_table, row, 8) or 0.0),
+            }
+            if role == "metal":
+                model_widget = self.material_table.cellWidget(row, 10)
+                material["metal_model"] = model_widget.currentText() if isinstance(model_widget, QComboBox) else "Conductive 3D"
+                layer_values = numeric_list(self._cell_text(self.material_table, row, 9))
+                if not layer_values:
+                    raise ValueError(f"{name}: enter at least one GDS layer for the RF metal.")
+                if any(
+                    not math.isfinite(value) or value < 0 or abs(value - round(value)) > 1e-12
+                    for value in layer_values
+                ):
+                    raise ValueError(f"{name}: GDS layers must be nonnegative whole numbers.")
+                material["gds_layers"] = [int(round(value)) for value in layer_values]
+            else:
+                axes = [self._cell_text(self.material_table, row, column) for column in (4, 5, 6)]
+                if any(axes):
+                    if not all(axes):
+                        raise ValueError(f"{name}: fill all of εx, εy, and εz, or leave all three blank.")
+                    material.update({
+                        "anisotropic": True,
+                        "relative_permittivity_x": float(axes[0]),
+                        "relative_permittivity_y": float(axes[1]),
+                        "relative_permittivity_z": float(axes[2]),
+                    })
+                else:
+                    epsilon = self._cell_text(self.material_table, row, 3)
+                    if not epsilon:
+                        raise ValueError(f"{name}: enter εr or all three anisotropic permittivities.")
+                    material["relative_permittivity"] = float(epsilon)
+            stack.append(material)
+        return stack
+
+    def _scope_uids(self) -> list[int]:
+        raw = self.scope_combo.currentData()
+        return list(map(int, raw or []))
+
+    def _manual_rf_objects(self) -> list[dict[str, Any]]:
+        scope_uids = set(self._scope_uids())
+        return [
+            component for component in self.components
+            if int(component.get("uid", -1)) in scope_uids
+            and str(component.get("kind", "")) in RF_SIMULATION_OBJECT_KINDS
+        ]
+
+    def _update_scope_report(self, *_args) -> None:
+        objects = self._manual_rf_objects()
+        ports = sum(str(component.get("kind", "")) == "RF mode port" for component in objects)
+        monitors = sum(str(component.get("kind", "")) == "RF power monitor" for component in objects)
+        if objects:
+            self.scope_report.setText(
+                f"{ports} RF mode port(s), {monitors} RF power monitor(s). These manual planes take precedence over endpoint defaults."
+            )
+        elif self.values["rf_workflow"] == "fde":
+            self.scope_report.setText("No RF planes selected; a uniform CPW FDE solve uses its transverse cross-section directly.")
+        else:
+            self.scope_report.setText("No manual RF planes selected. Keep endpoint fallback enabled or add/select RF plane objects before export.")
+
+    def configuration(self, *, validate_ports: bool = True) -> dict[str, Any]:
+        stack = self._material_stack()
+        objects = self._manual_rf_objects()
+        manual_uids = [int(component["uid"]) for component in objects]
+        manual_ports = [component for component in objects if component.get("kind") == "RF mode port"]
+        use_endpoints = bool(self.endpoint_fallback.isChecked())
+        if (
+            validate_ports
+            and self.values["rf_workflow"] == "fdtd"
+            and not manual_ports
+            and not use_endpoints
+        ):
+            raise ValueError(
+                "A 3D RF FDTD run needs a selected RF mode port or the explicitly enabled component-endpoint fallback."
+            )
+        if manual_uids:
+            port_strategy = "manual_or_component_endpoints" if use_endpoints else "manual_only"
+        else:
+            if use_endpoints:
+                port_strategy = "component_endpoints"
+            elif not validate_ports and self.values["rf_workflow"] == "fdtd":
+                # Previewing unported geometry is useful while the user is
+                # still arranging explicit RF planes.  ``manual_only`` is a
+                # valid 3D strategy with an empty plane list; the preview
+                # builder then presents the missing-source/output warnings.
+                port_strategy = "manual_only"
+            else:
+                port_strategy = "cross_section_only"
+        configuration = copy.deepcopy(self.values)
+        configuration.update({
+            "rf_workflow": self.values["rf_workflow"],
+            "scope_uids": self._scope_uids(),
+            "primary_component_uid": int(self.target_component["uid"]),
+            "primary_component_kind": self.kind,
+            "manual_rf_object_uids": manual_uids,
+            "rf_port_strategy": port_strategy,
+            "use_endpoint_reference_planes": use_endpoints,
+            "frequency_start_ghz": self.frequency_start.value(),
+            "frequency_stop_ghz": self.frequency_stop.value(),
+            "frequency_points": self.frequency_points.value(),
+            "target_frequency_ghz": self.target_frequency.value(),
+            "material_stack": stack,
+            "rf_stack_preset": self.stack_preset.currentText(),
+            "input_port_inset_um": self.input_inset.value(),
+            "output_port_inset_um": self.output_inset.value(),
+            "port_transverse_span_um": self.port_transverse_span.value(),
+            "port_vertical_span_um": self.port_vertical_span.value(),
+            "multifrequency_mode_injection": self.multifrequency_injection.isChecked(),
+            "mesh_edge_um": self.mesh_edge.value(),
+            "mesh_vertical_um": self.mesh_vertical.value(),
+            "mesh_bulk_um": self.mesh_bulk.value(),
+            "boundary_type": self.boundary_type.currentText(),
+            "pml_layers": self.pml_layers.value(),
+            "port_clearance_wavelengths": self.port_clearance.value(),
+            "simulation_time_ns": self.simulation_time.value(),
+            "auto_shutoff": self.auto_shutoff.value(),
+            "backing_ground": self.backing_ground.isChecked(),
+            "snap_pec_to_yee_cell_boundary": self.snap_pec.isChecked(),
+            "optimize_for_short_pulse": self.short_pulse.isChecked(),
+            "build_cpu_threads": self.build_threads.value(),
+            "resource_mode": self.resource_mode.currentText(),
+            "run_after_build": self.run_after_build.isChecked(),
+            "save_inspection_fsp": True,
+            "save_final_fsp": True,
+        })
+        metal = next((row for row in stack if row.get("role") == "metal"), None)
+        if metal is not None:
+            configuration["metal_model"] = metal.get("metal_model", "Conductive 3D")
+            configuration["metal_conductivity_s_per_m"] = float(metal.get("conductivity_s_per_m", 0.0))
+            configuration["metal_thickness_um"] = float(metal.get("thickness_um", 0.0))
+        substrate = next(
+            (
+                row for row in stack
+                if row.get("role") == "dielectric"
+                and (
+                    bool(row.get("anisotropic", False))
+                    or float(row.get("relative_permittivity", 1.0)) > 1.000001
+                )
+            ),
+            None,
+        )
+        if substrate is not None:
+            if bool(substrate.get("anisotropic", False)):
+                configuration["substrate_relative_permittivity"] = max(
+                    float(substrate["relative_permittivity_x"]),
+                    float(substrate["relative_permittivity_y"]),
+                    float(substrate["relative_permittivity_z"]),
+                )
+            else:
+                configuration["substrate_relative_permittivity"] = float(
+                    substrate.get("relative_permittivity", 1.0)
+                )
+            configuration["substrate_loss_tangent"] = float(
+                substrate.get("loss_tangent", 0.0)
+            )
+            configuration["substrate_thickness_um"] = float(
+                substrate.get("thickness_um", 0.0)
+            )
+        return normalize_rf_configuration(self.kind, configuration)
+
+    def accept(self) -> None:
+        try:
+            self.configuration()
+        except Exception as exc:
+            QMessageBox.critical(self, "Invalid Lumerical RF settings", str(exc))
+            return
+        super().accept()
 
 
 class NativeLayoutWindow(QMainWindow):
@@ -758,7 +1465,16 @@ class NativeLayoutWindow(QMainWindow):
             None,
             None,
             file_menu,
-            status_tip="Export selected geometry, material stack, simulation-only ports, and CPU/GPU settings as a self-contained notebook.",
+            status_tip="Export the selected optical device or route a CPW device to the dedicated RF MODE/FDTD notebook workflow.",
+        )
+        action(
+            "export_lumerical_rf",
+            "Lumerical RF Run…",
+            self.export_lumerical_rf_notebook,
+            None,
+            None,
+            file_menu,
+            status_tip="Export a straight CPW with MODE/FDE or an RF taper/discontinuity with 3D FDTD S-parameters.",
         )
         action(
             "export_lumerical_sweep",
@@ -1171,6 +1887,27 @@ class NativeLayoutWindow(QMainWindow):
             }[kind]
             count = 1 + sum(component.get("kind") == kind for component in self.components)
             params["name"] = f"{prefix}_{count}"
+        elif kind == "RF mode port":
+            used_orders = {
+                int(component.get("params", {}).get("order", 0))
+                for component in self.components
+                if component.get("kind") == "RF mode port"
+            }
+            order = 1
+            while order in used_orders:
+                order += 1
+            params["name"] = f"rf_port_{order}"
+            params["order"] = order
+        elif kind == "RF power monitor":
+            used_names = {
+                str(component.get("params", {}).get("name", ""))
+                for component in self.components
+                if component.get("kind") == "RF power monitor"
+            }
+            count = 1
+            while f"rf_power_{count}" in used_names:
+                count += 1
+            params["name"] = f"rf_power_{count}"
         component = {
             "uid": self.next_uid,
             "kind": kind,
@@ -1545,8 +2282,17 @@ class NativeLayoutWindow(QMainWindow):
                     "span_um": float(fiber_port["params"].get("span_um", 20.0)),
                     "z_span_um": 0.0,
                     "mode": str(fiber_port["params"].get("mode", "user select")),
-                    "mode number": int(fiber_port["params"].get("mode number", 2)),
-                    "polarization": str(fiber_port["params"].get("polarization", "Ey")),
+                    "mode number": int(fiber_port["params"].get("mode number", 0)),
+                    "polarization": str(fiber_port["params"].get("polarization", "local TE")),
+                    "candidate mode numbers": list(
+                        fiber_port["params"].get("candidate mode numbers", [1, 2])
+                    ),
+                    "mode degeneracy tolerance": float(
+                        fiber_port["params"].get("mode degeneracy tolerance", 0.01)
+                    ),
+                    "minimum local TE fraction": float(
+                        fiber_port["params"].get("minimum local TE fraction", 0.8)
+                    ),
                     "angle theta": float(fiber_port["params"].get("angle theta", fiber_angle_deg)),
                     "angle phi": float(fiber_port["params"].get("angle phi", 0.0)),
                     "align to fiber axis": True,
@@ -1681,8 +2427,17 @@ class NativeLayoutWindow(QMainWindow):
                             "span_um": span_um,
                             "z_span_um": 0.0,
                             "mode": str(source_params.get("mode", "user select")),
-                            "mode number": int(source_params.get("mode number", 2)),
-                            "polarization": str(source_params.get("polarization", "Ey")),
+                            "mode number": int(source_params.get("mode number", 0)),
+                            "polarization": str(source_params.get("polarization", "local TE")),
+                            "candidate mode numbers": list(
+                                source_params.get("candidate mode numbers", [1, 2])
+                            ),
+                            "mode degeneracy tolerance": float(
+                                source_params.get("mode degeneracy tolerance", 0.01)
+                            ),
+                            "minimum local TE fraction": float(
+                                source_params.get("minimum local TE fraction", 0.8)
+                            ),
                             "angle theta": float(source_params.get("angle theta", old.get("angle theta", 7.0))),
                             "angle phi": float(source_params.get("angle phi", old.get("angle phi", 0.0))),
                             "align to fiber axis": True,
@@ -1731,8 +2486,17 @@ class NativeLayoutWindow(QMainWindow):
                         "span_um": float(source_params.get("span_um", 20.0)),
                         "z_span_um": 0.0,
                         "mode": str(source_params.get("mode", "user select")),
-                        "mode number": int(source_params.get("mode number", 2)),
-                        "polarization": str(source_params.get("polarization", "Ey")),
+                        "mode number": int(source_params.get("mode number", 0)),
+                        "polarization": str(source_params.get("polarization", "local TE")),
+                        "candidate mode numbers": list(
+                            source_params.get("candidate mode numbers", [1, 2])
+                        ),
+                        "mode degeneracy tolerance": float(
+                            source_params.get("mode degeneracy tolerance", 0.01)
+                        ),
+                        "minimum local TE fraction": float(
+                            source_params.get("minimum local TE fraction", 0.8)
+                        ),
                         "angle theta": source_theta_deg,
                         "angle phi": float(source_params.get("angle phi", 0.0)),
                         "align to fiber axis": True,
@@ -1977,12 +2741,30 @@ class NativeLayoutWindow(QMainWindow):
                             ),
                             "mode number": int(
                                 source_port_params.get(
-                                    "mode number", companion["params"].get("mode number", 2)
+                                    "mode number", companion["params"].get("mode number", 0)
                                 )
                             ),
                             "polarization": str(
                                 source_port_params.get(
-                                    "polarization", companion["params"].get("polarization", "Ey")
+                                    "polarization", companion["params"].get("polarization", "local TE")
+                                )
+                            ),
+                            "candidate mode numbers": list(
+                                source_port_params.get(
+                                    "candidate mode numbers",
+                                    companion["params"].get("candidate mode numbers", [1, 2]),
+                                )
+                            ),
+                            "mode degeneracy tolerance": float(
+                                source_port_params.get(
+                                    "mode degeneracy tolerance",
+                                    companion["params"].get("mode degeneracy tolerance", 0.01),
+                                )
+                            ),
+                            "minimum local TE fraction": float(
+                                source_port_params.get(
+                                    "minimum local TE fraction",
+                                    companion["params"].get("minimum local TE fraction", 0.8),
                                 )
                             ),
                             "angle theta": theta_deg,
@@ -2309,6 +3091,16 @@ class NativeLayoutWindow(QMainWindow):
         center = scene_to_world_point(self.view.mapToScene(self.view.viewport().rect().center()))
         snapshot = self.snapshot()
         component = self.make_component(name, *center)
+        rf_parent: dict[str, Any] | None = None
+        if name in RF_SIMULATION_OBJECT_KINDS:
+            selected_rf_parents = [
+                candidate for candidate in self.selected_components()
+                if str(candidate.get("kind", "")) in RF_SIMULATABLE_COMPONENT_KINDS
+            ]
+            if len(selected_rf_parents) == 1:
+                rf_parent = selected_rf_parents[0]
+                component["simulation_parent_uid"] = int(rf_parent["uid"])
+                component["orientation_deg"] = float(rf_parent.get("orientation_deg", 0.0))
         if name=="RF test block" and not self.configure_rf_test_block(component):
             self.next_uid=max(1,self.next_uid-1);return
         if name=="Photonic test block" and not self.configure_photonic_test_block(component):
@@ -2335,6 +3127,10 @@ class NativeLayoutWindow(QMainWindow):
         self.on_scene_selection_changed()
         if companions:
             self.statusBar().showMessage(f"Added {name} with {len(companions)} movable FDTD/fiber simulation object(s).")
+        elif rf_parent is not None:
+            self.statusBar().showMessage(
+                f"Added movable {name} and attached it to {rf_parent.get('kind')} UID {rf_parent.get('uid')}."
+            )
         else:
             self.statusBar().showMessage(f"Added {name}.")
 
@@ -2878,10 +3674,36 @@ class NativeLayoutWindow(QMainWindow):
         for action_item in (go_action, duplicate_action, array_action, lattice_action, save_module_action, delete_action):
             action_item.setEnabled(has_selection)
         boolean_menu.setEnabled(len(self.selected_components())>=2)
-        export_lumerical_action.setEnabled(len(self.selected_components()) == 1)
-        sweep_lumerical_action.setEnabled(len(self.selected_components()) == 1)
-        multigpu_sweep_lumerical_action.setEnabled(len(self.selected_components()) == 1)
-        optimize_lumerical_action.setEnabled(len(self.selected_components()) == 1)
+        selected_components = self.selected_components()
+        selected_rf_targets = [
+            component for component in selected_components
+            if str(component.get("kind", "")) in RF_SIMULATABLE_COMPONENT_KINDS
+        ]
+        valid_rf_selection = (
+            len(selected_rf_targets) == 1
+            and all(
+                str(component.get("kind", ""))
+                in RF_SIMULATABLE_COMPONENT_KINDS | RF_SIMULATION_OBJECT_KINDS
+                for component in selected_components
+            )
+        )
+        selected_rf_target = (
+            selected_rf_targets[0]
+            if valid_rf_selection
+            else self.rf_lumerical_target_component(
+                selected_components[0] if len(selected_components) == 1 else None
+            )
+        )
+        if selected_rf_target is not None:
+            export_lumerical_action.setText("Lumerical RF run…")
+            export_lumerical_action.setToolTip(
+                "Use MODE/FDE for a uniform CPW or 3D FDTD S-parameters for an RF discontinuity."
+            )
+        export_lumerical_action.setEnabled(len(selected_components) == 1 or valid_rf_selection)
+        optical_sweep_enabled = len(selected_components) == 1 and selected_rf_target is None
+        sweep_lumerical_action.setEnabled(optical_sweep_enabled)
+        multigpu_sweep_lumerical_action.setEnabled(optical_sweep_enabled)
+        optimize_lumerical_action.setEnabled(optical_sweep_enabled)
         chosen = menu.exec(self.project_tree.viewport().mapToGlobal(position))
         if chosen is go_action:
             self.fit_selection()
@@ -4260,6 +5082,179 @@ class NativeLayoutWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Exports
     # ------------------------------------------------------------------
+    def rf_lumerical_target_component(
+        self, clicked_component: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Resolve an RF geometry target from a device or manual RF plane."""
+        if clicked_component is not None and str(clicked_component.get("kind", "")) in RF_SIMULATABLE_COMPONENT_KINDS:
+            return clicked_component
+        if clicked_component is not None and str(clicked_component.get("kind", "")) in RF_SIMULATION_OBJECT_KINDS:
+            parent_uid = clicked_component.get("simulation_parent_uid")
+            if parent_uid is not None:
+                parent = next(
+                    (
+                        component for component in self.components
+                        if int(component.get("uid", -1)) == int(parent_uid)
+                        and str(component.get("kind", "")) in RF_SIMULATABLE_COMPONENT_KINDS
+                    ),
+                    None,
+                )
+                if parent is not None:
+                    return parent
+            selected_targets = [
+                component for component in self.selected_components()
+                if str(component.get("kind", "")) in RF_SIMULATABLE_COMPONENT_KINDS
+            ]
+            if len(selected_targets) == 1:
+                return selected_targets[0]
+            candidates = [
+                component for component in self.components
+                if str(component.get("kind", "")) in RF_SIMULATABLE_COMPONENT_KINDS
+            ]
+            if candidates:
+                x = float(clicked_component.get("x", 0.0))
+                y = float(clicked_component.get("y", 0.0))
+                return min(
+                    candidates,
+                    key=lambda component: math.hypot(
+                        float(component.get("x", 0.0)) - x,
+                        float(component.get("y", 0.0)) - y,
+                    ),
+                )
+        return None
+
+    def rf_lumerical_scope_options(
+        self, target_component: dict[str, Any]
+    ) -> list[tuple[str, list[int]]]:
+        """Offer RF-only geometry/plane scopes, preferring manual planes."""
+        target_uid = int(target_component["uid"])
+        options: list[tuple[str, list[int]]] = []
+        seen: set[tuple[int, ...]] = set()
+
+        def add(label: str, members: list[dict[str, Any]]) -> None:
+            ordered: list[int] = []
+            for member in members:
+                kind = str(member.get("kind", ""))
+                if kind not in RF_SIMULATABLE_COMPONENT_KINDS | RF_SIMULATION_OBJECT_KINDS:
+                    continue
+                uid = int(member["uid"])
+                if uid not in ordered:
+                    ordered.append(uid)
+            if target_uid not in ordered:
+                ordered.insert(0, target_uid)
+            signature = tuple(ordered)
+            if signature in seen:
+                return
+            seen.add(signature)
+            options.append((label, ordered))
+
+        selected = [
+            component for component in self.selected_components()
+            if str(component.get("kind", "")) in RF_SIMULATABLE_COMPONENT_KINDS | RF_SIMULATION_OBJECT_KINDS
+        ]
+        selected_manual = [
+            component for component in selected
+            if str(component.get("kind", "")) in RF_SIMULATION_OBJECT_KINDS
+        ]
+        if selected_manual:
+            add(
+                f"Current RF selection — device + {len(selected_manual)} manual RF plane(s)",
+                [target_component, *selected],
+            )
+
+        attached = [
+            component for component in self.components
+            if str(component.get("kind", "")) in RF_SIMULATION_OBJECT_KINDS
+            and int(component.get("simulation_parent_uid", -1)) == target_uid
+        ]
+        if attached:
+            add(
+                f"Component + {len(attached)} attached RF port/monitor object(s)",
+                [target_component, *attached],
+            )
+
+        for key, title in (
+            ("group_id", "Complete RF group"),
+            ("module_instance_id", "Complete RF module"),
+        ):
+            value = target_component.get(key)
+            if value:
+                members = [component for component in self.components if component.get(key) == value]
+                add(f"{title} — {value}", members)
+
+        add(
+            f"Component only — {component_display_name(str(target_component.get('kind', 'CPW')))} "
+            "(endpoint fallback if needed)",
+            [target_component],
+        )
+        return options
+
+    def export_lumerical_rf_notebook(
+        self, clicked_component: dict[str, Any] | bool | None = None
+    ) -> None:
+        """Export a MODE/FDE or 3D FDTD RF notebook for a CPW structure."""
+        if isinstance(clicked_component, bool):
+            clicked_component = None
+        if clicked_component is None:
+            selected = self.selected_components()
+            clicked_component = selected[0] if selected else None
+        target_component = self.rf_lumerical_target_component(clicked_component)
+        if target_component is None:
+            QMessageBox.information(
+                self,
+                "Lumerical RF",
+                "Select a CPW, CPW taper, CPW bend/open/short, segmented electrode, or one of its RF planes.",
+            )
+            return
+        saved = copy.deepcopy(target_component.get("lumerical_rf_export_settings", {}))
+        dialog = RFLumericalExportDialog(
+            self.components,
+            target_component,
+            self.rf_lumerical_scope_options(target_component),
+            saved=saved,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            configuration = dialog.configuration()
+        except Exception as exc:
+            QMessageBox.critical(self, "Invalid Lumerical RF settings", str(exc))
+            return
+        selected_uids = set(map(int, configuration.get("scope_uids", [])))
+        selected_uids.add(int(target_component["uid"]))
+        export_components = [
+            safe_json_copy(component) for component in self.components
+            if int(component.get("uid", -1)) in selected_uids
+        ]
+        base_kind = re.sub(
+            r"[^A-Za-z0-9_-]+", "_", str(target_component.get("kind", "cpw"))
+        ).strip("_").lower() or "cpw"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Lumerical RF notebook",
+            str(Path.home() / f"{base_kind}_rf.ipynb"),
+            "Jupyter notebook (*.ipynb)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".ipynb"):
+            path += ".ipynb"
+        try:
+            warnings = write_lumerical_rf_notebook(path, export_components, configuration)
+        except Exception as exc:
+            QMessageBox.critical(self, "Lumerical RF export failed", str(exc))
+            return
+        snapshot = self.snapshot()
+        target_component["lumerical_rf_export_settings"] = safe_json_copy(configuration)
+        self.commit_interaction_snapshot(snapshot)
+        self.rebuild_scene(preserve_selection=True)
+        workflow = str(configuration.get("rf_workflow", "rf")).upper()
+        message = f"Exported {workflow} Lumerical RF notebook: {path}"
+        if warnings:
+            message += f" ({len(warnings)} note(s) are recorded inside the notebook)"
+        self.statusBar().showMessage(message, 10000)
+
     def lumerical_scope_options(self, clicked_component: dict[str, Any] | None) -> list[tuple[str, list[int]]]:
         """Geometry choices shown after a component-oriented simulation export."""
         options: list[tuple[str, list[int]]] = []
@@ -4358,6 +5353,17 @@ class NativeLayoutWindow(QMainWindow):
         if clicked_component is None:
             selected = self.selected_components()
             clicked_component = selected[0] if selected else None
+        rf_target = self.rf_lumerical_target_component(clicked_component)
+        if rf_target is not None:
+            self.export_lumerical_rf_notebook(rf_target)
+            return
+        if clicked_component is not None and str(clicked_component.get("kind", "")) in RF_COMPONENT_KINDS:
+            QMessageBox.information(
+                self,
+                "Lumerical RF",
+                "This RF container is not a direct solver target. Select one of its CPW, taper, bend, open/short, or segmented-electrode children.",
+            )
+            return
         settings_component = clicked_component
         if clicked_component and clicked_component.get("kind") in SIMULATION_COMPONENT_KINDS:
             parent_uid = clicked_component.get("simulation_parent_uid")
@@ -4368,6 +5374,8 @@ class NativeLayoutWindow(QMainWindow):
         saved = settings_component.get("lumerical_export_settings", {}) if settings_component else {}
         if settings_component and settings_component.get("kind") == "1x2 MMI":
             saved = mmi_lumerical_export_settings(saved)
+        if settings_component and settings_component.get("kind") == "Grating coupler":
+            saved = grating_lumerical_export_settings(saved)
         if settings_component and settings_component.get("kind") == "GC-SOI" and saved:
             saved = copy.deepcopy(saved)
             # Migrate the first compact-domain preset, which cropped the
@@ -4467,6 +5475,13 @@ class NativeLayoutWindow(QMainWindow):
                 "A port or monitor cannot be the sweep target. Right-click its parent device instead.",
             )
             return
+        if str(target_component.get("kind", "")) in RF_SIMULATABLE_COMPONENT_KINDS:
+            QMessageBox.information(
+                self,
+                "Lumerical RF sweep",
+                "RF parameter sweeps require RF-specific S-parameter/impedance objectives. Export a Lumerical RF run first; the optical sweep exporter is intentionally not used for CPW devices.",
+            )
+            return
         if target_component.get("kind") in {"Grating coupler", "GC-SOI"}:
             # Ensure the sweep dialog and every generated case expose only the
             # canonical project-JSON name, including layouts made by older
@@ -4492,6 +5507,8 @@ class NativeLayoutWindow(QMainWindow):
         saved_export = copy.deepcopy(target_component.get("lumerical_export_settings", {}))
         if target_component.get("kind") == "1x2 MMI":
             saved_export = mmi_lumerical_export_settings(saved_export)
+        if target_component.get("kind") == "Grating coupler":
+            saved_export = grating_lumerical_export_settings(saved_export)
         if target_component.get("kind") == "GC-SOI" and saved_export:
             # Apply the same compact-domain migration as the one-run export.
             # Old saved bounds could crop the terminal arc during a sweep.
@@ -4607,7 +5624,7 @@ class NativeLayoutWindow(QMainWindow):
         self.rebuild_scene(preserve_selection=True)
         message = (
             f"Exported {sweep_spec['point_count']}-point optimized Lumerical sweep: {path}. "
-            "One nominal FSP; no per-point FSP saves."
+            "One live model; no per-point FSP saves."
         )
         if warnings:
             message += f" ({len(warnings)} export note(s))"
@@ -4649,6 +5666,13 @@ class NativeLayoutWindow(QMainWindow):
                 "A port or monitor cannot be the sweep target. Right-click its parent device instead.",
             )
             return
+        if str(target_component.get("kind", "")) in RF_SIMULATABLE_COMPONENT_KINDS:
+            QMessageBox.information(
+                self,
+                "Lumerical RF sweep-multithread",
+                "The optical multi-GPU sweep is intentionally disabled for CPW devices. Start with the dedicated Lumerical RF run so its MODE/FDTD ports, materials, and S-parameter normalization are used.",
+            )
+            return
         if target_component.get("kind") in {"Grating coupler", "GC-SOI"}:
             migrate_grating_fiber_offset_parameter(target_component)
 
@@ -4674,6 +5698,8 @@ class NativeLayoutWindow(QMainWindow):
         )
         if target_component.get("kind") == "1x2 MMI":
             saved_export = mmi_lumerical_export_settings(saved_export)
+        if target_component.get("kind") == "Grating coupler":
+            saved_export = grating_lumerical_export_settings(saved_export)
         if target_component.get("kind") == "GC-SOI" and saved_export:
             if int(saved_export.get("gc_domain_version", 0)) < 3:
                 saved_export.pop("domain_padding_um", None)
@@ -4956,6 +5982,8 @@ class NativeLayoutWindow(QMainWindow):
         )
         if target_component.get("kind") == "1x2 MMI":
             saved_export = mmi_lumerical_export_settings(saved_export)
+        if target_component.get("kind") == "Grating coupler":
+            saved_export = grating_lumerical_export_settings(saved_export)
         if target_component.get("kind") == "GC-SOI" and saved_export:
             if int(saved_export.get("gc_domain_version", 0)) < 3:
                 saved_export.pop("domain_padding_um", None)
@@ -6234,11 +7262,15 @@ ENDFLOW
                             action = section_menu.addAction(section_title)
                             section_actions[action] = (component, section_title, section_keys)
                     menu.addSeparator()
+                rf_target = self.rf_lumerical_target_component(component)
                 export_lumerical_action = menu.addAction("Lumerical run…")
+                if rf_target is not None:
+                    export_lumerical_action.setText("Lumerical RF run…")
                 export_font = export_lumerical_action.font(); export_font.setBold(True); export_lumerical_action.setFont(export_font)
-                sweep_lumerical_action = menu.addAction("Lumerical sweep…")
-                multigpu_sweep_lumerical_action = menu.addAction("Lumerical sweep-multithread…")
-                optimize_lumerical_action = menu.addAction("Lumerical optimization…")
+                if rf_target is None:
+                    sweep_lumerical_action = menu.addAction("Lumerical sweep…")
+                    multigpu_sweep_lumerical_action = menu.addAction("Lumerical sweep-multithread…")
+                    optimize_lumerical_action = menu.addAction("Lumerical optimization…")
                 menu.addSeparator()
         save_module_action = menu.addAction("Add selection to User modules…")
         save_module_action.setEnabled(bool([component for component in self.selected_components() if component.get("kind") != "E-beam multipass"]))

@@ -18,6 +18,7 @@ import json
 import math
 import pprint
 import re
+import textwrap
 import zlib
 
 import numpy as np
@@ -749,8 +750,15 @@ def _promote_fiber_measurement_ports(
                     "z_span_um": 0.0,
                     "dir": str(monitor.get("dir", "Backward")),
                     "mode": "user select",
-                    "mode number": max(1, int(monitor.get("mode number", 2))),
-                    "polarization": str(monitor.get("polarization", "Ey")),
+                    "mode number": 0,
+                    "polarization": "local TE",
+                    "candidate mode numbers": [1, 2],
+                    "mode degeneracy tolerance": float(
+                        monitor.get("mode degeneracy tolerance", 0.01)
+                    ),
+                    "minimum local TE fraction": float(
+                        monitor.get("minimum local TE fraction", 0.8)
+                    ),
                     "fiber plane role": "passive fiber measurement",
                     "parent_port_name": "fiber_input_power",
                     "align to fiber axis": True,
@@ -771,6 +779,36 @@ def _notebook_cell(cell_type: str, source: str) -> dict[str, Any]:
     if cell_type == "code":
         cell.update({"execution_count": None, "outputs": []})
     return cell
+
+
+def _quick_run_options_cell(configuration: dict[str, Any], *, workflow: str) -> str:
+    """Put the remaining execution choices at the top of a notebook."""
+    return (
+        "# ==============================================================================\n"
+        "# QUICK RUN OPTIONS — edit these before running any other cell.\n"
+        "# ==============================================================================\n"
+        f"RUN_SIMULATION = {bool(configuration.get('run_after_build', True))!r}\n"
+        f"SHOW_GEOMETRY_PREVIEW = {bool(configuration.get('show_geometry_preview', False))!r}\n"
+        f"SHOW_PORT_MODE_PREVIEW = {bool(configuration.get('show_port_mode_preview', False))!r}\n"
+        f"RUN_GPU_SYSTEM_CHECK = {bool(configuration.get('run_gpu_system_check', False))!r}\n"
+        "# One pre-solve inspection FSP and one solved/best FSP are always stored.\n"
+        "# ==============================================================================\n"
+        "print('Project-file saving is always enabled: inspection plus solved/best FSP.')\n\n"
+        + _PIRIS_PATHS_CELL
+    )
+
+
+def _runtime_setup_source(builder_source: str) -> str:
+    """Apply first-cell switches and enforce project-file persistence."""
+    return (
+        "\n# Apply first-cell switches. Project saving is mandatory.\n"
+        "SETTINGS['run_after_build'] = bool(RUN_SIMULATION)\n"
+        "SETTINGS['save_inspection_fsp'] = True\n"
+        "SETTINGS['save_final_fsp'] = True\n"
+        "SETTINGS['run_gpu_system_check'] = bool(RUN_GPU_SYSTEM_CHECK)\n"
+        "print('Execution mode:', 'run' if SETTINGS['run_after_build'] else 'build only')\n"
+        "print('Inspection and solved/best FSP saving: always enabled')\n"
+    )
 
 
 _PIRIS_PATHS_CELL = r'''# Piris Labs project paths (managed by the 3D Simulations launcher)
@@ -911,10 +949,87 @@ def _format_live_optimization_rows(rows):
     return lines
 
 
+def _format_live_sweep_rows(rows, elapsed_seconds=None):
+    """Format the latest sweep state without dumping one line per poll."""
+    if not rows:
+        return []
+    latest = rows[-1]
+    total = max(0, int(latest.get("total_count", 0)))
+    completed = max(0, int(latest.get("completed_count", 0)))
+    failed = max(0, int(latest.get("failed_count", 0)))
+    processed = min(total, completed + failed) if total else completed + failed
+    percent = 100.0 * processed / total if total else 0.0
+    elapsed = (
+        max(0.0, float(elapsed_seconds))
+        if elapsed_seconds is not None
+        else max(0.0, float(latest.get("elapsed_seconds", 0.0)))
+    )
+    eta_text = "estimating"
+    if processed > 0 and total > processed:
+        durations = []
+        for row in rows:
+            if str(row.get("status", "")) not in {"completed", "failed"}:
+                continue
+            try:
+                duration = float(row["case_seconds"])
+            except Exception:
+                continue
+            if duration > 0.0:
+                durations.append(duration)
+        mean_case_seconds = (
+            sum(durations) / len(durations)
+            if durations else elapsed / processed
+        )
+        eta_seconds = mean_case_seconds * (total - processed)
+        eta_text = "%.1f min" % (eta_seconds / 60.0)
+    elif total and processed >= total:
+        eta_text = "0.0 min"
+
+    values = dict(latest.get("values", {}))
+    parameter_text = ", ".join(
+        "%s=%.9g" % (str(name), float(value))
+        for name, value in values.items()
+    )
+    status = str(latest.get("status", "running"))
+    current = str(latest.get("display_label", "")).strip() or parameter_text or "preparing"
+    lines = [
+        "Sweep progress: %d/%d finished (%6.2f%%) | failed %d | elapsed %.1f min | ETA %s"
+        % (processed, total, percent, failed, elapsed / 60.0, eta_text),
+        "Current: %s | %s" % (status, current),
+    ]
+
+    terminal_rows = [
+        row for row in rows
+        if str(row.get("status", "")) in {"completed", "reused", "failed"}
+    ]
+    if terminal_rows:
+        lines.append("Latest completed points:")
+        for row in terminal_rows[-5:]:
+            label_text = str(row.get("display_label", "")).strip()
+            result_text = ""
+            try:
+                peak = float(row["peak_response"])
+                wavelength_nm = float(row["peak_wavelength_nm"])
+                result_text = " | peak %.6g at %.3f nm" % (peak, wavelength_nm)
+            except Exception:
+                pass
+            lines.append(
+                "- %d/%d %s: %s%s"
+                % (
+                    int(row.get("case_index", -1)) + 1,
+                    total,
+                    str(row.get("status", "completed")),
+                    label_text,
+                    result_text,
+                )
+            )
+    return lines
+
+
 def _solve_with_live_optimization_progress(
-    code, label, poll, timeout, progress_file
+    code, label, poll, timeout, progress_file, progress_mode="optimization"
 ):
-    """Run remotely while redrawing solver percentage plus iteration history."""
+    """Run remotely while redrawing solver percentage plus streamed progress."""
     try:
         from IPython.display import clear_output
     except Exception:
@@ -960,6 +1075,20 @@ def _solve_with_live_optimization_progress(
         except Exception:
             pass
         latest_rows = _read_live_optimization_rows(progress_file)
+        if progress_mode == "sweep" and latest_rows:
+            latest = latest_rows[-1]
+            total = max(0, int(latest.get("total_count", 0)))
+            processed = max(0, int(latest.get("completed_count", 0))) + max(
+                0, int(latest.get("failed_count", 0))
+            )
+            if total:
+                # Blend the current FDTD solver percentage into the completed
+                # case count so the overall bar moves during a long point too.
+                current_fraction = (
+                    max(0.0, min(100.0, percent)) / 100.0
+                    if str(latest.get("status", "")) == "running" else 0.0
+                )
+                percent = 100.0 * min(total, processed + current_fraction) / total
         count = int(max(0.0, min(100.0, percent)) / 2.0)
         screen_lines = [
             "%s [%s%s] %6.2f%%   %6.1f s"
@@ -971,10 +1100,17 @@ def _solve_with_live_optimization_progress(
                 time.monotonic() - started,
             )
         ]
-        formatted_rows = _format_live_optimization_rows(latest_rows)
-        if formatted_rows:
-            screen_lines.extend(["", "Completed optimization iterations:"])
-            screen_lines.extend(formatted_rows)
+        if progress_mode == "sweep":
+            formatted_rows = _format_live_sweep_rows(
+                latest_rows, elapsed_seconds=time.monotonic() - started
+            )
+            if formatted_rows:
+                screen_lines.extend(["", *formatted_rows])
+        else:
+            formatted_rows = _format_live_optimization_rows(latest_rows)
+            if formatted_rows:
+                screen_lines.extend(["", "Completed optimization iterations:"])
+                screen_lines.extend(formatted_rows)
         screen = "\n".join(screen_lines)
         if screen != last_screen:
             clear_output(wait=True)
@@ -989,10 +1125,17 @@ def _solve_with_live_optimization_progress(
         "%s [%s] 100.00%%   %.1f s  DONE"
         % (label, "#" * 50, time.monotonic() - started)
     ]
-    formatted_rows = _format_live_optimization_rows(latest_rows)
-    if formatted_rows:
-        final_lines.extend(["", "Completed optimization iterations:"])
-        final_lines.extend(formatted_rows)
+    if progress_mode == "sweep":
+        formatted_rows = _format_live_sweep_rows(
+            latest_rows, elapsed_seconds=time.monotonic() - started
+        )
+        if formatted_rows:
+            final_lines.extend(["", *formatted_rows])
+    else:
+        formatted_rows = _format_live_optimization_rows(latest_rows)
+        if formatted_rows:
+            final_lines.extend(["", "Completed optimization iterations:"])
+            final_lines.extend(formatted_rows)
     print("\n".join(final_lines), flush=True)
     if "exception" in error:
         raise error["exception"]
@@ -1002,13 +1145,15 @@ def _solve_with_live_optimization_progress(
     return output
 
 
-def solve_remote_checked(code, label, timeout=21600, progress_file=None):
+def solve_remote_checked(
+    code, label, timeout=21600, progress_file=None, progress_mode="optimization"
+):
     """Keep the live progress display while still detecting a solver traceback."""
     guarded, ok_marker, error_marker = _guard_remote_code(code, label)
     if progress_file:
         output = _solve_with_live_optimization_progress(
             guarded, label=label, poll=5.0, timeout=timeout,
-            progress_file=progress_file,
+            progress_file=progress_file, progress_mode=progress_mode,
         )
     else:
         output = lam.solve(guarded, label=label, poll=5.0, timeout=timeout)
@@ -1061,10 +1206,28 @@ print("HPC Packs:", "3 roamed to this session for 24 h" if "SUCCESS" in out else
 
 _BUILD_CELL = r'''import os
 import json
+import re
+import shutil
+import time
+import uuid
 import numpy as np
 import lumapi
 
 UM = 1e-6
+
+# A notebook cell may be rerun after changing its first-cell options.  Close
+# the previous CAD owner before creating/loading another one; otherwise the
+# persistent Lambda Python process can accumulate hidden FDTD processes and
+# make every subsequent build progressively slower.
+_previous_fdtd = globals().get("fdtd")
+if _previous_fdtd is not None:
+    try:
+        _previous_fdtd.close()
+        print("Closed the previous live FDTD model before rebuilding.")
+    except Exception as _previous_close_exc:
+        print("Previous FDTD close warning:", str(_previous_close_exc)[:240])
+    finally:
+        globals().pop("fdtd", None)
 
 os.makedirs(REMOTE_WORK, exist_ok=True)
 REMOTE_FSP_DIR = os.path.join(REMOTE_WORK, "fsp")
@@ -1073,6 +1236,7 @@ os.chdir(REMOTE_WORK)
 for _old_name in {
     os.path.basename(str(SETTINGS.get("project_file", "exported_component.fsp"))),
     "_max_layout_mode_seed.fsp",
+    "_max_layout_runtime.fsp",
     "geometry_xyz_projections.png",
     "port_mode_Ex_Ey.png",
     "max_layout_results.npz",
@@ -1265,13 +1429,53 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
     fdtd.set("base mesh order", layer_builder_mesh_order)
     fdtd.set("process name", "Max Layout export")
     fdtd.set("GDS sidewall angle position reference", "middle")
-    layer_builder_x_um = 0.5 * (bounds[0] + bounds[2])
-    layer_builder_y_um = 0.5 * (bounds[1] + bounds[3])
+
+    # A manually resized FDTD domain is allowed to cut through a waveguide or
+    # another device polygon so the geometry reaches the PML.  Material films
+    # must not be clipped to that solver box: doing so could leave the part of
+    # an exported tooth, flare, terminal arc, or waveguide outside the oxide
+    # cladding and previously caused the conformal-coverage check to fail.
+    # Keep the FDTD bounds unchanged and independently enlarge the material
+    # extent to the union of the solver box and all exported polygons.
+    material_x_min_um = float(bounds[0]) - pml_geometry_overlap_um
+    material_x_max_um = float(bounds[2]) + pml_geometry_overlap_um
+    material_y_min_um = float(bounds[1]) - pml_geometry_overlap_um
+    material_y_max_um = float(bounds[3]) + pml_geometry_overlap_um
+    geometry_bounds_um = None
+    if GEOMETRY:
+        geometry_points_um = np.vstack([
+            np.asarray(polygon["vertices_um"], dtype=float) for polygon in GEOMETRY
+        ])
+        geometry_bounds_um = (
+            float(np.min(geometry_points_um[:, 0])),
+            float(np.min(geometry_points_um[:, 1])),
+            float(np.max(geometry_points_um[:, 0])),
+            float(np.max(geometry_points_um[:, 1])),
+        )
+        material_x_min_um = min(
+            material_x_min_um,
+            geometry_bounds_um[0] - pml_geometry_overlap_um,
+        )
+        material_x_max_um = max(
+            material_x_max_um,
+            geometry_bounds_um[2] + pml_geometry_overlap_um,
+        )
+        material_y_min_um = min(
+            material_y_min_um,
+            geometry_bounds_um[1] - pml_geometry_overlap_um,
+        )
+        material_y_max_um = max(
+            material_y_max_um,
+            geometry_bounds_um[3] + pml_geometry_overlap_um,
+        )
+
+    layer_builder_x_um = 0.5 * (material_x_min_um + material_x_max_um)
+    layer_builder_y_um = 0.5 * (material_y_min_um + material_y_max_um)
     fdtd.set("x", layer_builder_x_um * UM)
     fdtd.set("y", layer_builder_y_um * UM)
     fdtd.set("z", 0.0)
-    fdtd.set("x span", (bounds[2] - bounds[0] + 2.0 * pml_geometry_overlap_um) * UM)
-    fdtd.set("y span", (bounds[3] - bounds[1] + 2.0 * pml_geometry_overlap_um) * UM)
+    fdtd.set("x span", (material_x_max_um - material_x_min_um) * UM)
+    fdtd.set("y span", (material_y_max_um - material_y_min_um) * UM)
 
     # GEOMETRY vertices are absolute layout coordinates, while Layer Builder
     # interprets its geometry struct relative to the object's own origin.
@@ -1398,32 +1602,29 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
     # Layer Builder forces every background process layer to base order + 2.
     # Create full-film volumes explicitly so the requested substrate, BOX, and
     # conformal-cladding orders are preserved independently.
-    cladding_x_min_um = float(bounds[0]) - pml_geometry_overlap_um
-    cladding_x_max_um = float(bounds[2]) + pml_geometry_overlap_um
-    cladding_y_min_um = float(bounds[1]) - pml_geometry_overlap_um
-    cladding_y_max_um = float(bounds[3]) + pml_geometry_overlap_um
+    cladding_x_min_um = material_x_min_um
+    cladding_x_max_um = material_x_max_um
+    cladding_y_min_um = material_y_min_um
+    cladding_y_max_um = material_y_max_um
     for name, material, z_min_um, z_max_um, mesh_order, is_conformal in background_volumes:
         fdtd.addrect()
         fdtd.set("name", "Max Layout " + name)
         fdtd.set("material", str(material))
-        fdtd.set("x", 0.5 * (bounds[0] + bounds[2]) * UM)
-        fdtd.set("y", 0.5 * (bounds[1] + bounds[3]) * UM)
-        fdtd.set("x span", (bounds[2] - bounds[0] + 2.0 * pml_geometry_overlap_um) * UM)
-        fdtd.set("y span", (bounds[3] - bounds[1] + 2.0 * pml_geometry_overlap_um) * UM)
+        fdtd.set("x", 0.5 * (material_x_min_um + material_x_max_um) * UM)
+        fdtd.set("y", 0.5 * (material_y_min_um + material_y_max_um) * UM)
+        fdtd.set("x span", (material_x_max_um - material_x_min_um) * UM)
+        fdtd.set("y span", (material_y_max_um - material_y_min_um) * UM)
         fdtd.set("z min", z_min_um * UM)
         fdtd.set("z max", z_max_um * UM)
         fdtd.set("override mesh order from material database", True)
         fdtd.set("mesh order", mesh_order)
         print("Added material volume %s with mesh order %d." % (name, mesh_order))
         if is_conformal:
-            if GEOMETRY:
-                geometry_points_um = np.vstack([
-                    np.asarray(polygon["vertices_um"], dtype=float) for polygon in GEOMETRY
-                ])
-                geometry_x_min_um = float(np.min(geometry_points_um[:, 0]))
-                geometry_x_max_um = float(np.max(geometry_points_um[:, 0]))
-                geometry_y_min_um = float(np.min(geometry_points_um[:, 1]))
-                geometry_y_max_um = float(np.max(geometry_points_um[:, 1]))
+            if geometry_bounds_um is not None:
+                geometry_x_min_um = geometry_bounds_um[0]
+                geometry_y_min_um = geometry_bounds_um[1]
+                geometry_x_max_um = geometry_bounds_um[2]
+                geometry_y_max_um = geometry_bounds_um[3]
                 if (
                     geometry_x_min_um < cladding_x_min_um - 1e-9
                     or geometry_x_max_um > cladding_x_max_um + 1e-9
@@ -1636,13 +1837,252 @@ set("first axis","y");
 set("rotation 1",theta);
 """
         fdtd.set("script", fiber_setup_script)
-        fdtd.runsetup()
         print(
             "Added scripted Ansys fiber property group %s with core/cladding internal offsets (0, 0, 0) um "
             "as through-going cylinders centered on the nominal contact at (%.6g, %.6g) um "
             "(mesh precedence clips the effective fiber material; no source or port was created)."
             % (name, bottom_x_um, bottom_y_um)
         )
+
+
+def _mode_profile_vector(mode_profile, mode_number):
+    """Return one selected port mode as a complex (..., 3) Cartesian field."""
+    available = list(mode_profile.keys())
+    candidates = ["E%d" % int(mode_number), "E"]
+    rejected = []
+    for key in candidates:
+        if key not in available:
+            continue
+        electric = np.asarray(mode_profile[key])
+        if electric.ndim == 0:
+            rejected.append((key, electric.shape))
+            continue
+        if electric.shape[-1] == 3:
+            component_axis = electric.ndim - 1
+        else:
+            component_axes = [axis for axis, size in enumerate(electric.shape) if size == 3]
+            component_axis = component_axes[-1] if component_axes else None
+        if component_axis is None:
+            rejected.append((key, electric.shape))
+            continue
+        electric = np.moveaxis(electric, component_axis, -1)
+        if key == "E":
+            try:
+                mode_coordinates = np.asarray(mode_profile["n"]).ravel()
+            except Exception:
+                mode_coordinates = np.asarray([])
+            if mode_coordinates.size > 1:
+                mode_axes = [
+                    axis for axis, size in enumerate(electric.shape[:-1])
+                    if size == mode_coordinates.size
+                ]
+                if mode_axes:
+                    matches = np.flatnonzero(
+                        np.isclose(mode_coordinates.astype(float), float(mode_number))
+                    )
+                    mode_index = (
+                        int(matches[0]) if matches.size
+                        else int(mode_number) - 1
+                    )
+                    if not 0 <= mode_index < mode_coordinates.size:
+                        rejected.append((key, electric.shape))
+                        continue
+                    electric = np.take(electric, mode_index, axis=mode_axes[-1])
+        electric = np.squeeze(electric)
+        while electric.ndim > 3:
+            electric = np.take(electric, 0, axis=-2)
+        if electric.ndim < 2 or electric.shape[-1] != 3:
+            rejected.append((key, electric.shape))
+            continue
+        return np.asarray(electric, dtype=complex)
+    raise RuntimeError(
+        "Mode %d has no readable vector electric field. Available fields: %r; rejected: %r"
+        % (int(mode_number), available, rejected)
+    )
+
+
+def _fiber_local_te_score(mode_profile, mode_number, grating_axis_deg):
+    """Power fraction normal to the grating propagation axis in global XY."""
+    electric = _mode_profile_vector(mode_profile, mode_number)
+    phi = np.deg2rad(float(grating_axis_deg))
+    target_x = -np.sin(phi)
+    target_y = np.cos(phi)
+    desired = target_x * electric[..., 0] + target_y * electric[..., 1]
+    desired_power = float(np.sum(np.abs(desired) ** 2))
+    total_power = float(np.sum(np.abs(electric) ** 2))
+    return desired_power / max(total_power, 1e-300)
+
+
+def _fiber_candidate_neff(fdtd, port_path, candidate_modes):
+    """Best-effort central neff values for degeneracy validation."""
+    try:
+        dataset = fdtd.getresult(port_path, "neff")
+        available = list(dataset.keys())
+    except Exception:
+        return {}
+    result = {}
+    normalized = {
+        "".join(character for character in str(key).lower() if character.isalnum()): key
+        for key in available
+    }
+    for mode_number in candidate_modes:
+        key = normalized.get("neff%d" % int(mode_number))
+        if key is None:
+            continue
+        values = np.real(np.asarray(dataset[key])).ravel()
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            result[int(mode_number)] = float(np.median(finite))
+    if len(result) == len(candidate_modes):
+        return result
+    try:
+        plain_key = normalized.get("neff")
+        values = np.real(np.asarray(dataset[plain_key])).squeeze()
+        if values.size == len(candidate_modes):
+            for mode_number, value in zip(candidate_modes, values.ravel()):
+                if np.isfinite(value):
+                    result[int(mode_number)] = float(value)
+    except Exception:
+        pass
+    return result
+
+
+def _select_fiber_local_te_mode(fdtd, port_path, port):
+    """Calculate both HE11 partners and identify the rotation-correct one."""
+    raw_candidates = port.get("candidate mode numbers", (1, 2))
+    candidate_modes = []
+    for value in raw_candidates:
+        mode_number = int(value)
+        if mode_number > 0 and mode_number not in candidate_modes:
+            candidate_modes.append(mode_number)
+    if len(candidate_modes) < 2:
+        raise RuntimeError(
+            "Fiber port %s requires at least two candidate mode numbers"
+            % port.get("name", port_path)
+        )
+    candidate_modes = candidate_modes[:2]
+    fdtd.select(port_path)
+    update_status = fdtd.updateportmodes(np.asarray(candidate_modes, dtype=int))
+    if update_status is not None and float(np.asarray(update_status).squeeze()) < 0.0:
+        raise RuntimeError(
+            "Lumerical could not calculate both fiber modes %r for %s"
+            % (candidate_modes, port.get("name", port_path))
+        )
+    mode_profile = fdtd.getresult(port_path, "mode profiles")
+    grating_axis_deg = float(port.get("angle phi", 0.0)) % 360.0
+    scores = {
+        mode_number: _fiber_local_te_score(
+            mode_profile, mode_number, grating_axis_deg
+        )
+        for mode_number in candidate_modes
+    }
+    selected_mode = max(candidate_modes, key=lambda mode_number: scores[mode_number])
+    minimum_fraction = float(port.get("minimum local TE fraction", 0.8))
+    if scores[selected_mode] < minimum_fraction:
+        raise RuntimeError(
+            "Neither near-degenerate fiber mode is sufficiently polarized normal to the "
+            "grating axis at %.6g deg. Scores=%r; required >= %.6g."
+            % (grating_axis_deg, scores, minimum_fraction)
+        )
+    # Do not call updateportmodes a second time merely to reorder an already
+    # calculated pair.  The port group selects the source by eigensolver mode
+    # number, and the result extractor uses the dataset's explicit ``n``
+    # coordinate.  Retaining the original calculated order avoids a second
+    # expensive embedded eigensolver pass.
+    retained_modes = list(candidate_modes)
+    neff_by_mode = _fiber_candidate_neff(fdtd, port_path, candidate_modes)
+    degeneracy_delta = None
+    if len(neff_by_mode) == len(candidate_modes):
+        degeneracy_delta = abs(
+            neff_by_mode[candidate_modes[0]] - neff_by_mode[candidate_modes[1]]
+        )
+        degeneracy_tolerance = max(
+            0.0, float(port.get("mode degeneracy tolerance", 0.01))
+        )
+        if degeneracy_delta > degeneracy_tolerance:
+            raise RuntimeError(
+                "Fiber modes %r at %s are not the expected near-degenerate pair: "
+                "neff=%r, delta=%.6g > %.6g"
+                % (
+                    candidate_modes, port.get("name", port_path), neff_by_mode,
+                    degeneracy_delta, degeneracy_tolerance,
+                )
+            )
+    target_x = -np.sin(np.deg2rad(grating_axis_deg))
+    target_y = np.cos(np.deg2rad(grating_axis_deg))
+    selection = {
+        "mode number": int(selected_mode),
+        "selected mode order": list(map(int, retained_modes)),
+        # Port-group source labels and expansion-result ``n`` coordinates use
+        # the eigensolver mode number.  Keep that identity explicit so a
+        # two-mode fiber result is never reduced by position alone.
+        "selected mode result number": int(selected_mode),
+        "candidate mode numbers": list(map(int, candidate_modes)),
+        "local TE scores": {str(key): float(value) for key, value in scores.items()},
+        "grating axis deg": float(grating_axis_deg),
+        "target polarization xy": [float(target_x), float(target_y)],
+        "polarization": "local TE",
+        "candidate neff": {str(key): float(value) for key, value in neff_by_mode.items()},
+        "neff degeneracy delta": degeneracy_delta,
+    }
+    print(
+        "Fiber port %s calculated modes %r and selected eigensolver mode %d: "
+        "local-TE score %.6f for target (Ex,Ey)=(%.6g,%.6g), grating axis %.6g deg%s."
+        % (
+            port.get("name", port_path), candidate_modes, selected_mode,
+            scores[selected_mode], target_x, target_y, grating_axis_deg,
+            "" if degeneracy_delta is None else ", neff delta %.6g" % degeneracy_delta,
+        )
+    )
+    return selection
+
+
+def _reuse_verified_fiber_local_te_mode(fdtd, port_path, port, source_selection):
+    """Reuse the source's verified polarization at a concentric passive plane.
+
+    The automatic passive plane is only 0.1 um below the source and has the
+    same fiber, tilt, span, and axis.  Calculating both degenerate partners a
+    second time is redundant.  Calculate only the source winner here, verify
+    its local-TE fraction, and fall back to a full two-mode search if the local
+    mode numbering unexpectedly changes.
+    """
+    selected_mode = max(1, int(source_selection.get("mode number", 1)))
+    fdtd.select(port_path)
+    update_status = fdtd.updateportmodes(selected_mode)
+    if update_status is not None and float(np.asarray(update_status).squeeze()) < 0.0:
+        raise RuntimeError(
+            "Lumerical could not calculate inherited fiber mode %d for %s"
+            % (selected_mode, port.get("name", port_path))
+        )
+    mode_profile = fdtd.getresult(port_path, "mode profiles")
+    grating_axis_deg = float(port.get("angle phi", 0.0)) % 360.0
+    local_te_score = _fiber_local_te_score(
+        mode_profile, selected_mode, grating_axis_deg
+    )
+    minimum_fraction = float(port.get("minimum local TE fraction", 0.8))
+    if local_te_score < minimum_fraction:
+        print(
+            "Passive fiber mode %d at %s is not the source's local-TE partner "
+            "(score %.6f); running the full two-mode fallback."
+            % (selected_mode, port.get("name", port_path), local_te_score)
+        )
+        return _select_fiber_local_te_mode(fdtd, port_path, port)
+    selection = dict(source_selection)
+    selection.update({
+        "mode number": int(selected_mode),
+        "selected mode order": [int(selected_mode)],
+        "selected mode result number": int(selected_mode),
+        "local TE scores": {str(selected_mode): float(local_te_score)},
+        "grating axis deg": float(grating_axis_deg),
+        "polarization": "local TE",
+        "inherited from source mode": True,
+    })
+    print(
+        "Passive fiber port %s reused verified source eigensolver mode %d: "
+        "local-TE score %.6f; skipped redundant partner calculation."
+        % (port.get("name", port_path), selected_mode, local_te_score)
+    )
+    return selection
 
 
 PORT_MODE_SELECTIONS = {}
@@ -1744,9 +2184,25 @@ def _add_ports(
             if abs(phi_deg) > 1e-12:
                 fdtd.set("phi", phi_deg)
             fdtd.set("rotation offset", float(port.get("rotation offset_um", 0.0)) * UM)
+        fiber_plane_role = str(port.get("fiber plane role", "")).strip().lower()
+        grating_fiber_names = set()
+        if GRATING_ANALYSIS:
+            grating_fiber_names = {
+                str(GRATING_ANALYSIS.get("fiber_port_name", "")),
+                str(GRATING_ANALYSIS.get("fiber_input_measurement_port_name", "")),
+            }
+        is_fiber_mode_port = bool(
+            axis == "z-axis"
+            and (
+                name in grating_fiber_names
+                or bool(fiber_plane_role)
+                or str(port.get("parent_port_name", "")) == "fiber_input_power"
+            )
+        )
         requested_mode_number = max(0, int(port.get("mode number", 0)))
-        mode_selection = "user select" if requested_mode_number else str(
-            port.get("mode", "fundamental TE mode")
+        mode_selection = (
+            "user select" if is_fiber_mode_port or requested_mode_number
+            else str(port.get("mode", "fundamental TE mode"))
         )
         fdtd.set("mode selection", mode_selection)
         if GRATING_ANALYSIS:
@@ -1760,12 +2216,53 @@ def _add_ports(
         # solve yet expose neither S nor expansion results.
         port_path = "FDTD::ports::" + name
         fdtd.select(port_path)
-        mode_update_status = (
-            fdtd.updateportmodes(requested_mode_number)
-            if requested_mode_number else fdtd.updateportmodes()
-        )
-        if mode_update_status is not None and float(np.asarray(mode_update_status).squeeze()) < 0.0:
-            raise RuntimeError("Lumerical could not calculate the selected mode for FDTD port " + name)
+        if is_fiber_mode_port:
+            source_fiber_name = str(
+                GRATING_ANALYSIS.get("fiber_port_name", "")
+                if GRATING_ANALYSIS else ""
+            )
+            measurement_fiber_name = str(
+                GRATING_ANALYSIS.get("fiber_input_measurement_port_name", "")
+                if GRATING_ANALYSIS else ""
+            )
+            source_selection = PORT_MODE_SELECTIONS.get(source_fiber_name)
+            if name == measurement_fiber_name and source_selection:
+                fiber_selection = _reuse_verified_fiber_local_te_mode(
+                    fdtd, port_path, port, source_selection
+                )
+            else:
+                fiber_selection = _select_fiber_local_te_mode(fdtd, port_path, port)
+            PORT_MODE_SELECTIONS[name] = fiber_selection
+            requested_mode_number = int(fiber_selection["mode number"])
+            port["mode number"] = requested_mode_number
+            port["polarization"] = "local TE"
+            port["selected mode order"] = list(
+                fiber_selection["selected mode order"]
+            )
+            if GRATING_ANALYSIS and name == str(GRATING_ANALYSIS.get("fiber_port_name", "")):
+                GRATING_ANALYSIS["fiber_source_mode"] = "mode %d" % requested_mode_number
+                GRATING_ANALYSIS["fiber_source_mode_number"] = requested_mode_number
+                GRATING_ANALYSIS["fiber_polarization"] = "local TE"
+                GRATING_ANALYSIS["fiber_selected_mode_order"] = list(
+                    fiber_selection["selected mode order"]
+                )
+            if GRATING_ANALYSIS and name == str(
+                GRATING_ANALYSIS.get("fiber_input_measurement_port_name", "")
+            ):
+                GRATING_ANALYSIS["fiber_measurement_mode"] = (
+                    "mode %d" % requested_mode_number
+                )
+                GRATING_ANALYSIS["fiber_measurement_mode_number"] = requested_mode_number
+                GRATING_ANALYSIS["fiber_measurement_selected_mode_order"] = list(
+                    fiber_selection["selected mode order"]
+                )
+        else:
+            mode_update_status = (
+                fdtd.updateportmodes(requested_mode_number)
+                if requested_mode_number else fdtd.updateportmodes()
+            )
+            if mode_update_status is not None and float(np.asarray(mode_update_status).squeeze()) < 0.0:
+                raise RuntimeError("Lumerical could not calculate the selected mode for FDTD port " + name)
         if not bool(fdtd.haveresult(port_path, "mode profiles")):
             raise RuntimeError(
                 "FDTD port %s has no mode profile after updateportmodes; enlarge/reposition the port so it crosses its waveguide or fiber core"
@@ -1810,7 +2307,17 @@ def _add_ports(
                 "Validated FDTD port %s mode: neff %.6g around shared target %.6g."
                 % (name, selected_neff, target_neff)
             )
-        if requested_mode_number:
+        if is_fiber_mode_port:
+            retained_modes = list(
+                PORT_MODE_SELECTIONS.get(name, {}).get(
+                    "selected mode order", [requested_mode_number]
+                )
+            )
+            print(
+                "Selected rotation-aware local TE on FDTD port %s using eigensolver mode %d; retained mode data %r."
+                % (name, requested_mode_number, retained_modes)
+            )
+        elif requested_mode_number:
             print(
                 "Selected %s polarization on FDTD port %s using eigensolver mode %d."
                 % (port.get("polarization", "requested"), name, requested_mode_number)
@@ -2025,20 +2532,26 @@ def _add_monitors(
 
 
 def build_simulation():
+    build_started = time.perf_counter()
+    build_timings = {}
     available_cpu_cores = os.cpu_count() or 1
     build_cpu_threads = max(
         1,
         min(int(SETTINGS.get("build_cpu_threads", 30)), available_cpu_cores),
     )
+    stage_started = time.perf_counter()
     fdtd = lumapi.FDTD(
-        hide=bool(SETTINGS.get("hide_cad", False)),
+        hide=bool(SETTINGS.get("hide_cad", True)),
         serverArgs={"threads": str(build_cpu_threads)},
     )
+    build_timings["FDTD startup"] = time.perf_counter() - stage_started
     print(
         "Model construction CPU allocation: %d thread%s"
         % (build_cpu_threads, "" if build_cpu_threads == 1 else "s")
     )
+    stage_started = time.perf_counter()
     _add_required_materials(fdtd)
+    build_timings["materials"] = time.perf_counter() - stage_started
     bounds = list(BOUNDING_BOX_UM)
     if SETTINGS.get("include_ports", True):
         for port in PORTS:
@@ -2241,29 +2754,34 @@ def build_simulation():
         % "; ".join(stack_mesh_summary)
     )
 
+    stage_started = time.perf_counter()
     if z_ranges:
         _add_material_stack(
             fdtd, z_ranges, bounds, simulation_z_min_um, simulation_z_max_um, pml_geometry_overlap_um
         )
         _add_layer_mesh_overrides(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_z_max_um)
+    build_timings["stack and mesh"] = time.perf_counter() - stage_started
     # Port eigensolvers must see the requested wavelength range before their
     # mode profiles are explicitly updated.
     fdtd.setglobalsource("wavelength start", float(SETTINGS.get("wavelength_start_um", 1.25)) * UM)
     fdtd.setglobalsource("wavelength stop", float(SETTINGS.get("wavelength_stop_um", 1.35)) * UM)
+    stage_started = time.perf_counter()
     _add_fiber_geometries(
         fdtd, device_top_um, stack_top_um,
         silica_cladding_top_um, silica_cladding_center_um,
     )
-    if PORTS or any(
+    if FIBER_GEOMETRIES or PORTS or any(
         str(monitor.get("monitor_kind", "")) == "Mode expansion monitor"
         for monitor in MONITORS
     ):
-        # Commit every mesh-changing structure before an embedded port/monitor
-        # eigensolver is updated.  This prevents a newly built Layer Builder
-        # cross-section from being evaluated against stale background material.
-        mode_seed_project = os.path.join(REMOTE_WORK, "_max_layout_mode_seed.fsp")
-        fdtd.save(mode_seed_project)
-        print("Committed geometry before embedded mode calculations:", mode_seed_project)
+        # Force every structure/property-group setup script to finish in the
+        # live CAD session before asking an embedded port/monitor eigensolver
+        # for modes.  This is the in-memory equivalent of the former temporary
+        # mode-seed FSP save and avoids a disk write in pure Fast Run mode.
+        fdtd.runsetup()
+        print("Committed geometry in memory before embedded mode calculations.")
+    build_timings["fiber geometry and one setup pass"] = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
     if SETTINGS.get("include_ports", True):
         _add_ports(
             fdtd, device_z_um, device_top_um, stack_top_um,
@@ -2272,23 +2790,34 @@ def build_simulation():
         if PORTS:
             fdtd.select("FDTD::ports")
             fdtd.set("monitor frequency points", int(SETTINGS.get("frequency_points", 31)))
+    build_timings["FDTD port modes"] = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
     _add_monitors(
         fdtd, device_z_um, device_top_um, stack_top_um,
         silica_cladding_top_um, silica_cladding_center_um,
     )
     fdtd.setglobalmonitor("use source limits", True)
     fdtd.setglobalmonitor("frequency points", int(SETTINGS.get("frequency_points", 31)))
-    if "mode_seed_project" in locals() and os.path.isfile(mode_seed_project):
-        os.remove(mode_seed_project)
-        print("Removed transient mode-seed FSP after embedded mode setup:", mode_seed_project)
+    build_timings["monitors and expansion modes"] = time.perf_counter() - stage_started
     model_bounds_um = [
         float(bounds[0]), float(bounds[1]), float(simulation_z_min_um),
         float(bounds[2]), float(bounds[3]), float(simulation_z_max_um),
     ]
+    build_timings["total"] = time.perf_counter() - build_started
+    print(
+        "Pre-solve CPU timing: "
+        + "; ".join(
+            "%s %.2f s" % (name, seconds)
+            for name, seconds in build_timings.items()
+        )
+    )
     return fdtd, model_bounds_um
 
 
+REMOTE_RUNTIME_PROJECT_FILE = ""
 fdtd, MODEL_BOUNDS_UM = build_simulation()
+print("Built directly in memory; exact-model caching is disabled.")
+
 ACTUAL_FDTD_DIMENSION = str(fdtd.getnamed("FDTD", "dimension"))
 if ACTUAL_FDTD_DIMENSION.upper() != "3D":
     raise RuntimeError("Max Layout requires a 3D FDTD region, but Lumerical reported " + ACTUAL_FDTD_DIMENSION)
@@ -2297,6 +2826,9 @@ print(f"Built a verified 3D model with {len(GEOMETRY)} polygons, {len(PORTS)} st
 
 
 _GEOMETRY_PROJECTIONS_REMOTE = r'''# Render the exact embedded XY polygons and their Layer Builder XZ/YZ process projections.
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, Polygon as MplPolygon, Rectangle
 
@@ -2559,10 +3091,12 @@ print("Saved 3-axis geometry verification:", GEOMETRY_PROJECTIONS_FILE)
 
 
 _PORT_MODE_PROFILES_REMOTE = r'''# Visualize the selected port modes before solving.
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-def _field_plane(mode_profile, component_index, preferred_mode_number=0):
+def _field_plane(mode_profile, component_index, preferred_mode_number=0, magnitude=True):
     component_name = ("Ex", "Ey")[component_index]
     try:
         available = list(mode_profile.keys())
@@ -2581,14 +3115,10 @@ def _field_plane(mode_profile, component_index, preferred_mode_number=0):
             key=lambda key: int(key[1:]),
         )
     )
-    # Prefer an explicitly returned selected-mode Cartesian component.  Some
-    # Lumerical releases expose Ex/Ey directly, while others expose a vector E
-    # or E# dataset.  A scalar E2 intensity is not a polarization vector and
-    # must not block a later valid E/Ex/Ey candidate.
-    try:
-        field = np.asarray(mode_profile[component_name])
-    except (KeyError, TypeError, IndexError):
-        field = None
+    # Prefer the explicitly selected E# vector. With two retained fiber modes,
+    # a shared E dataset can carry an n dimension; select the requested n
+    # rather than silently taking column zero.
+    field = None
     rejected_vector_shapes = []
     for candidate in dict.fromkeys(vector_candidates):
         try:
@@ -2605,10 +3135,36 @@ def _field_plane(mode_profile, component_index, preferred_mode_number=0):
             rejected_vector_shapes.append((candidate, electric.shape))
             continue
         electric = np.moveaxis(electric, component_axis, -1)
+        if candidate == "E" and int(preferred_mode_number) > 0:
+            try:
+                mode_coordinates = np.asarray(mode_profile["n"]).ravel()
+            except Exception:
+                mode_coordinates = np.asarray([])
+            if mode_coordinates.size > 1:
+                mode_axes = [
+                    axis for axis, size in enumerate(electric.shape[:-1])
+                    if size == mode_coordinates.size
+                ]
+                if mode_axes:
+                    matches = np.flatnonzero(np.isclose(
+                        mode_coordinates.astype(float), float(preferred_mode_number)
+                    ))
+                    mode_index = (
+                        int(matches[0]) if matches.size
+                        else int(preferred_mode_number) - 1
+                    )
+                    if not 0 <= mode_index < mode_coordinates.size:
+                        rejected_vector_shapes.append((candidate, electric.shape))
+                        continue
+                    electric = np.take(electric, mode_index, axis=mode_axes[-1])
         vector_field = electric[..., component_index]
-        if field is None:
-            field = vector_field
+        field = vector_field
         break
+    if field is None:
+        try:
+            field = np.asarray(mode_profile[component_name])
+        except (KeyError, TypeError, IndexError):
+            field = None
     if field is None:
         raise RuntimeError(
             "The port mode-profile result contains neither %s nor a readable E/E# vector. "
@@ -2620,7 +3176,7 @@ def _field_plane(mode_profile, component_index, preferred_mode_number=0):
         field = np.take(field, 0, axis=-1)
     if field.ndim == 1:
         field = field[:, np.newaxis]
-    return np.abs(field)
+    return np.abs(field) if magnitude else np.asarray(field, dtype=complex)
 
 
 def _plot_coordinates(mode_profile, plane_normal, shape):
@@ -2641,11 +3197,11 @@ def _plot_coordinates(mode_profile, plane_normal, shape):
 
 if GRATING_ANALYSIS:
     profile_specs = [
-        ("Fiber source", str(GRATING_ANALYSIS["fiber_port_name"]), "Ey", "port"),
+        ("Fiber source", str(GRATING_ANALYSIS["fiber_port_name"]), "local TE", "port"),
         (
             "Waveguide fundamental mode",
             str(GRATING_ANALYSIS["waveguide_mode_monitor_name"]),
-            "Ey",
+            "local TE",
             "monitor",
         ),
     ]
@@ -2693,16 +3249,17 @@ else:
         profile_object = object_by_name.get(object_name, {})
         preferred_mode_number = max(0, int(profile_object.get("mode number", 0)))
         resolved_required_polarization = str(required_polarization or "")
-        if resolved_required_polarization.strip().lower() in {"te", "local te", "fundamental te"}:
-            # TE is transverse to the propagation axis.  A horizontal MMI
-            # propagating along X is Ey-dominant; a 90-degree rotated MMI
-            # propagating along Y is Ex-dominant.
-            resolved_required_polarization = (
-                "Ex" if str(profile_object.get("plane normal", "X")).upper() == "Y"
-                else "Ey"
-            )
-        ex = _field_plane(mode_profile, 0, preferred_mode_number)
-        ey = _field_plane(mode_profile, 1, preferred_mode_number)
+        local_te_required = resolved_required_polarization.strip().lower() in {
+            "te", "local te", "fundamental te"
+        }
+        ex_complex = _field_plane(
+            mode_profile, 0, preferred_mode_number, magnitude=False
+        )
+        ey_complex = _field_plane(
+            mode_profile, 1, preferred_mode_number, magnitude=False
+        )
+        ex = np.abs(ex_complex)
+        ey = np.abs(ey_complex)
         if ex.shape != ey.shape:
             raise RuntimeError("Mode object %s returned incompatible Ex/Ey profile shapes" % object_name)
         ex_power = float(np.sum(ex ** 2))
@@ -2710,6 +3267,30 @@ else:
         transverse_power = max(ex_power + ey_power, 1e-300)
         ex_fraction = ex_power / transverse_power
         ey_fraction = ey_power / transverse_power
+        local_te_fraction = None
+        if local_te_required:
+            plane_normal = str(profile_object.get("plane normal", "X")).upper()
+            propagation_angle_deg = float(
+                profile_object.get("angle phi", 0.0)
+                if plane_normal == "Z"
+                else profile_object.get(
+                    "outward_orientation_deg",
+                    profile_object.get("orientation_deg", 0.0),
+                )
+            )
+            propagation_angle = np.deg2rad(propagation_angle_deg)
+            target_x = -np.sin(propagation_angle)
+            target_y = np.cos(propagation_angle)
+            local_te_field = target_x * ex_complex + target_y * ey_complex
+            local_parallel_field = (
+                np.cos(propagation_angle) * ex_complex
+                + np.sin(propagation_angle) * ey_complex
+            )
+            local_te_power = float(np.sum(np.abs(local_te_field) ** 2))
+            local_parallel_power = float(np.sum(np.abs(local_parallel_field) ** 2))
+            local_te_fraction = local_te_power / max(
+                local_te_power + local_parallel_power, 1e-300
+            )
         transverse_field = np.sqrt(ex ** 2 + ey ** 2)
         peak_field = max(float(np.max(transverse_field)) if transverse_field.size else 0.0, 1e-300)
         boundary_field = np.concatenate((
@@ -2720,6 +3301,10 @@ else:
         report = "%s: Ex %.4f%%, Ey %.4f%%, boundary field %.4f%% of peak" % (
             object_name, 100.0 * ex_fraction, 100.0 * ey_fraction, 100.0 * edge_fraction,
         )
+        if local_te_fraction is not None:
+            report += ", local TE %.4f%% normal to %.6g deg axis" % (
+                100.0 * local_te_fraction, propagation_angle_deg,
+            )
         selection = {}
         if object_kind == "monitor":
             selection = dict(WAVEGUIDE_MODE_SELECTIONS.get(object_name, {}))
@@ -2729,16 +3314,28 @@ else:
             )
         elif object_name in PORT_MODE_SELECTIONS:
             selection = dict(PORT_MODE_SELECTIONS.get(object_name, {}))
-            report += ", selected neff %.6g (shared target %.6g)" % (
-                float(selection.get("neff", 0.0)),
-                float(selection.get("target neff", 0.0)),
-            )
+            if "target neff" in selection:
+                report += ", selected neff %.6g (shared target %.6g)" % (
+                    float(selection.get("neff", 0.0)),
+                    float(selection.get("target neff", 0.0)),
+                )
+            else:
+                report += ", selected mode %d from pair %r" % (
+                    int(selection.get("mode number", preferred_mode_number)),
+                    selection.get("candidate mode numbers", []),
+                )
         PORT_POLARIZATION_REPORT.append(report)
         print(report)
-        if resolved_required_polarization == "Ey" and ey_power <= ex_power:
+        if local_te_required and local_te_fraction is not None and local_te_fraction <= 0.5:
+            PORT_POLARIZATION_VALID = False
+            print(
+                "ERROR — %s is not polarized normal to its propagation/grating axis; do not run the FDTD solve."
+                % label
+            )
+        if not local_te_required and resolved_required_polarization == "Ey" and ey_power <= ex_power:
             PORT_POLARIZATION_VALID = False
             print("ERROR — %s is not Ey-dominant; do not run the FDTD solve." % label)
-        if resolved_required_polarization == "Ex" and ex_power <= ey_power:
+        if not local_te_required and resolved_required_polarization == "Ex" and ex_power <= ey_power:
             PORT_POLARIZATION_VALID = False
             print("ERROR — %s is not Ex-dominant; do not run the FDTD solve." % label)
         if (label.startswith("Waveguide") or label.startswith("MMI")) and edge_fraction > 0.05:
@@ -2795,7 +3392,8 @@ PORT_MODE_VALID = bool(PORT_POLARIZATION_VALID and PORT_MODE_CONFINEMENT_VALID)
 '''
 
 
-_REMOTE_RESOURCE_AND_SAVE = r'''import time
+_REMOTE_RESOURCE_AND_SAVE = r'''import re
+import time
 
 resource_mode = str(SETTINGS.get("resource_mode", "GPU")).strip().upper()
 TOTAL_CORES = max(1, min(int(SETTINGS.get("build_cpu_threads", 30)), os.cpu_count() or 1))
@@ -2828,16 +3426,19 @@ if resource_mode == "GPU":
     print("  GPU resource active:", fdtd.getresource("FDTD", 1, "active"))
     print("  CPU support resource active:", fdtd.getresource("FDTD", 2, "active"))
     print("  SM licence estimate:", fdtd.getresource("FDTD", 1, "sm estimate"))
-    try:
-        estimate = fdtd.getlicenseestimate("FDTD", "1")
-        print("  GPU licence feature:", estimate.get("feature"))
-        print("  GPU single-run licences:", estimate.get("single"))
-    except Exception as exc:
-        print("  GPU licence-estimate warning:", str(exc)[:180])
-    try:
-        print("  GPU system check:", fdtd.runsystemcheck("FDTD", "GPU"))
-    except Exception as exc:
-        print("  GPU system-check warning:", str(exc)[:180])
+    if bool(SETTINGS.get("run_gpu_system_check", False)):
+        try:
+            estimate = fdtd.getlicenseestimate("FDTD", "1")
+            print("  GPU licence feature:", estimate.get("feature"))
+            print("  GPU single-run licences:", estimate.get("single"))
+        except Exception as exc:
+            print("  GPU licence-estimate warning:", str(exc)[:180])
+        try:
+            print("  GPU system check:", fdtd.runsystemcheck("FDTD", "GPU"))
+        except Exception as exc:
+            print("  GPU system-check warning:", str(exc)[:180])
+    else:
+        print("  GPU diagnostic skipped by cell 1; the solve still explicitly requests GPU.")
 elif resource_mode == "CPU":
     fdtd.setresource("FDTD", 1, "active", False)
     fdtd.setresource("FDTD", 2, "device type", "CPU")
@@ -2854,19 +3455,72 @@ if GRATING_ANALYSIS:
         raise RuntimeError("The passive fiber measurement port must be distinct from the upper fiber source port")
     fdtd.select("FDTD::ports")
     fdtd.set("source port", str(GRATING_ANALYSIS["fiber_port_name"]))
-    fiber_source_mode = str(GRATING_ANALYSIS.get("fiber_source_mode", "mode 2"))
+    fiber_source_mode = str(GRATING_ANALYSIS.get("fiber_source_mode", "auto local TE"))
+    if not re.match(r"^mode\s+[1-9][0-9]*$", fiber_source_mode.strip(), flags=re.IGNORECASE):
+        raise RuntimeError(
+            "The fiber source mode was not resolved from its near-degenerate pair before resource setup: "
+            + fiber_source_mode
+        )
+    fiber_measurement_mode = str(
+        GRATING_ANALYSIS.get("fiber_measurement_mode", "auto local TE")
+    )
+    if not re.match(r"^mode\s+[1-9][0-9]*$", fiber_measurement_mode.strip(), flags=re.IGNORECASE):
+        raise RuntimeError(
+            "The passive fiber measurement mode was not resolved from its near-degenerate pair: "
+            + fiber_measurement_mode
+        )
     fdtd.set("source mode", fiber_source_mode)
+    configured_fiber_source_mode = str(fdtd.get("source mode")).strip()
+    requested_source_match = re.fullmatch(
+        r"mode\s+([1-9][0-9]*)", fiber_source_mode.strip(), flags=re.IGNORECASE
+    )
+    configured_source_match = re.fullmatch(
+        r"mode\s+([1-9][0-9]*)", configured_fiber_source_mode, flags=re.IGNORECASE
+    )
+    if (
+        requested_source_match is None
+        or configured_source_match is None
+        or int(requested_source_match.group(1)) != int(configured_source_match.group(1))
+    ):
+        raise RuntimeError(
+            "The FDTD port group did not retain the verified local-TE source mode: "
+            "requested %r, configured %r"
+            % (fiber_source_mode, configured_fiber_source_mode)
+        )
+    source_selection = dict(PORT_MODE_SELECTIONS.get(
+        str(GRATING_ANALYSIS["fiber_port_name"]), {}
+    ))
+    source_mode_number = int(requested_source_match.group(1))
+    source_te_score = float(
+        dict(source_selection.get("local TE scores", {})).get(
+            str(source_mode_number), 0.0
+        )
+    )
+    if source_te_score < float(source_selection.get("minimum local TE fraction", 0.8)):
+        raise RuntimeError(
+            "Configured fiber source mode %d is not the verified local-TE/Ey winner; "
+            "score %.6g, selection metadata %r"
+            % (source_mode_number, source_te_score, source_selection)
+        )
     print("Grating excitation source: FDTD::ports::" + str(GRATING_ANALYSIS["fiber_port_name"]))
     print("Grating excitation direction: Backward along the tilted Z-axis fiber port")
     print(
-        "Grating excitation mode: %s (%s-dominant polarization)"
-        % (fiber_source_mode, GRATING_ANALYSIS.get("fiber_polarization", "Ey"))
+        "Grating excitation mode: %s (%s, normal to grating axis %.6g deg)"
+        % (
+            fiber_source_mode,
+            GRATING_ANALYSIS.get("fiber_polarization", "local TE"),
+            float(GRATING_ANALYSIS.get("fiber_axis_orientation_deg", 0.0)),
+        )
+    )
+    print(
+        "Verified active fiber source readback: %s, local-TE score %.6f."
+        % (configured_fiber_source_mode, source_te_score)
     )
     print(
         "Passive fiber measurement: FDTD::ports::%s (%s); it is not selected as a source."
         % (
             GRATING_ANALYSIS["fiber_input_measurement_port_name"],
-            GRATING_ANALYSIS.get("fiber_measurement_mode", fiber_source_mode),
+            fiber_measurement_mode,
         )
     )
     print("Waveguide total-power monitor: " + str(GRATING_ANALYSIS["waveguide_power_monitor_name"]))
@@ -2908,26 +3562,31 @@ if not _project_name.lower().endswith(".fsp"):
 REMOTE_FSP_DIR = os.path.join(REMOTE_WORK, "fsp")
 os.makedirs(REMOTE_FSP_DIR, exist_ok=True)
 REMOTE_PROJECT_FILE = os.path.join(REMOTE_FSP_DIR, _project_name)
+REMOTE_INSPECTION_PROJECT_FILE = os.path.join(REMOTE_FSP_DIR, "inspection_" + _project_name)
+REMOTE_INSPECTION_FSP_SAVED = False
+REMOTE_FINAL_FSP_SAVED = False
 
 
-def save_verified_project():
+def save_verified_project(project_path=REMOTE_PROJECT_FILE):
     """Save to shared storage and do not report success until a non-empty .fsp exists."""
-    fdtd.save(REMOTE_PROJECT_FILE)
+    fdtd.save(project_path)
     for _attempt in range(40):
-        if os.path.isfile(REMOTE_PROJECT_FILE) and os.path.getsize(REMOTE_PROJECT_FILE) > 0:
+        if os.path.isfile(project_path) and os.path.getsize(project_path) > 0:
             print("Verified remote project: %s (%d bytes)" % (
-                REMOTE_PROJECT_FILE, os.path.getsize(REMOTE_PROJECT_FILE)
+                project_path, os.path.getsize(project_path)
             ))
-            return REMOTE_PROJECT_FILE
+            return project_path
         time.sleep(0.25)
     nearby = sorted(name for name in os.listdir(REMOTE_FSP_DIR) if name.lower().endswith(".fsp"))
     raise RuntimeError(
         "Lumerical save returned without creating %s. Nearby .fsp files: %s"
-        % (REMOTE_PROJECT_FILE, nearby)
+        % (project_path, nearby)
     )
 
 
-save_verified_project()
+save_verified_project(REMOTE_INSPECTION_PROJECT_FILE)
+REMOTE_INSPECTION_FSP_SAVED = True
+print("Saved required pre-solve inspection FSP.")
 '''
 
 
@@ -3048,6 +3707,7 @@ _SUMMARY_MAJOR_PARAMETERS = (
     ("L_extra", "Thick-end extension", "um"),
     ("wg_width", "Waveguide width", "um"),
     ("wg_length", "Waveguide length", "um"),
+    ("taper_exponent", "Grating taper exponent", ""),
     ("width", "Width", "um"),
     ("length", "Length", "um"),
     ("width_start", "Starting width", "um"),
@@ -3060,13 +3720,25 @@ _SUMMARY_MAJOR_PARAMETERS = (
     ("input_length", "Input access length", "um"),
     ("output_length", "Output access length", "um"),
     ("port_sep", "Output branch separation", "um"),
+    ("taper_power", "MMI taper profile exponent", ""),
+    ("taper_points", "MMI taper discretization points", ""),
+    ("input_reference_before_taper_um", "Input power-reference distance before taper", "um"),
+    ("fdtd_port_clearance_um", "MMI access-port clearance from waveguide end", "um"),
     ("fiber_offset", "Fiber offset", "um"),
     ("angle_theta", "Fiber angle theta", "deg"),
+    ("fiber_tox_offset_um", "Fiber bottom offset above SiO2 cladding", "um"),
     ("fiber_core_diameter_um", "Fiber core diameter", "um"),
+    ("fiber_core_index", "Fiber core refractive index", ""),
     ("fiber_cladding_diameter_um", "Fiber cladding diameter", "um"),
+    ("fiber_cladding_index", "Fiber cladding refractive index", ""),
     ("fiber_length_um", "Fiber length", "um"),
+    ("fiber_power_monitor_below_source_um", "Fiber power-plane distance below source", "um"),
+    ("fdtd_port_offset_from_waveguide_end_um", "Waveguide FDTD-port offset from waveguide end", "um"),
+    ("waveguide_monitor_span_um", "Waveguide mode-monitor transverse span", "um"),
+    ("waveguide_total_power_before_mode_um", "Total-power plane distance before waveguide mode plane", "um"),
     ("waveguide_effective_index", "Waveguide target effective index", ""),
     ("waveguide_neff_tolerance", "Waveguide effective-index tolerance", ""),
+    ("waveguide_mode_search_count", "Waveguide eigensolver modes searched", ""),
     ("tolerance", "Geometry build tolerance", "um"),
 )
 
@@ -3082,22 +3754,30 @@ def _summary_parameter_value(value):
 def _append_major_component_parameters(lines, component):
     params = dict(component.get("params", {}))
     found = 0
+    shown = set()
     for key, label, unit in _SUMMARY_MAJOR_PARAMETERS:
         if key not in params or params[key] in (None, ""):
             continue
         suffix = (" " + unit) if unit else ""
         lines.append("  - %s: %s%s" % (label, _summary_parameter_value(params[key]), suffix))
         found += 1
-    if not found:
-        ignored = {"name", "layer", "datatype"}
-        for key, value in params.items():
-            if key in ignored or key.endswith("_layer") or key.endswith("_datatype"):
-                continue
-            if isinstance(value, (bool, int, float, str)) and value not in (None, ""):
-                lines.append("  - %s: %s" % (str(key).replace("_", " ").title(), _summary_parameter_value(value)))
-                found += 1
-            if found >= 12:
-                break
+        shown.add(key)
+    # Preserve future geometry parameters even before they receive a curated
+    # label above.  Layer/datatype selectors are already captured by the exact
+    # JSON and material-stack sections, so omit only those layout identifiers.
+    ignored = {"name", "layer", "datatype"}
+    for key, value in params.items():
+        if (
+            key in shown or key in ignored or key.endswith("_layer")
+            or key.endswith("_datatype") or value in (None, "")
+        ):
+            continue
+        if isinstance(value, (bool, int, float, str, list, tuple, dict)):
+            lines.append(
+                "  - %s: %s"
+                % (str(key).replace("_", " ").title(), _summary_parameter_value(value))
+            )
+            found += 1
 
 
 def _fdtd_summary_value(property_name):
@@ -3110,7 +3790,8 @@ def _fdtd_summary_value(property_name):
 summary_lines = ["MAX LAYOUT — LUMERICAL SIMULATION SUMMARY"]
 _summary_section(summary_lines, "PROJECT")
 summary_lines.extend([
-    "Project file: %s" % REMOTE_PROJECT_FILE,
+    "Solved/final FSP: %s" % REMOTE_PROJECT_FILE,
+    "Pre-solve inspection FSP: %s" % REMOTE_INSPECTION_PROJECT_FILE,
     "Export scope: %s" % EXPORT_SCOPE_LABEL,
     "Run status: %s" % ("simulation completed" if SETTINGS.get("run_after_build", False) else "model built only; solve disabled"),
 ])
@@ -3285,6 +3966,13 @@ elif GRATING_ANALYSIS and isinstance(globals().get("GRATING_RESULT_ARRAYS"), dic
         )
     )
     summary_lines.append(
+        "- Grating coupling efficiency (dB): peak=%s dB | target=%s dB"
+        % (
+            _summary_number(10.0 * np.log10(max(coupling[peak_index], 1e-15))),
+            _summary_number(10.0 * np.log10(max(coupling[target_index], 1e-15))),
+        )
+    )
+    summary_lines.append(
         "- Target power accounting: fiber forward=%s | fiber reflected=%s | fiber net=%s | waveguide mode=%s | waveguide total=%s"
         % (
             _summary_number(_grating_value_at("fiber_forward_power", target_index)),
@@ -3351,6 +4039,9 @@ with open(REMOTE_RESULTS_JSON, "w", encoding="utf-8") as stream:
     json.dump(
         {
             "project_file": REMOTE_PROJECT_FILE,
+            "inspection_project_file": (
+                REMOTE_INSPECTION_PROJECT_FILE if REMOTE_INSPECTION_FSP_SAVED else None
+            ),
             "simulation_ran": bool(SETTINGS.get("run_after_build", False)),
             "resource_mode": SETTINGS.get("resource_mode"),
             "saved_numeric_keys": sorted(RESULT_ARRAYS),
@@ -3371,7 +4062,22 @@ with open(REMOTE_RESULTS_JSON, "w", encoding="utf-8") as stream:
 for required_path in (REMOTE_RESULTS_NPZ, REMOTE_RESULTS_JSON, REMOTE_TEXT_SUMMARY):
     if not os.path.isfile(required_path) or os.path.getsize(required_path) <= 0:
         raise RuntimeError("Required result artifact was not created: " + required_path)
-save_verified_project()
+save_verified_project(REMOTE_PROJECT_FILE)
+REMOTE_FINAL_FSP_SAVED = True
+print("Saved solved/final FSP:", REMOTE_PROJECT_FILE)
+if (
+    os.path.isfile(globals().get("REMOTE_RUNTIME_PROJECT_FILE", ""))
+    and os.path.abspath(REMOTE_RUNTIME_PROJECT_FILE)
+    not in {
+        os.path.abspath(REMOTE_PROJECT_FILE),
+        os.path.abspath(REMOTE_INSPECTION_PROJECT_FILE),
+    }
+):
+    try:
+        os.remove(REMOTE_RUNTIME_PROJECT_FILE)
+        print("Removed transient runtime project after result extraction.")
+    except Exception as exc:
+        print("Transient runtime cleanup warning:", str(exc)[:180])
 print("Saved result bundle:", REMOTE_RESULTS_NPZ)
 print("Saved result summary:", REMOTE_RESULTS_JSON)
 print("Saved human-readable summary:", REMOTE_TEXT_SUMMARY)
@@ -3414,7 +4120,10 @@ else:
                 return match
         raise KeyError("none of %r is present; available fields: %r" % (candidates, available))
 
-    def _one_spectrum(dataset, value_key, magnitude=True):
+    def _one_spectrum(
+        dataset, value_key, magnitude=True,
+        selected_mode_number=0, selected_mode_order=None,
+    ):
         wavelength_key = _find_result_key(dataset, "lambda", "wavelength") if any(
             _normalized_result_key(key) in {"lambda", "wavelength"} for key in dataset.keys()
         ) else None
@@ -3425,6 +4134,7 @@ else:
             wavelength = 299792458.0 / np.squeeze(np.asarray(dataset[frequency_key], dtype=float)).ravel()
         resolved_value_key = _find_result_key(dataset, value_key)
         values = np.squeeze(np.asarray(dataset[resolved_value_key]))
+        raw_value_shape = tuple(values.shape)
         if values.ndim == 0:
             values = np.full(wavelength.size, values)
         elif values.ndim == 1:
@@ -3436,7 +4146,67 @@ else:
                     "Could not align %s data shape %s with %d wavelengths"
                     % (resolved_value_key, values.shape, wavelength.size)
                 )
-            values = np.moveaxis(values, wavelength_axes[0], 0).reshape(wavelength.size, -1)[:, 0]
+            values = np.moveaxis(values, wavelength_axes[0], 0)
+            if int(selected_mode_number) > 0:
+                selected_mode_number = int(selected_mode_number)
+                selected_mode_order = [
+                    int(value) for value in (selected_mode_order or [])
+                    if int(value) > 0
+                ]
+                mode_coordinates = np.asarray(dataset.get("n", [])).squeeze().ravel()
+                selected_from_coordinate = False
+                if mode_coordinates.size:
+                    mode_axes = [
+                        axis for axis, size in enumerate(values.shape[1:], start=1)
+                        if size == mode_coordinates.size
+                    ]
+                    matches = np.flatnonzero(np.isclose(
+                        mode_coordinates.astype(float), float(selected_mode_number)
+                    ))
+                    if mode_axes and matches.size:
+                        values = np.take(values, int(matches[0]), axis=mode_axes[0])
+                        selected_from_coordinate = True
+                if not selected_from_coordinate:
+                    flattened = values.reshape(wavelength.size, -1)
+                    if selected_mode_number in selected_mode_order:
+                        selected_column = selected_mode_order.index(selected_mode_number)
+                    elif flattened.shape[1] == 1:
+                        selected_column = 0
+                    else:
+                        raise RuntimeError(
+                            "Cannot identify selected fiber mode %d in %s shape %s; "
+                            "dataset n=%r, retained order=%r"
+                            % (
+                                selected_mode_number, resolved_value_key,
+                                raw_value_shape, mode_coordinates.tolist(),
+                                selected_mode_order,
+                            )
+                        )
+                    if selected_column >= flattened.shape[1]:
+                        raise RuntimeError(
+                            "Selected fiber mode %d maps to column %d but %s shape %s has only %d modal columns"
+                            % (
+                                selected_mode_number, selected_column,
+                                resolved_value_key, raw_value_shape,
+                                flattened.shape[1],
+                            )
+                        )
+                    values = flattened[:, selected_column]
+                else:
+                    values = np.squeeze(values)
+                    if values.ndim > 1:
+                        flattened = values.reshape(wavelength.size, -1)
+                        if flattened.shape[1] != 1:
+                            raise RuntimeError(
+                                "Selected fiber mode %d left ambiguous %s shape %s after using dataset n=%r"
+                                % (
+                                    selected_mode_number, resolved_value_key,
+                                    values.shape, mode_coordinates.tolist(),
+                                )
+                            )
+                        values = flattened[:, 0]
+            else:
+                values = values.reshape(wavelength.size, -1)[:, 0]
         if values.size != wavelength.size:
             raise RuntimeError(
                 "%s returned %d values for %d wavelengths"
@@ -3507,17 +4277,34 @@ else:
     fiber_expansion, fiber_result_path, fiber_result_name = _fiber_port_expansion(
         fiber_measurement_port_name, fiber_expansion_result_name
     )
+    fiber_measurement_mode_number = int(
+        GRATING_ANALYSIS.get("fiber_measurement_mode_number", 0)
+    )
+    fiber_measurement_mode_order = list(
+        GRATING_ANALYSIS.get("fiber_measurement_selected_mode_order", [])
+    )
+    if fiber_measurement_mode_number <= 0:
+        raise RuntimeError(
+            "The passive fiber plane has no verified local-TE/Ey mode number; "
+            "refusing to normalize with an arbitrary modal column."
+        )
     fiber_forward_key = _find_result_key(fiber_expansion, "T_in", "Tin", "T in")
     fiber_reflected_key = _find_result_key(fiber_expansion, "T_out", "Tout", "T out")
     fiber_net_key = _find_result_key(fiber_expansion, "Tnet", "T_net", "T net")
     fiber_wavelength_m, fiber_forward_raw = _one_spectrum(
-        fiber_expansion, fiber_forward_key, magnitude=True
+        fiber_expansion, fiber_forward_key, magnitude=True,
+        selected_mode_number=fiber_measurement_mode_number,
+        selected_mode_order=fiber_measurement_mode_order,
     )
     reflected_wavelength_m, fiber_reflected_raw = _one_spectrum(
-        fiber_expansion, fiber_reflected_key, magnitude=True
+        fiber_expansion, fiber_reflected_key, magnitude=True,
+        selected_mode_number=fiber_measurement_mode_number,
+        selected_mode_order=fiber_measurement_mode_order,
     )
     net_wavelength_m, fiber_net_raw = _one_spectrum(
-        fiber_expansion, fiber_net_key, magnitude=False
+        fiber_expansion, fiber_net_key, magnitude=False,
+        selected_mode_number=fiber_measurement_mode_number,
+        selected_mode_order=fiber_measurement_mode_order,
     )
     fiber_forward_power = np.interp(wavelengths_m, fiber_wavelength_m, fiber_forward_raw)
     fiber_reflected_power = np.interp(wavelengths_m, reflected_wavelength_m, fiber_reflected_raw)
@@ -3539,6 +4326,19 @@ else:
     fiber_coupling = waveguide_mode_power_source_normalized / np.maximum(
         fiber_forward_power, normalization_floor
     )
+    fiber_coupling_db = 10.0 * np.log10(np.maximum(fiber_coupling, normalization_floor))
+    if not np.all(np.isfinite(fiber_forward_power)) or float(np.max(fiber_forward_power)) < 0.1:
+        raise RuntimeError(
+            "The verified local-TE/Ey fiber mode %d carries too little forward power at the passive plane "
+            "(maximum %.6g). Check source-mode readback, passive-mode identity, and plane alignment."
+            % (fiber_measurement_mode_number, float(np.nanmax(fiber_forward_power)))
+        )
+    if not np.all(np.isfinite(fiber_coupling)) or float(np.max(fiber_coupling)) > 1.05:
+        raise RuntimeError(
+            "Unphysical grating coupling efficiency after selecting local-TE/Ey fiber mode %d: "
+            "maximum %.6g. The result will not be plotted or saved."
+            % (fiber_measurement_mode_number, float(np.nanmax(fiber_coupling)))
+        )
     mode_selection = dict(WAVEGUIDE_MODE_SELECTIONS.get(waveguide_mode_monitor_name, {}))
     selected_neff = float(mode_selection.get("neff", GRATING_ANALYSIS.get("waveguide_target_neff", 2.5)))
     selected_mode_number = int(mode_selection.get("mode number", 0))
@@ -3551,6 +4351,11 @@ else:
             fiber_reflected_key,
             fiber_net_key,
         )
+    )
+    print(
+        "Passive fiber accounting selects verified local-TE/Ey eigensolver mode %d "
+        "from retained order %r; no orthogonal-polarization power is included."
+        % (fiber_measurement_mode_number, fiber_measurement_mode_order)
     )
     print(
         "Incident-normalized grating CE = source-normalized %s power of waveguide mode %d "
@@ -3575,6 +4380,13 @@ else:
         "waveguide_total_power": waveguide_total_power,
         "waveguide_transmission": waveguide_mode_power_source_normalized,
         "fiber_coupling": fiber_coupling,
+        "fiber_coupling_db": fiber_coupling_db,
+        "fiber_source_mode_number": np.asarray([
+            int(GRATING_ANALYSIS.get("fiber_source_mode_number", 0))
+        ]),
+        "fiber_measurement_mode_number": np.asarray([
+            fiber_measurement_mode_number
+        ]),
         "waveguide_selected_neff": np.asarray([selected_neff]),
         "waveguide_selected_mode_number": np.asarray([selected_mode_number]),
         "target_wavelength_m": np.asarray([wavelength_target_m]),
@@ -3590,6 +4402,8 @@ else:
 
 
 _MMI_ANALYSIS_REMOTE = r'''# Mode-1 input to the two MMI output waveguides.
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 if not MMI_ANALYSIS:
@@ -3981,11 +4795,15 @@ import json
 import os
 import re
 import socket
+import time
 import uuid
 import numpy as np
 
-SWEEP_CHECKPOINT_SCHEMA = 4
-SWEEP_RUNTIME_VERSION = "max-layout-sweep-runtime-v4"
+SWEEP_CHECKPOINT_SCHEMA = 5
+SWEEP_RUNTIME_VERSION = "max-layout-sweep-runtime-v5"
+SWEEP_CODE_FINGERPRINT = str(globals().get(
+    "SWEEP_CODE_FINGERPRINT", SWEEP_RUNTIME_VERSION
+))
 
 
 class SweepResultSchemaError(RuntimeError):
@@ -3996,10 +4814,328 @@ SWEEP_CHECKPOINT_DIR = globals().get(
     os.path.join(REMOTE_WORK, "sweep-checkpoint-" + str(SWEEP_HASH)[:12]),
 )
 os.makedirs(SWEEP_CHECKPOINT_DIR, exist_ok=True)
+SWEEP_PROGRESS_FILE = str(globals().get(
+    "SWEEP_PROGRESS_FILE", os.path.join(REMOTE_WORK, "sweep_live_progress.jsonl")
+))
+_SWEEP_PROGRESS_SEQUENCE = 0
+_SWEEP_PROGRESS_STARTED = time.monotonic()
 SWEEP_BASE_PORTS_BY_NAME = {
     str(port.get("name", "")): dict(port) for port in PORTS
 }
 SWEEP_BASE_PORT_Z_M = {}
+SWEEP_FIBER_MODE_SELECTIONS = {
+    str(name): dict(selection)
+    for name, selection in dict(globals().get(
+        "SWEEP_FIBER_MODE_SELECTIONS",
+        globals().get("PORT_MODE_SELECTIONS", {}),
+    )).items()
+    if "candidate mode numbers" in dict(selection)
+}
+
+
+def _restore_sweep_fiber_mode_contract():
+    """Restore resolved local-TE identities and the active source mode."""
+    if not GRATING_ANALYSIS:
+        return
+    ports_by_name = {str(port.get("name", "")): port for port in PORTS}
+    source_name = str(GRATING_ANALYSIS.get("fiber_port_name", ""))
+    measurement_name = str(
+        GRATING_ANALYSIS.get("fiber_input_measurement_port_name", "")
+    )
+    source_mode_number = 0
+    for name, selection in SWEEP_FIBER_MODE_SELECTIONS.items():
+        selected_mode = max(1, int(selection.get("mode number", 1)))
+        selected_order = [
+            max(1, int(value))
+            for value in selection.get(
+                "selected mode order",
+                selection.get("candidate mode numbers", [selected_mode]),
+            )
+        ]
+        selected_order = list(dict.fromkeys(selected_order))
+        if not selected_order:
+            selected_order = [selected_mode]
+        port = ports_by_name.get(str(name))
+        if port is not None:
+            port["mode number"] = selected_mode
+            port["polarization"] = "local TE"
+            port["selected mode order"] = list(selected_order)
+        if str(name) == source_name:
+            GRATING_ANALYSIS["fiber_source_mode"] = "mode %d" % selected_mode
+            GRATING_ANALYSIS["fiber_source_mode_number"] = selected_mode
+            GRATING_ANALYSIS["fiber_polarization"] = "local TE"
+            GRATING_ANALYSIS["fiber_selected_mode_order"] = list(selected_order)
+            source_mode_number = selected_mode
+        if str(name) == measurement_name:
+            GRATING_ANALYSIS["fiber_measurement_mode"] = "mode %d" % selected_mode
+            GRATING_ANALYSIS["fiber_measurement_mode_number"] = selected_mode
+            GRATING_ANALYSIS["fiber_measurement_selected_mode_order"] = list(
+                selected_order
+            )
+    if not source_name:
+        return
+    if source_mode_number <= 0:
+        raise RuntimeError(
+            "The sweep has no verified local-TE/Ey source mode for %s" % source_name
+        )
+    fdtd.select("FDTD::ports")
+    fdtd.set("source port", source_name)
+    fdtd.set("source mode", "mode %d" % source_mode_number)
+    configured_source_mode = str(fdtd.get("source mode")).strip()
+    if configured_source_mode.lower() != ("mode %d" % source_mode_number).lower():
+        raise RuntimeError(
+            "The sweep could not activate its verified local-TE/Ey source mode: "
+            "requested mode %d, configured %r"
+            % (source_mode_number, configured_source_mode)
+        )
+
+
+def _sweep_mode_profile_vector(mode_profile, mode_number):
+    """Read one selected fiber mode as a complex Cartesian (..., 3) field."""
+    available = list(mode_profile.keys())
+    for key in ("E%d" % int(mode_number), "E"):
+        if key not in available:
+            continue
+        electric = np.asarray(mode_profile[key])
+        if electric.ndim == 0:
+            continue
+        component_axis = (
+            electric.ndim - 1
+            if electric.shape[-1] == 3
+            else next(
+                (axis for axis in reversed(range(electric.ndim)) if electric.shape[axis] == 3),
+                None,
+            )
+        )
+        if component_axis is None:
+            continue
+        electric = np.moveaxis(electric, component_axis, -1)
+        if key == "E":
+            mode_coordinates = np.asarray(mode_profile.get("n", [])).ravel()
+            if mode_coordinates.size > 1:
+                mode_axes = [
+                    axis for axis, size in enumerate(electric.shape[:-1])
+                    if size == mode_coordinates.size
+                ]
+                if mode_axes:
+                    matches = np.flatnonzero(
+                        np.isclose(mode_coordinates.astype(float), float(mode_number))
+                    )
+                    mode_index = int(matches[0]) if matches.size else int(mode_number) - 1
+                    if not 0 <= mode_index < mode_coordinates.size:
+                        continue
+                    electric = np.take(electric, mode_index, axis=mode_axes[-1])
+        electric = np.squeeze(electric)
+        while electric.ndim > 3:
+            electric = np.take(electric, 0, axis=-2)
+        if electric.ndim >= 2 and electric.shape[-1] == 3:
+            return np.asarray(electric, dtype=complex)
+    raise RuntimeError(
+        "Fiber mode %d has no readable vector E field; available fields: %r"
+        % (int(mode_number), available)
+    )
+
+
+def _sweep_reselect_fiber_local_te(port_path, port, previous_selection):
+    """Re-score the degenerate pair after a tilted fiber geometry change."""
+    selector = globals().get("_select_fiber_local_te_mode")
+    if callable(selector):
+        return dict(selector(fdtd, port_path, port))
+    candidates = [
+        int(value)
+        for value in port.get(
+            "candidate mode numbers",
+            previous_selection.get("candidate mode numbers", [1, 2]),
+        )
+        if int(value) > 0
+    ]
+    candidates = list(dict.fromkeys(candidates))[:2]
+    if len(candidates) != 2:
+        raise RuntimeError("A fiber sweep requires exactly two candidate modes")
+    fdtd.select(port_path)
+    fdtd.updateportmodes(np.asarray(candidates, dtype=int))
+    profile = fdtd.getresult(port_path, "mode profiles")
+    phi_deg = float(port.get("angle phi", 0.0)) % 360.0
+    phi = np.deg2rad(phi_deg)
+    target_x, target_y = -np.sin(phi), np.cos(phi)
+    scores = {}
+    for mode_number in candidates:
+        electric = _sweep_mode_profile_vector(profile, mode_number)
+        desired = target_x * electric[..., 0] + target_y * electric[..., 1]
+        scores[mode_number] = float(np.sum(np.abs(desired) ** 2)) / max(
+            float(np.sum(np.abs(electric) ** 2)), 1e-300
+        )
+    selected_mode = max(candidates, key=lambda number: scores[number])
+    minimum_fraction = float(port.get("minimum local TE fraction", 0.8))
+    if scores[selected_mode] < minimum_fraction:
+        raise RuntimeError(
+            "No fiber mode is sufficiently normal to the %.6g degree grating axis: %r"
+            % (phi_deg, scores)
+        )
+    # The pair was just calculated in candidate order.  Select the source by
+    # its eigensolver mode number; do not run the same two-mode calculation a
+    # second time simply to reorder the stored results.
+    selected_order = list(candidates)
+    neff_delta = None
+    try:
+        neff_dataset = fdtd.getresult(port_path, "neff")
+        normalized_keys = {
+            "".join(character for character in str(key).lower() if character.isalnum()): key
+            for key in neff_dataset.keys()
+        }
+        neff_values = []
+        for mode_number in candidates:
+            key = normalized_keys.get("neff%d" % mode_number)
+            if key is not None:
+                values = np.real(np.asarray(neff_dataset[key])).ravel()
+                finite = values[np.isfinite(values)]
+                if finite.size:
+                    neff_values.append(float(np.median(finite)))
+        if len(neff_values) < 2 and normalized_keys.get("neff") is not None:
+            values = np.real(
+                np.asarray(neff_dataset[normalized_keys["neff"]])
+            ).ravel()
+            finite = values[np.isfinite(values)]
+            if finite.size >= 2:
+                neff_values = list(map(float, finite[:2]))
+        if len(neff_values) >= 2:
+            neff_delta = abs(neff_values[0] - neff_values[1])
+            tolerance = max(
+                0.0, float(port.get("mode degeneracy tolerance", 0.01))
+            )
+            if neff_delta > tolerance:
+                raise RuntimeError(
+                    "Fiber modes %r are not near-degenerate after tilt update: "
+                    "delta neff %.6g > %.6g"
+                    % (candidates, neff_delta, tolerance)
+                )
+    except RuntimeError:
+        raise
+    except Exception:
+        # Some Lumerical builds expose only profile fields here.  The nominal
+        # seed-build degeneracy check has already validated this same pair.
+        neff_delta = None
+    selection = dict(previous_selection)
+    selection.update({
+        "mode number": int(selected_mode),
+        "selected mode order": list(selected_order),
+        "candidate mode numbers": list(candidates),
+        "local TE scores": {str(key): float(value) for key, value in scores.items()},
+        "grating axis deg": float(phi_deg),
+        "target polarization xy": [float(target_x), float(target_y)],
+        "polarization": "local TE",
+        "neff degeneracy delta": neff_delta,
+    })
+    print(
+        "Re-selected fiber port %s mode %d from pair %r after tilt update; local-TE scores %r."
+        % (port.get("name", port_path), selected_mode, candidates, scores)
+    )
+    return selection
+
+
+def _sweep_reuse_verified_fiber_local_te(port_path, port, source_selection):
+    """Calculate only the source's verified winner at the passive plane."""
+    reusable = globals().get("_reuse_verified_fiber_local_te_mode")
+    if callable(reusable):
+        return dict(reusable(fdtd, port_path, port, source_selection))
+    selected_mode = max(1, int(source_selection.get("mode number", 1)))
+    fdtd.select(port_path)
+    fdtd.updateportmodes(selected_mode)
+    profile = fdtd.getresult(port_path, "mode profiles")
+    phi_deg = float(port.get("angle phi", 0.0)) % 360.0
+    phi = np.deg2rad(phi_deg)
+    target_x, target_y = -np.sin(phi), np.cos(phi)
+    electric = _sweep_mode_profile_vector(profile, selected_mode)
+    desired = target_x * electric[..., 0] + target_y * electric[..., 1]
+    score = float(np.sum(np.abs(desired) ** 2)) / max(
+        float(np.sum(np.abs(electric) ** 2)), 1e-300
+    )
+    if score < float(port.get("minimum local TE fraction", 0.8)):
+        return _sweep_reselect_fiber_local_te(
+            port_path, port, source_selection
+        )
+    selection = dict(source_selection)
+    selection.update({
+        "mode number": selected_mode,
+        "selected mode order": [selected_mode],
+        "local TE scores": {str(selected_mode): score},
+        "grating axis deg": phi_deg,
+        "target polarization xy": [float(target_x), float(target_y)],
+        "polarization": "local TE",
+        "inherited from source mode": True,
+    })
+    return selection
+
+
+_restore_sweep_fiber_mode_contract()
+
+
+def _sweep_json_value(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(key): _sweep_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sweep_json_value(item) for item in value]
+    return value
+
+
+def _emit_sweep_progress(
+    status, case_index=-1, completed_count=0, failed_count=0,
+    case_seconds=None, primary_name=None, wavelength_m=None, response=None,
+    error=None,
+):
+    """Append one durable status row; reporting must never interrupt a solve."""
+    global _SWEEP_PROGRESS_SEQUENCE
+    try:
+        case_index = int(case_index)
+        case = SWEEP_CASES[case_index] if 0 <= case_index < len(SWEEP_CASES) else {}
+        row = {
+            "progress_type": "sweep",
+            "sequence": int(_SWEEP_PROGRESS_SEQUENCE),
+            "status": str(status),
+            "case_index": case_index,
+            "completed_count": int(completed_count),
+            "failed_count": int(failed_count),
+            "total_count": int(len(SWEEP_CASES)),
+            "values": _sweep_json_value(case.get("values", {})),
+            "display_label": str(case.get("display_label", "")),
+            "elapsed_seconds": float(time.monotonic() - _SWEEP_PROGRESS_STARTED),
+        }
+        if case_seconds is not None:
+            row["case_seconds"] = float(case_seconds)
+        if primary_name is not None:
+            row["primary_name"] = str(primary_name)
+        if wavelength_m is not None and response is not None:
+            wavelength = np.asarray(wavelength_m, dtype=float).ravel()
+            values = np.asarray(response, dtype=float).ravel()
+            finite = np.isfinite(values)
+            if wavelength.size == values.size and np.any(finite):
+                finite_indices = np.flatnonzero(finite)
+                peak_index = int(finite_indices[np.argmax(values[finite])])
+                row["peak_response"] = float(values[peak_index])
+                row["peak_wavelength_nm"] = float(wavelength[peak_index] / 1e-9)
+        if error is not None:
+            row["error"] = str(error)[:1000]
+        os.makedirs(os.path.dirname(SWEEP_PROGRESS_FILE) or ".", exist_ok=True)
+        with open(SWEEP_PROGRESS_FILE, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _SWEEP_PROGRESS_SEQUENCE += 1
+    except Exception as progress_exc:
+        print("Sweep progress reporting warning:", str(progress_exc)[:240])
+
+
+def _sweep_checkpoint_spectrum(case_index):
+    with np.load(_sweep_case_npz(case_index), allow_pickle=False) as data:
+        return (
+            str(np.asarray(data["primary_name"]).ravel()[0]),
+            np.asarray(data["wavelength_m"], dtype=float).ravel(),
+            np.asarray(data["primary_response"], dtype=float).ravel(),
+        )
 
 
 def _sweep_safe_key(value):
@@ -4035,6 +5171,7 @@ def _apply_sweep_case(case_index):
     MONITORS = list(case["monitors"])
     GRATING_ANALYSIS = case.get("grating_analysis")
     MMI_ANALYSIS = case.get("mmi_analysis")
+    _restore_sweep_fiber_mode_contract()
 
     layer_builder_name = "Max Layout material stack"
     layer_x_um = float(np.asarray(fdtd.getnamed(layer_builder_name, "x")).squeeze()) / UM
@@ -4048,6 +5185,20 @@ def _apply_sweep_case(case_index):
     angle_theta_is_swept = any(
         str(axis.get("parameter", "")) == "angle_theta"
         for axis in SWEEP_SPEC.get("axes", [])
+    )
+    nonfiber_mode_sensitive_tokens = (
+        "width", "gap", "height", "thickness", "index", "diameter",
+        "cross_section",
+    )
+    fiber_only_mode_refresh = bool(
+        angle_theta_is_swept
+        and not any(
+            any(
+                token in str(axis.get("parameter", "")).lower()
+                for token in nonfiber_mode_sensitive_tokens
+            )
+            for axis in SWEEP_SPEC.get("axes", [])
+        )
     )
     for fiber in FIBER_GEOMETRIES:
         path = "::model::" + str(fiber["name"])
@@ -4119,14 +5270,74 @@ def _apply_sweep_case(case_index):
     if bool(SWEEP_RECOMPUTE_MODES):
         # Geometry width/gap sweeps change modal cross-sections.  Refresh only
         # for those axes; pitch/filling-factor sweeps reuse the nominal modes.
-        fdtd.runsetup()
-        for port in PORTS:
-            path = "FDTD::ports::" + str(port["name"])
+        # An angle sweep already rebuilt the scripted fiber once above.  Do
+        # not repeat the full structure-group setup before mode selection.
+        if not (angle_theta_is_swept and FIBER_GEOMETRIES):
+            fdtd.runsetup()
+        source_fiber_name = str(
+            GRATING_ANALYSIS.get("fiber_port_name", "")
+            if GRATING_ANALYSIS else ""
+        )
+        measurement_fiber_name = str(
+            GRATING_ANALYSIS.get("fiber_input_measurement_port_name", "")
+            if GRATING_ANALYSIS else ""
+        )
+        # Source first so the passive plane can reuse its verified physical
+        # polarization even if JSON/component order was changed by the user.
+        ports_for_mode_refresh = sorted(
+            PORTS,
+            key=lambda candidate: (
+                0 if str(candidate.get("name", "")) == source_fiber_name
+                else 1 if str(candidate.get("name", "")) == measurement_fiber_name
+                else 2
+            ),
+        )
+        for port in ports_for_mode_refresh:
+            name = str(port["name"])
+            path = "FDTD::ports::" + name
             fdtd.select(path)
-            mode_number = max(0, int(port.get("mode number", 0)))
-            fdtd.updateportmodes(mode_number) if mode_number else fdtd.updateportmodes()
+            fiber_selection = SWEEP_FIBER_MODE_SELECTIONS.get(name)
+            if fiber_only_mode_refresh and not fiber_selection:
+                # Fiber tilt does not change any waveguide access plane.
+                continue
+            if fiber_selection:
+                if name == source_fiber_name and angle_theta_is_swept:
+                    fiber_selection = _sweep_reselect_fiber_local_te(
+                        path, port, fiber_selection
+                    )
+                elif name == measurement_fiber_name:
+                    source_selection = SWEEP_FIBER_MODE_SELECTIONS.get(
+                        source_fiber_name, fiber_selection
+                    )
+                    fiber_selection = _sweep_reuse_verified_fiber_local_te(
+                        path, port, source_selection
+                    )
+                else:
+                    # The fiber angle/polarization did not change. Recalculate
+                    # only the already verified winner after geometry setup.
+                    selected_mode = max(
+                        1, int(fiber_selection.get("mode number", 1))
+                    )
+                    fdtd.updateportmodes(selected_mode)
+                    fiber_selection = dict(fiber_selection)
+                    fiber_selection["selected mode order"] = [selected_mode]
+                SWEEP_FIBER_MODE_SELECTIONS[name] = dict(fiber_selection)
+                selected_mode = max(1, int(fiber_selection.get("mode number", 1)))
+                selected_order = list(
+                    fiber_selection.get("selected mode order", [selected_mode])
+                )
+                port["mode number"] = selected_mode
+                port["selected mode order"] = list(selected_order)
+                port["polarization"] = "local TE"
+            else:
+                mode_number = max(0, int(port.get("mode number", 0)))
+                fdtd.updateportmodes(mode_number) if mode_number else fdtd.updateportmodes()
+        _restore_sweep_fiber_mode_contract()
         for monitor in MONITORS:
-            if str(monitor.get("monitor_kind", "")) == "Mode expansion monitor":
+            if (
+                not fiber_only_mode_refresh
+                and str(monitor.get("monitor_kind", "")) == "Mode expansion monitor"
+            ):
                 fdtd.select(str(monitor["name"]))
                 fdtd.updatemodes()
         if MMI_ANALYSIS:
@@ -4311,7 +5522,10 @@ def _sweep_mode_expansion_result(monitor_name, configured_result_name):
     )
 
 
-def _sweep_spectrum(dataset, value_key, magnitude=True):
+def _sweep_spectrum(
+    dataset, value_key, magnitude=True,
+    selected_mode_number=0, selected_mode_order=None,
+):
     if any(_sweep_normalized_key(key) in {"lambda", "wavelength"} for key in dataset.keys()):
         wavelength_key = _sweep_result_key(dataset, "lambda", "wavelength")
         wavelength_m = np.squeeze(np.asarray(dataset[wavelength_key], dtype=float)).ravel()
@@ -4320,6 +5534,7 @@ def _sweep_spectrum(dataset, value_key, magnitude=True):
         wavelength_m = 299792458.0 / np.squeeze(np.asarray(dataset[frequency_key], dtype=float)).ravel()
     resolved_key = _sweep_result_key(dataset, value_key)
     values = np.squeeze(np.asarray(dataset[resolved_key]))
+    raw_value_shape = tuple(values.shape)
     if values.ndim == 0:
         values = np.full(wavelength_m.size, values)
     elif values.ndim == 1:
@@ -4331,7 +5546,65 @@ def _sweep_spectrum(dataset, value_key, magnitude=True):
                 "Could not align %s shape %s with %d wavelengths"
                 % (resolved_key, values.shape, wavelength_m.size)
             )
-        values = np.moveaxis(values, wavelength_axes[0], 0).reshape(wavelength_m.size, -1)[:, 0]
+        values = np.moveaxis(values, wavelength_axes[0], 0)
+        if int(selected_mode_number) > 0:
+            selected_mode_number = int(selected_mode_number)
+            selected_mode_order = [
+                int(value) for value in (selected_mode_order or [])
+                if int(value) > 0
+            ]
+            mode_coordinates = np.asarray(dataset.get("n", [])).squeeze().ravel()
+            selected_from_coordinate = False
+            if mode_coordinates.size:
+                mode_axes = [
+                    axis for axis, size in enumerate(values.shape[1:], start=1)
+                    if size == mode_coordinates.size
+                ]
+                matches = np.flatnonzero(np.isclose(
+                    mode_coordinates.astype(float), float(selected_mode_number)
+                ))
+                if mode_axes and matches.size:
+                    values = np.take(values, int(matches[0]), axis=mode_axes[0])
+                    selected_from_coordinate = True
+            if not selected_from_coordinate:
+                flattened = values.reshape(wavelength_m.size, -1)
+                if selected_mode_number in selected_mode_order:
+                    selected_column = selected_mode_order.index(selected_mode_number)
+                elif flattened.shape[1] == 1:
+                    selected_column = 0
+                else:
+                    raise RuntimeError(
+                        "Cannot identify selected fiber mode %d in %s shape %s; "
+                        "dataset n=%r, retained order=%r"
+                        % (
+                            selected_mode_number, resolved_key, raw_value_shape,
+                            mode_coordinates.tolist(), selected_mode_order,
+                        )
+                    )
+                if selected_column >= flattened.shape[1]:
+                    raise RuntimeError(
+                        "Selected fiber mode %d maps to column %d but %s shape %s has only %d modal columns"
+                        % (
+                            selected_mode_number, selected_column, resolved_key,
+                            raw_value_shape, flattened.shape[1],
+                        )
+                    )
+                values = flattened[:, selected_column]
+            else:
+                values = np.squeeze(values)
+                if values.ndim > 1:
+                    flattened = values.reshape(wavelength_m.size, -1)
+                    if flattened.shape[1] != 1:
+                        raise RuntimeError(
+                            "Selected fiber mode %d left ambiguous %s shape %s after using dataset n=%r"
+                            % (
+                                selected_mode_number, resolved_key,
+                                values.shape, mode_coordinates.tolist(),
+                            )
+                        )
+                    values = flattened[:, 0]
+        else:
+            values = values.reshape(wavelength_m.size, -1)[:, 0]
     if values.size != wavelength_m.size:
         raise RuntimeError("%s returned %d values for %d wavelengths" % (resolved_key, values.size, wavelength_m.size))
     order = np.argsort(wavelength_m)
@@ -4381,11 +5654,33 @@ def _extract_sweep_result():
         fiber_name = str(GRATING_ANALYSIS["fiber_input_measurement_port_name"])
         fiber_result_name = str(GRATING_ANALYSIS.get("fiber_measurement_expansion_result_name", "expansion for port monitor"))
         fiber_data = _sweep_port_expansion(fiber_name, fiber_result_name)
+        measurement_selection = dict(SWEEP_FIBER_MODE_SELECTIONS.get(fiber_name, {}))
+        fiber_mode_number = int(GRATING_ANALYSIS.get(
+            "fiber_measurement_mode_number",
+            measurement_selection.get("mode number", 0),
+        ))
+        fiber_mode_order = list(GRATING_ANALYSIS.get(
+            "fiber_measurement_selected_mode_order",
+            measurement_selection.get("selected mode order", []),
+        ))
+        if fiber_mode_number <= 0:
+            raise SweepResultSchemaError(
+                "The passive fiber plane %r has no verified local-TE/Ey mode number"
+                % fiber_name
+            )
         try:
             input_key = _sweep_result_key(fiber_data, "T_in", "Tin", "T in")
             output_key = _sweep_result_key(fiber_data, "T_out", "Tout", "T out")
-            fiber_wavelength_m, fiber_forward = _sweep_spectrum(fiber_data, input_key)
-            reflected_wavelength_m, fiber_reflected = _sweep_spectrum(fiber_data, output_key)
+            fiber_wavelength_m, fiber_forward = _sweep_spectrum(
+                fiber_data, input_key,
+                selected_mode_number=fiber_mode_number,
+                selected_mode_order=fiber_mode_order,
+            )
+            reflected_wavelength_m, fiber_reflected = _sweep_spectrum(
+                fiber_data, output_key,
+                selected_mode_number=fiber_mode_number,
+                selected_mode_order=fiber_mode_order,
+            )
         except Exception as exc:
             raise SweepResultSchemaError(
                 "The passive fiber measurement port %r has an incompatible expansion schema: %s"
@@ -4394,6 +5689,17 @@ def _extract_sweep_result():
         fiber_forward = np.interp(wavelength_m, fiber_wavelength_m, fiber_forward)
         fiber_reflected = np.interp(wavelength_m, reflected_wavelength_m, fiber_reflected)
         coupling_efficiency = mode_power / np.maximum(fiber_forward, 1e-15)
+        if not np.all(np.isfinite(fiber_forward)) or float(np.max(fiber_forward)) < 0.1:
+            raise SweepResultSchemaError(
+                "The verified local-TE/Ey fiber mode %d carries too little forward power "
+                "at the passive plane (maximum %.6g)"
+                % (fiber_mode_number, float(np.nanmax(fiber_forward)))
+            )
+        if not np.all(np.isfinite(coupling_efficiency)) or float(np.max(coupling_efficiency)) > 1.05:
+            raise SweepResultSchemaError(
+                "Unphysical grating CE for verified local-TE/Ey fiber mode %d: maximum %.6g"
+                % (fiber_mode_number, float(np.nanmax(coupling_efficiency)))
+            )
         arrays.update(
             {
                 "coupling_efficiency": coupling_efficiency,
@@ -4509,7 +5815,8 @@ def _sweep_case_is_complete(case_index):
     try:
         with np.load(case_path, allow_pickle=False) as data:
             required = {
-                "checkpoint_schema", "runtime_version", "sweep_hash", "case_index",
+                "checkpoint_schema", "runtime_version", "code_fingerprint",
+                "sweep_hash", "case_index",
                 "wavelength_m", "primary_response", "primary_name",
             }
             expected_primary = _sweep_expected_primary_name()
@@ -4524,6 +5831,9 @@ def _sweep_case_is_complete(case_index):
                 return False
             stored_schema = int(np.asarray(data["checkpoint_schema"]).ravel()[0])
             stored_runtime = str(np.asarray(data["runtime_version"]).ravel()[0])
+            stored_code_fingerprint = str(
+                np.asarray(data["code_fingerprint"]).ravel()[0]
+            )
             stored_hash = str(np.asarray(data["sweep_hash"]).ravel()[0])
             stored_index = int(np.asarray(data["case_index"]).ravel()[0])
             wavelength_m = np.asarray(data["wavelength_m"], dtype=float).ravel()
@@ -4532,6 +5842,7 @@ def _sweep_case_is_complete(case_index):
         return bool(
             stored_schema == int(SWEEP_CHECKPOINT_SCHEMA)
             and stored_runtime == str(SWEEP_RUNTIME_VERSION)
+            and stored_code_fingerprint == str(SWEEP_CODE_FINGERPRINT)
             and stored_hash == str(SWEEP_HASH)
             and stored_index == int(case_index)
             and wavelength_m.size > 0
@@ -4550,6 +5861,7 @@ def _save_sweep_case(case_index, primary_name, wavelength_m, primary_response, a
     payload = {
         "checkpoint_schema": np.asarray([int(SWEEP_CHECKPOINT_SCHEMA)], dtype=int),
         "runtime_version": np.asarray([str(SWEEP_RUNTIME_VERSION)]),
+        "code_fingerprint": np.asarray([str(SWEEP_CODE_FINGERPRINT)]),
         "sweep_hash": np.asarray([str(SWEEP_HASH)]),
         "case_index": np.asarray([int(case_index)], dtype=int),
         "wavelength_m": np.asarray(wavelength_m, dtype=float),
@@ -4683,6 +5995,9 @@ def _finalize_sweep_results(failures):
     )
     manifest = {
         "sweep_hash": SWEEP_HASH,
+        "sweep_code_fingerprint": str(SWEEP_CODE_FINGERPRINT),
+        "checkpoint_schema": int(SWEEP_CHECKPOINT_SCHEMA),
+        "runtime_version": str(SWEEP_RUNTIME_VERSION),
         "component_uid": int(SWEEP_SPEC["component_uid"]),
         "component_kind": str(SWEEP_SPEC["component_kind"]),
         "axes": SWEEP_SPEC["axes"],
@@ -4699,6 +6014,7 @@ def _finalize_sweep_results(failures):
         "primary_name": primary_name,
         "failures": failures,
         "per_case_fsp_saved": False,
+        "best_fsp": None,
         "execution": str(globals().get("SWEEP_EXECUTION_MODE", "single-session-sequential")),
         "text_summary": SWEEP_TEXT_SUMMARY,
     }
@@ -4723,6 +6039,7 @@ def _finalize_sweep_results(failures):
         "pitch": ("Pitch", "um"),
         "fill_factor": ("Fill factor", ""),
         "duty_cycle": ("Duty cycle", ""),
+        "fill_factors": ("Apodized fill factors", ""),
         "N": ("Number of grating periods", ""),
         "target_length": ("Target grating length", "um"),
         "h_total": ("Device-layer thickness", "um"),
@@ -4734,6 +6051,7 @@ def _finalize_sweep_results(failures):
         "L_extra": ("Thick-end extension", "um"),
         "wg_width": ("Waveguide width", "um"),
         "wg_length": ("Waveguide length", "um"),
+        "taper_exponent": ("Grating taper exponent", ""),
         "mmi_width": ("MMI width", "um"),
         "mmi_length": ("MMI length", "um"),
         "taper_width": ("MMI taper width", "um"),
@@ -4742,31 +6060,61 @@ def _finalize_sweep_results(failures):
         "input_length": ("Input access length", "um"),
         "output_length": ("Output access length", "um"),
         "port_sep": ("Output branch separation", "um"),
+        "taper_power": ("MMI taper profile exponent", ""),
+        "taper_points": ("MMI taper discretization points", ""),
+        "input_reference_before_taper_um": ("Input power-reference distance before taper", "um"),
+        "fdtd_port_clearance_um": ("MMI access-port clearance from waveguide end", "um"),
         "fiber_offset": ("Fiber offset", "um"),
         "angle_theta": ("Fiber angle theta", "deg"),
+        "fiber_tox_offset_um": ("Fiber bottom offset above SiO2 cladding", "um"),
+        "fiber_core_diameter_um": ("Fiber core diameter", "um"),
+        "fiber_core_index": ("Fiber core refractive index", ""),
+        "fiber_cladding_diameter_um": ("Fiber cladding diameter", "um"),
+        "fiber_cladding_index": ("Fiber cladding refractive index", ""),
+        "fiber_length_um": ("Fiber length", "um"),
+        "fiber_power_monitor_below_source_um": ("Fiber power-plane distance below source", "um"),
+        "fdtd_port_offset_from_waveguide_end_um": ("Waveguide FDTD-port offset from waveguide end", "um"),
+        "waveguide_monitor_span_um": ("Waveguide mode-monitor transverse span", "um"),
+        "waveguide_total_power_before_mode_um": ("Total-power plane distance before waveguide mode plane", "um"),
         "waveguide_effective_index": ("Waveguide target effective index", ""),
         "waveguide_neff_tolerance": ("Waveguide effective-index tolerance", ""),
+        "waveguide_mode_search_count": ("Waveguide eigensolver modes searched", ""),
         "tolerance": ("Geometry build tolerance", "um"),
     }
+
+    def _sweep_parameter_value(value):
+        if isinstance(value, (dict, list, tuple)):
+            return _sweep_summary_json(value)
+        if isinstance(value, str):
+            return value
+        return _sweep_summary_number(value)
 
     def _append_sweep_major_parameters(lines, parameters, prefix="- "):
         parameters = dict(parameters or {})
         found = 0
+        shown = set()
         for key, (label, unit) in _sweep_parameter_details.items():
             if key not in parameters or parameters[key] in (None, ""):
                 continue
             suffix = (" " + unit) if unit else ""
             lines.append("%s%s: %s%s" % (
-                prefix, label, _sweep_summary_number(parameters[key]), suffix
+                prefix, label, _sweep_parameter_value(parameters[key]), suffix
             ))
             found += 1
-        if not found:
-            for key, value in parameters.items():
-                if isinstance(value, (bool, int, float, str)) and value not in (None, ""):
-                    lines.append("%s%s: %s" % (prefix, str(key).replace("_", " ").title(), str(value)))
-                    found += 1
-                if found >= 12:
-                    break
+            shown.add(key)
+        ignored = {"name", "layer", "datatype"}
+        for key, value in parameters.items():
+            if (
+                key in shown or key in ignored or key.endswith("_layer")
+                or key.endswith("_datatype") or value in (None, "")
+            ):
+                continue
+            if isinstance(value, (bool, int, float, str, list, tuple, dict)):
+                lines.append(
+                    "%s%s: %s"
+                    % (prefix, str(key).replace("_", " ").title(), _sweep_parameter_value(value))
+                )
+                found += 1
 
     best_peak_index = int(np.nanargmax(response_matrix[best_index]))
     best_peak_wavelength_m = float(reference_wavelength_m[best_peak_index])
@@ -4883,6 +6231,11 @@ def _finalize_sweep_results(failures):
             str(SETTINGS.get("resource_mode", "GPU")),
             str(SETTINGS.get("build_cpu_threads", 30)),
         ),
+        "- Reproducibility: checkpoint schema=%d | runtime=%s | code fingerprint=%s"
+        % (
+            int(SWEEP_CHECKPOINT_SCHEMA), str(SWEEP_RUNTIME_VERSION),
+            str(SWEEP_CODE_FINGERPRINT),
+        ),
         "- Numerical controls: mesh accuracy=%s | dt factor=%s | PML=%s | geometry/PML overlap=%s um"
         % (
             str(SETTINGS.get("mesh_accuracy", 2)),
@@ -4960,7 +6313,17 @@ def _finalize_sweep_results(failures):
             _sweep_summary_number(target_response[target_best_index]),
             _sweep_summary_number(100.0 * target_response[target_best_index]),
         ),
+        "Target-best major parameters:",
     ])
+    _append_sweep_major_parameters(
+        summary_lines, SWEEP_CASES[target_best_index].get("source_parameters", {})
+    )
+    summary_lines.append(
+        "Target-best exact source parameters (JSON): %s"
+        % _sweep_summary_json(
+            SWEEP_CASES[target_best_index].get("source_parameters", {})
+        )
+    )
 
     if primary_name == "output_1_over_input" and detail_matrices.get("output_2_over_input") is not None:
         _mmi_upper_over_input = detail_matrices["output_1_over_input"][best_index, target_index]
@@ -4995,7 +6358,10 @@ def _finalize_sweep_results(failures):
 
     _sweep_summary_section(summary_lines, "FSP PROVENANCE")
     summary_lines.append(
-        "per_case_fsp_saved=false. The saved nominal/baseline FSP represents the untouched project JSON and is not necessarily either winning sweep case. Re-run a winner as a single simulation to create a winner-specific FSP."
+        "per_case_fsp_saved=false. After the compact sweep completes, only the peak-best geometry is solved once more and saved as the required winning FSP."
+    )
+    summary_lines.append(
+        "Parity note: every sweep point uses the shared union FDTD domain. Compare a sweep spectrum with a standalone run only when geometry, material stack, mesh factors, wavelength sampling, ports, and FDTD bounds are all identical."
     )
     with open(SWEEP_TEXT_SUMMARY, "w", encoding="utf-8") as handle:
         handle.write("\n".join(summary_lines).rstrip() + "\n")
@@ -5004,6 +6370,7 @@ def _finalize_sweep_results(failures):
     print("Saved combined sweep results:", SWEEP_RESULTS_NPZ)
     print("Saved human-readable sweep summary:", SWEEP_TEXT_SUMMARY)
     print("Best sweep point:", manifest["best_values"], "maximum", manifest["best_maximum_response"])
+    return best_index
 '''
 
 
@@ -5013,22 +6380,63 @@ if resource_mode not in {"GPU", "CPU"}:
     raise ValueError("resource_mode must be GPU or CPU")
 failures = []
 schema_failure = None
+completed_count = 0
+failed_count = 0
+_SWEEP_PROGRESS_SEQUENCE = 0
+_SWEEP_PROGRESS_STARTED = time.monotonic()
+try:
+    if os.path.isfile(SWEEP_PROGRESS_FILE):
+        os.remove(SWEEP_PROGRESS_FILE)
+except Exception as progress_reset_exc:
+    print("Sweep progress reset warning:", str(progress_reset_exc)[:240])
+_emit_sweep_progress(
+    "started", completed_count=completed_count, failed_count=failed_count
+)
 for case_index, case in enumerate(SWEEP_CASES):
     case_path = _sweep_case_npz(case_index)
     if _sweep_case_is_complete(case_index):
+        completed_count += 1
+        reused_name, reused_wavelength_m, reused_response = _sweep_checkpoint_spectrum(
+            case_index
+        )
+        _emit_sweep_progress(
+            "reused", case_index=case_index, completed_count=completed_count,
+            failed_count=failed_count, case_seconds=0.0,
+            primary_name=reused_name, wavelength_m=reused_wavelength_m,
+            response=reused_response,
+        )
         print("Reusing completed sweep checkpoint %d/%d: %s" % (
             case_index + 1, len(SWEEP_CASES), case["display_label"]
         ))
         continue
+    case_started = time.monotonic()
+    _emit_sweep_progress(
+        "running", case_index=case_index, completed_count=completed_count,
+        failed_count=failed_count,
+    )
     try:
         _apply_sweep_case(case_index)
         fdtd.run("FDTD", resource_mode)
         primary_name, wavelength_m, primary_response, arrays = _extract_sweep_result()
         _save_sweep_case(case_index, primary_name, wavelength_m, primary_response, arrays)
+        completed_count += 1
+        _emit_sweep_progress(
+            "completed", case_index=case_index, completed_count=completed_count,
+            failed_count=failed_count,
+            case_seconds=time.monotonic() - case_started,
+            primary_name=primary_name, wavelength_m=wavelength_m,
+            response=primary_response,
+        )
         print("Completed sweep point %d/%d." % (case_index + 1, len(SWEEP_CASES)))
     except SweepResultSchemaError as exc:
         message = str(exc)
+        failed_count += 1
         failures.append({"index": int(case_index), "values": case["values"], "error": message})
+        _emit_sweep_progress(
+            "failed", case_index=case_index, completed_count=completed_count,
+            failed_count=failed_count,
+            case_seconds=time.monotonic() - case_started, error=message,
+        )
         print("SWEEP RESULT SCHEMA FAILED %d/%d; remaining solves were cancelled: %s" % (
             case_index + 1, len(SWEEP_CASES), message
         ))
@@ -5036,10 +6444,43 @@ for case_index, case in enumerate(SWEEP_CASES):
         break
     except Exception as exc:
         message = str(exc)
+        failed_count += 1
         failures.append({"index": int(case_index), "values": case["values"], "error": message})
+        _emit_sweep_progress(
+            "failed", case_index=case_index, completed_count=completed_count,
+            failed_count=failed_count,
+            case_seconds=time.monotonic() - case_started, error=message,
+        )
         print("SWEEP POINT FAILED %d/%d: %s" % (case_index + 1, len(SWEEP_CASES), message))
+best_sweep_index = None
 if schema_failure is None:
-    _finalize_sweep_results(failures)
+    best_sweep_index = _finalize_sweep_results(failures)
+    print("Preparing the required winning solved FSP from sweep point %d." % (best_sweep_index + 1))
+    _apply_sweep_case(best_sweep_index)
+    fdtd.run("FDTD", resource_mode)
+    _best_project_name = os.path.basename(
+        str(SETTINGS.get("project_file", "lumerical_sweep.fsp"))
+    )
+    if not _best_project_name.lower().endswith(".fsp"):
+        _best_project_name += ".fsp"
+    REMOTE_BEST_SWEEP_FSP = os.path.join(
+        REMOTE_FSP_DIR, "best_" + _best_project_name
+    )
+    fdtd.save(REMOTE_BEST_SWEEP_FSP)
+    if not os.path.isfile(REMOTE_BEST_SWEEP_FSP) or os.path.getsize(REMOTE_BEST_SWEEP_FSP) <= 0:
+        raise RuntimeError("The required winning sweep FSP was not created")
+    with open(SWEEP_RESULTS_JSON, "r", encoding="utf-8") as _manifest_stream:
+        _saved_manifest = json.load(_manifest_stream)
+    _saved_manifest["best_fsp"] = REMOTE_BEST_SWEEP_FSP
+    with open(SWEEP_RESULTS_JSON, "w", encoding="utf-8") as _manifest_stream:
+        json.dump(_saved_manifest, _manifest_stream, indent=2)
+    with open(SWEEP_TEXT_SUMMARY, "a", encoding="utf-8") as _summary_stream:
+        _summary_stream.write("\nWinning solved FSP\n------------------\n%s\n" % REMOTE_BEST_SWEEP_FSP)
+    print("Saved the solved winning sweep design:", REMOTE_BEST_SWEEP_FSP)
+_emit_sweep_progress(
+    "finished" if schema_failure is None else "cancelled",
+    completed_count=completed_count, failed_count=failed_count,
+)
 
 # All electromagnetic solves are complete. Keep solved numeric artifacts on
 # disk and return the Lumerical resource table to the 30-thread CPU row before
@@ -5054,6 +6495,13 @@ try:
     print("All sweep solves complete; post-processing resource is CPU: 1 process x %d threads." % analysis_threads)
 except Exception as exc:
     print("CPU post-processing resource switch warning:", str(exc)[:240])
+_runtime_project = str(globals().get("REMOTE_RUNTIME_PROJECT_FILE", ""))
+if _runtime_project and os.path.isfile(_runtime_project):
+    try:
+        os.remove(_runtime_project)
+        print("Removed transient sweep runtime FSP after result extraction.")
+    except Exception as exc:
+        print("Transient sweep runtime cleanup warning:", str(exc)[:180])
 if schema_failure is not None:
     raise RuntimeError(
         "A solved sweep point exposed an incompatible Lumerical result schema; "
@@ -5237,13 +6685,27 @@ def _layer_builder_geometry(origin_x_um, origin_y_um, geometry=None):
 _MULTIGPU_SINGLE_CASE_REMOTE = r'''# One dynamically assigned case in this worker's persistent FDTD process.
 case_index = int(MULTIGPU_CASE_INDEX)
 if _sweep_case_is_complete(case_index):
+    case_status = "reused"
     print("Reusing completed sweep checkpoint %d/%d (validated on shared storage)" % (case_index + 1, len(SWEEP_CASES)))
 else:
     _apply_sweep_case(case_index)
     fdtd.run("FDTD", "GPU")
     primary_name, wavelength_m, primary_response, arrays = _extract_sweep_result()
     _save_sweep_case(case_index, primary_name, wavelength_m, primary_response, arrays)
+    case_status = "completed"
     print("Completed shared multi-GPU point %d/%d" % (case_index + 1, len(SWEEP_CASES)))
+primary_name, wavelength_m, primary_response = _sweep_checkpoint_spectrum(case_index)
+finite = np.isfinite(primary_response)
+result_record = {
+    "status": case_status,
+    "primary_name": str(primary_name),
+}
+if np.any(finite):
+    finite_indices = np.flatnonzero(finite)
+    peak_index = int(finite_indices[np.argmax(primary_response[finite])])
+    result_record["peak_response"] = float(primary_response[peak_index])
+    result_record["peak_wavelength_nm"] = float(wavelength_m[peak_index] / 1e-9)
+print("__MAX_LAYOUT_SWEEP_RESULT__" + json.dumps(result_record, sort_keys=True))
 '''
 
 
@@ -5322,6 +6784,8 @@ import csv
 import json
 import re
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from IPython.display import Image, display
 
@@ -5334,6 +6798,16 @@ _local_text_summary = PIRIS_RESULTS_DIR / "summary.txt"
 lam.fetch(_remote_sweep_npz, str(_local_sweep_npz))
 lam.fetch(_remote_sweep_json, str(_local_sweep_json))
 lam.fetch(_remote_text_summary, str(_local_text_summary))
+with open(_local_sweep_json, "r", encoding="utf-8") as _sweep_manifest_stream:
+    _local_sweep_manifest = json.load(_sweep_manifest_stream)
+_remote_best_fsp = str(_local_sweep_manifest.get("best_fsp") or "")
+if not _remote_best_fsp:
+    raise RuntimeError("The sweep manifest does not contain the required winning FSP path")
+_local_best_fsp = PIRIS_FSP_DIR / os.path.basename(_remote_best_fsp)
+lam.fetch(_remote_best_fsp, str(_local_best_fsp))
+if not _local_best_fsp.is_file() or _local_best_fsp.stat().st_size <= 0:
+    raise RuntimeError("The required winning FSP was not fetched: " + str(_local_best_fsp))
+print("saved winning solved FSP ->", _local_best_fsp)
 
 with np.load(_local_sweep_npz) as _data:
     _wavelength_nm = np.asarray(_data["wavelength_m"], dtype=float) * 1e9
@@ -5374,6 +6848,16 @@ _is_mmi = (
     _primary_name == "output_1_over_input"
     and _mmi_output_1_over_input is not None
     and _mmi_output_2_over_input is not None
+)
+_db_floor = 1e-15
+_responses_db = (
+    10.0 * np.log10(np.maximum(_responses, _db_floor)) if _is_ce else None
+)
+_maximum_db = (
+    10.0 * np.log10(np.maximum(_maximum, _db_floor)) if _is_ce else None
+)
+_target_db = (
+    10.0 * np.log10(np.maximum(_target, _db_floor)) if _is_ce else None
 )
 _ylabel = (
     "coupling efficiency (linear)" if _is_ce
@@ -5421,6 +6905,18 @@ for _index, (_label, _stem) in enumerate(zip(_case_labels, _result_stems)):
             )
             _split_axis.grid(alpha=0.3)
             _split_axis.legend()
+    elif _is_ce:
+        _figure, (_axis, _db_axis) = plt.subplots(
+            1, 2, figsize=(13.0, 4.8), sharex=True,
+        )
+        _axis.plot(_wavelength_nm, _responses[_index], lw=2.2, color="#2563eb")
+        _db_axis.plot(_wavelength_nm, _responses_db[_index], lw=2.2, color="#7c3aed")
+        _db_axis.set(
+            xlabel="wavelength [nm]",
+            ylabel="coupling efficiency [dB]",
+            title="Coupling efficiency — dB — " + _label,
+        )
+        _db_axis.grid(alpha=0.3)
     else:
         _figure, _axis = plt.subplots(figsize=(8.5, 4.8))
         _axis.plot(_wavelength_nm, _responses[_index], lw=2.2, color="#2563eb")
@@ -5453,20 +6949,33 @@ else:
 _summary_csv = PIRIS_RESULTS_DIR / (_summary_stem + ".csv")
 with _summary_csv.open("w", newline="", encoding="utf-8") as _handle:
     _writer = csv.writer(_handle)
-    _writer.writerow([*_parameter_names, "maximum_response", "target_response", "success", "curve_file"])
+    _summary_header = [*_parameter_names, "maximum_response", "target_response"]
+    if _is_ce:
+        _summary_header.extend(["maximum_response_db", "target_response_db"])
+    _summary_header.extend(["success", "curve_file"])
+    _writer.writerow(_summary_header)
     for _index in range(len(_case_labels)):
-        _writer.writerow([
+        _summary_row = [
             *_parameter_values[_index].tolist(),
             _maximum[_index],
             _target[_index],
-            bool(_success[_index]),
-            _result_stems[_index] + ".png",
+        ]
+        if _is_ce:
+            _summary_row.extend([_maximum_db[_index], _target_db[_index]])
+        _summary_row.extend([
+            bool(_success[_index]), _result_stems[_index] + ".png",
         ])
+        _writer.writerow(_summary_row)
 
 _summary_path = PIRIS_RESULTS_DIR / (_summary_stem + ".png")
 if len(_parameter_names) == 1:
     _order = np.argsort(_parameter_values[:, 0])
-    _figure, _axis = plt.subplots(figsize=(8.3, 5.0))
+    if _is_ce:
+        _figure, (_axis, _db_axis) = plt.subplots(
+            1, 2, figsize=(13.0, 5.0), sharex=True,
+        )
+    else:
+        _figure, _axis = plt.subplots(figsize=(8.3, 5.0))
     _axis.plot(_parameter_values[_order, 0], _maximum[_order], marker="o", lw=2.2)
     _axis.set(
         xlabel=_parameter_names[0].replace("_", " "),
@@ -5482,6 +6991,17 @@ if len(_parameter_names) == 1:
         ),
     )
     _axis.grid(alpha=0.3)
+    if _is_ce:
+        _db_axis.plot(
+            _parameter_values[_order, 0], _maximum_db[_order],
+            marker="o", lw=2.2, color="#7c3aed",
+        )
+        _db_axis.set(
+            xlabel=_parameter_names[0].replace("_", " "),
+            ylabel="maximum coupling efficiency [dB]",
+            title="Maximum CE across wavelength — dB",
+        )
+        _db_axis.grid(alpha=0.3)
 else:
     _x_values = np.unique(_parameter_values[:, 0])
     _y_values = np.unique(_parameter_values[:, 1])
@@ -5491,7 +7011,10 @@ else:
         _y_index = int(np.where(np.isclose(_y_values, _row[1]))[0][0])
         _existing = _grid[_y_index, _x_index]
         _grid[_y_index, _x_index] = _value if not np.isfinite(_existing) else max(_existing, _value)
-    _figure, _axis = plt.subplots(figsize=(8.3, 5.8))
+    if _is_ce:
+        _figure, (_axis, _db_axis) = plt.subplots(1, 2, figsize=(13.0, 5.8))
+    else:
+        _figure, _axis = plt.subplots(figsize=(8.3, 5.8))
     _image = _axis.imshow(
         _grid,
         origin="lower",
@@ -5517,11 +7040,34 @@ else:
             else "maximum response"
         ),
     )
+    if _is_ce:
+        _db_grid = 10.0 * np.log10(np.maximum(_grid, _db_floor))
+        _db_image = _db_axis.imshow(
+            _db_grid,
+            origin="lower",
+            aspect="auto",
+            extent=[_x_values.min(), _x_values.max(), _y_values.min(), _y_values.max()],
+            cmap="viridis",
+        )
+        _db_axis.set(
+            xlabel=_parameter_names[0].replace("_", " "),
+            ylabel=_parameter_names[1].replace("_", " "),
+            title="Maximum CE for each parameter combination — dB",
+        )
+        _figure.colorbar(
+            _db_image, ax=_db_axis, label="maximum coupling efficiency [dB]",
+        )
 _figure.tight_layout()
 _figure.savefig(_summary_path, dpi=170, bbox_inches="tight")
 plt.close(_figure)
 display(Image(filename=str(_summary_path), width=1000))
-print("best case ->", _case_labels[_best_index], "maximum", _maximum[_best_index])
+if _is_ce:
+    print(
+        "best case ->", _case_labels[_best_index],
+        "maximum", _maximum[_best_index], "linear /", _maximum_db[_best_index], "dB",
+    )
+else:
+    print("best case ->", _case_labels[_best_index], "maximum", _maximum[_best_index])
 print("saved ->", _summary_path)
 print("saved ->", _summary_csv)
 print("saved ->", _local_sweep_npz)
@@ -5532,13 +7078,14 @@ print("saved ->", _local_text_summary)
 
 _FETCH_RESULTS_CELL = r'''# Fetch every verified artifact before closing Lumerical or returning the HPC Packs.
 REMOTE_ARTIFACTS = [
-    REMOTE_PROJECT_FILE,
-    REMOTE_WORK + "/geometry_xyz_projections.png",
     REMOTE_WORK + "/max_layout_results.npz",
     REMOTE_WORK + "/max_layout_results.json",
     REMOTE_WORK + "/summary.txt",
 ]
-if PORTS:
+if SHOW_GEOMETRY_PREVIEW:
+    REMOTE_ARTIFACTS.append(REMOTE_WORK + "/geometry_xyz_projections.png")
+REMOTE_ARTIFACTS.insert(0, REMOTE_PROJECT_FILE)
+if PORTS and SHOW_PORT_MODE_PREVIEW:
     REMOTE_ARTIFACTS.append(REMOTE_WORK + "/port_mode_Ex_Ey.png")
 if GRATING_ANALYSIS and SETTINGS.get("run_after_build", False):
     print("Grating analysis and its locally rendered plot were already fetched by section 10.")
@@ -5557,27 +7104,41 @@ _artifact_expression = "{path: bool(os.path.isfile(path) and os.path.getsize(pat
 REMOTE_ARTIFACT_STATUS = lam.get(_artifact_expression)
 FETCHED_RESULTS = []
 MISSING_REMOTE_ARTIFACTS = []
+FAILED_TRANSFERS = []
 for remote_path in REMOTE_ARTIFACTS:
     if not REMOTE_ARTIFACT_STATUS.get(remote_path, False):
         MISSING_REMOTE_ARTIFACTS.append(remote_path)
         print("ERROR — remote stage did not create:", remote_path)
         continue
-    local_directory = PIRIS_FSP_DIR if remote_path == REMOTE_PROJECT_FILE else PIRIS_RESULTS_DIR
+    local_directory = PIRIS_FSP_DIR if remote_path.lower().endswith(".fsp") else PIRIS_RESULTS_DIR
     local_path = local_directory / os.path.basename(remote_path)
     try:
         fetched = lam.fetch(remote_path, str(local_path))
+        if not local_path.is_file() or local_path.stat().st_size <= 0:
+            raise RuntimeError("downloaded file is missing or empty: " + str(local_path))
         FETCHED_RESULTS.append(fetched)
         print("saved ->", fetched)
     except Exception as exc:
+        FAILED_TRANSFERS.append((remote_path, str(exc)))
         print("TRANSFER ERROR —", os.path.basename(remote_path), str(exc)[:200])
 if MISSING_REMOTE_ARTIFACTS:
-    print("One or more required artifacts are missing. Keep the output above and run the licence-release cell next.")
+    raise RuntimeError("Required remote artifacts are missing: " + repr(MISSING_REMOTE_ARTIFACTS))
+if FAILED_TRANSFERS:
+    raise RuntimeError("Required artifact transfers failed: " + repr(FAILED_TRANSFERS))
 '''
 
 
 _RELEASE_LICENSES_CELL = r'''# Release in the reverse order of acquisition: FDTD, roamed HPC Packs, SSH.
 try:
-    lam.run("try:\n    fdtd.close()\nexcept Exception:\n    pass", timeout=90)
+    lam.run(
+        "import os\n"
+        "try:\n    fdtd.close()\nexcept Exception:\n    pass\n"
+        "_runtime_fsp = globals().get('REMOTE_RUNTIME_PROJECT_FILE', '')\n"
+        "if _runtime_fsp and os.path.isfile(_runtime_fsp):\n"
+        "    try:\n        os.remove(_runtime_fsp)\n        print('Removed transient runtime FSP during release.')\n"
+        "    except Exception as _cleanup_exc:\n        print('Runtime-FSP cleanup warning:', str(_cleanup_exc)[:180])",
+        timeout=90,
+    )
 finally:
     _release = subprocess.run(_SSH + [HOST,
         f'{LIC}/LicensingSettings web shared products checkin '
@@ -5667,6 +7228,17 @@ def generate_lumerical_notebook(
         ]
         if matching_measurement_ports:
             fiber_measurement_ports = matching_measurement_ports
+        # Fiber HE11 is a near-degenerate polarization pair.  Never trust the
+        # legacy fixed mode-2/Ey choice: calculate both candidates remotely and
+        # select the member polarized perpendicular to the grating axis.  The
+        # exported global phi already includes component rotation.
+        for fiber_mode_port in [*fiber_ports, *fiber_measurement_ports]:
+            fiber_mode_port["mode"] = "user select"
+            fiber_mode_port["mode number"] = 0
+            fiber_mode_port["polarization"] = "local TE"
+            fiber_mode_port["candidate mode numbers"] = [1, 2]
+            fiber_mode_port.setdefault("mode degeneracy tolerance", 0.01)
+            fiber_mode_port.setdefault("minimum local TE fraction", 0.8)
         if not grating_polygons:
             warnings.append("Grating analysis was not added because no polygons from the grating coupler were selected.")
         elif not waveguide_power_monitors:
@@ -5765,14 +7337,14 @@ def generate_lumerical_notebook(
                     "waveguide_target_neff": float(waveguide_mode_monitor.get("target neff", 2.5)),
                     "waveguide_neff_tolerance": float(waveguide_mode_monitor.get("neff tolerance", 0.3)),
                     "fiber_port_name": fiber_port_name,
-                    "fiber_source_mode": "mode %d" % max(1, int(fiber_port.get("mode number", 1))),
-                    "fiber_polarization": str(fiber_port.get("polarization", "Ey")),
+                    "fiber_source_mode": "auto local TE",
+                    "fiber_polarization": "local TE",
+                    "fiber_axis_orientation_deg": float(fiber_port.get("angle phi", 0.0)),
+                    "fiber_mode_candidates": [1, 2],
                     "fiber_geometry_name": str(fiber_geometry.get("name", "fiber")),
                     "fiber_input_measurement_port_name": str(fiber_measurement_port.get("name", "")),
                     "fiber_measurement_expansion_result_name": "expansion for port monitor",
-                    "fiber_measurement_mode": "mode %d" % max(
-                        1, int(fiber_measurement_port.get("mode number", fiber_port.get("mode number", 1)))
-                    ),
+                    "fiber_measurement_mode": "auto local TE",
                     "fiber_input_monitor_name": None,
                     "frequency_points": int(configuration.get("frequency_points", 31)),
                 }
@@ -5974,11 +7546,14 @@ def generate_lumerical_notebook(
         "tfln_crystal_cut": str(configuration.get("tfln_crystal_cut", "X")).strip().upper(),
         "tfln_temperature_K": float(configuration.get("tfln_temperature_K", 296.3)),
         "include_ports": bool(configuration.get("include_ports", True)),
-        "hide_cad": bool(configuration.get("hide_cad", False)),
+        "hide_cad": bool(configuration.get("hide_cad", True)),
         "official_gc_domain": bool(configuration.get("official_gc_domain", False)),
         "use_y_antisymmetry": bool(configuration.get("use_y_antisymmetry", False)),
         "antisymmetry_boundary": str(configuration.get("antisymmetry_boundary", "")).strip().lower(),
         "run_after_build": bool(configuration.get("run_after_build", False)),
+        "run_gpu_system_check": bool(configuration.get("run_gpu_system_check", False)),
+        "save_inspection_fsp": True,
+        "save_final_fsp": True,
         "project_file": project_file,
     }
     if grating_analysis:
@@ -6036,6 +7611,7 @@ def generate_lumerical_notebook(
         f"EXPORT_WARNINGS = {pprint.pformat(warnings, width=120)}\n"
         "for warning in EXPORT_WARNINGS:\n"
         "    print('Export note:', warning)\n"
+        + _runtime_setup_source(_BUILD_CELL)
     )
     remote_builder_source = _BUILD_CELL
     remote_build_cell = (
@@ -6058,48 +7634,60 @@ def generate_lumerical_notebook(
         "    + 'MMI_ANALYSIS = ' + repr(MMI_ANALYSIS) + '\\n'\n"
         "    + 'EXPORT_WARNINGS = ' + repr(EXPORT_WARNINGS) + '\\n'\n"
         ")\n"
-        "run_remote_checked(_remote_payload + REMOTE_MODEL_BUILDER, 'Build verified 3D model', timeout=1800)\n"
+        "run_remote_checked(_remote_payload + REMOTE_MODEL_BUILDER, 'Build verified 3D model directly', timeout=1800)\n"
+        "print('Built one live model directly in memory.')\n"
     )
     geometry_projection_cell = (
-        "# Build and display XY, XZ, and YZ projections before committing compute time.\n"
+        "# Optionally build and display XY, XZ, and YZ projections.\n"
         f"REMOTE_GEOMETRY_PROJECTIONS = {repr(_GEOMETRY_PROJECTIONS_REMOTE)}\n"
-        "run_remote_checked(REMOTE_GEOMETRY_PROJECTIONS, 'Render 3-axis geometry verification', timeout=1800)\n"
-        "GEOMETRY_PROJECTIONS_FILE = REMOTE_WORK.rstrip('/') + '/geometry_xyz_projections.png'\n"
-        "lam.show(GEOMETRY_PROJECTIONS_FILE, width=1400)\n"
+        "if SHOW_GEOMETRY_PREVIEW:\n"
+        "    run_remote_checked(REMOTE_GEOMETRY_PROJECTIONS, 'Render 3-axis geometry verification', timeout=1800)\n"
+        "    GEOMETRY_PROJECTIONS_FILE = REMOTE_WORK.rstrip('/') + '/geometry_xyz_projections.png'\n"
+        "    lam.show(GEOMETRY_PROJECTIONS_FILE, width=1400)\n"
+        "else:\n"
+        "    print('3-axis preview skipped by cell 1; the embedded geometry is unchanged.')\n"
     )
     port_mode_profiles_cell = (
-        "# Calculate and display the selected FDTD port modes before committing GPU time.\n"
+        "# Optionally display modes already selected during the required model build.\n"
         f"REMOTE_PORT_MODE_PROFILES = {repr(_PORT_MODE_PROFILES_REMOTE)}\n"
-        "run_remote_checked(REMOTE_PORT_MODE_PROFILES, 'Render selected port Ex and Ey fields', timeout=1800)\n"
-        "if PORTS:\n"
-        "    PORT_MODE_PROFILES_FILE = REMOTE_WORK.rstrip('/') + '/port_mode_Ex_Ey.png'\n"
-        "    lam.show(PORT_MODE_PROFILES_FILE, width=1400)\n"
-        "    _port_polarization_valid = bool(lam.get('PORT_POLARIZATION_VALID'))\n"
-        "    _port_mode_confinement_valid = bool(lam.get('PORT_MODE_CONFINEMENT_VALID'))\n"
-        "    _port_mode_valid = bool(lam.get('PORT_MODE_VALID'))\n"
-        "    _port_polarization_report = lam.get('PORT_POLARIZATION_REPORT')\n"
-        "    print('Port transverse-polarization report:', _port_polarization_report)\n"
-        "    if not _port_mode_valid:\n"
-        "        raise RuntimeError('Mode validation failed: the fiber source must be Ey-dominant and the neff-selected waveguide mode must decay below 5% at every expansion-monitor boundary. Correct the target neff or monitor span before running the GPU solve.')\n"
+        "if SHOW_PORT_MODE_PREVIEW:\n"
+        "    run_remote_checked(REMOTE_PORT_MODE_PROFILES, 'Render selected port Ex and Ey fields', timeout=1800)\n"
+        "    if PORTS:\n"
+        "        PORT_MODE_PROFILES_FILE = REMOTE_WORK.rstrip('/') + '/port_mode_Ex_Ey.png'\n"
+        "        lam.show(PORT_MODE_PROFILES_FILE, width=1400)\n"
+        "        _port_polarization_valid = bool(lam.get('PORT_POLARIZATION_VALID'))\n"
+        "        _port_mode_confinement_valid = bool(lam.get('PORT_MODE_CONFINEMENT_VALID'))\n"
+        "        _port_mode_valid = bool(lam.get('PORT_MODE_VALID'))\n"
+        "        _port_polarization_report = lam.get('PORT_POLARIZATION_REPORT')\n"
+        "        print('Port transverse-polarization report:', _port_polarization_report)\n"
+        "        if not _port_mode_valid:\n"
+        "            raise RuntimeError('Mode validation failed: the fiber source must be local-TE and the neff-selected waveguide mode must decay below 5% at every expansion-monitor boundary. Correct the target neff or monitor span before running the GPU solve.')\n"
+        "    else:\n"
+        "        print('No FDTD ports were exported, so there are no port modes to display.')\n"
         "else:\n"
-        "    print('No FDTD ports were exported, so there are no port modes to display.')\n"
+        "    print('Port Ex/Ey images skipped by cell 1. Required local-TE selection and neff checks already ran during model construction.')\n"
     )
     resource_save_cell = (
-        "# Configure the licensed resource and download a verified pre-solve FSP. This cell does not solve.\n"
+        "# Configure the licensed resource and save the required inspection FSP.\n"
         f"REMOTE_RESOURCE_AND_SAVE = {repr(_REMOTE_RESOURCE_AND_SAVE)}\n"
-        "run_remote_checked(REMOTE_RESOURCE_AND_SAVE, 'Configure resources and save project', timeout=1800)\n"
-        "REMOTE_PROJECT_FILE = lam.get('REMOTE_PROJECT_FILE')\n"
+        "run_remote_checked(REMOTE_RESOURCE_AND_SAVE, 'Configure resources and save inspection project', timeout=1800)\n"
+        "_RESOURCE_STATE = lam.get(\"{'project_file': REMOTE_PROJECT_FILE, 'inspection_file': REMOTE_INSPECTION_PROJECT_FILE, 'inspection_saved': bool(REMOTE_INSPECTION_FSP_SAVED)}\")\n"
+        "REMOTE_PROJECT_FILE = str(_RESOURCE_STATE['project_file'])\n"
+        "REMOTE_INSPECTION_PROJECT_FILE = str(_RESOURCE_STATE['inspection_file'])\n"
+        "REMOTE_INSPECTION_FSP_SAVED = bool(_RESOURCE_STATE['inspection_saved'])\n"
         "PIRIS_FSP_DIR.mkdir(parents=True, exist_ok=True)\n"
-        "LOCAL_PROJECT_FILE = PIRIS_FSP_DIR / os.path.basename(REMOTE_PROJECT_FILE)\n"
-        "FETCHED_PROJECT_FILE = lam.fetch(REMOTE_PROJECT_FILE, str(LOCAL_PROJECT_FILE))\n"
-        "if not LOCAL_PROJECT_FILE.is_file() or LOCAL_PROJECT_FILE.stat().st_size <= 0:\n"
-        "    raise RuntimeError('The verified remote .fsp could not be downloaded before solving: ' + str(LOCAL_PROJECT_FILE))\n"
-        "print('saved pre-solve project ->', FETCHED_PROJECT_FILE)\n"
+        "if not REMOTE_INSPECTION_FSP_SAVED:\n"
+        "    raise RuntimeError('The required pre-solve inspection FSP was not saved')\n"
+        "LOCAL_INSPECTION_PROJECT_FILE = PIRIS_FSP_DIR / os.path.basename(REMOTE_INSPECTION_PROJECT_FILE)\n"
+        "FETCHED_INSPECTION_PROJECT_FILE = lam.fetch(REMOTE_INSPECTION_PROJECT_FILE, str(LOCAL_INSPECTION_PROJECT_FILE))\n"
+        "if not LOCAL_INSPECTION_PROJECT_FILE.is_file() or LOCAL_INSPECTION_PROJECT_FILE.stat().st_size <= 0:\n"
+        "    raise RuntimeError('The required inspection .fsp could not be downloaded: ' + str(LOCAL_INSPECTION_PROJECT_FILE))\n"
+        "print('saved pre-solve inspection project ->', FETCHED_INSPECTION_PROJECT_FILE)\n"
     )
     review_project_cell = (
-        "# Inspect the exact pre-solve FSP before committing GPU time.\n"
+        "# Inspect the always-saved exact pre-solve FSP.\n"
         "from IPython.display import FileLink, display\n"
-        "display(FileLink(str(LOCAL_PROJECT_FILE)))\n"
+        "display(FileLink(str(LOCAL_INSPECTION_PROJECT_FILE)))\n"
         "print('Open the linked .fsp with Lumerical FDTD on a computer that has the GUI installed.')\n"
         "OPEN_REMOTE_LUMERICAL_GUI = False\n"
         "if OPEN_REMOTE_LUMERICAL_GUI:\n"
@@ -6110,7 +7698,7 @@ def generate_lumerical_notebook(
         "        print('Lambda is headless: no DISPLAY is available. Use the downloaded FSP link above.')\n"
     )
     solve_cell = (
-        "# Run only after reviewing the downloaded FSP. GPU remains the default for every 3D solve.\n"
+        "# Run the live in-memory model. GPU remains the default for every 3D solve.\n"
         f"REMOTE_SWITCH_TO_CPU_ANALYSIS = {repr(_SWITCH_TO_CPU_ANALYSIS_REMOTE)}\n"
         "if SETTINGS.get('run_after_build', False):\n"
         "    _resource_mode = str(SETTINGS.get('resource_mode', 'GPU')).strip().upper()\n"
@@ -6122,9 +7710,9 @@ def generate_lumerical_notebook(
         "        raise ValueError('resource_mode must be GPU or CPU')\n"
         "    solve_remote_checked(_solve_code, label='Max Layout 3D FDTD [' + _resource_mode + ']', timeout=21600)\n"
         "    run_remote_checked(REMOTE_SWITCH_TO_CPU_ANALYSIS, 'Switch post-processing to CPU', timeout=300)\n"
-        "    print(\"Simulation finished. The solved project is saved once with the numerical result bundle in section 11.\")\n"
+        "    print(\"Simulation finished. The solved project will be saved once with the numerical result bundle.\")\n"
         "else:\n"
-        "    print(\"Run is disabled. The reviewed pre-solve .fsp is preserved and will still be fetched.\")\n"
+        "    print(\"Run is disabled. The verified live model was built but not solved.\")\n"
     )
     save_results_cell = (
         "# Serialize model results while the FDTD licence and remote session are still active.\n"
@@ -6145,6 +7733,7 @@ def generate_lumerical_notebook(
         "    with np.load(_local_grating_npz) as _grating_data:\n"
         "        _wavelength_nm = np.asarray(_grating_data['wavelength_m']) * 1e9\n"
         "        _coupling_linear = np.asarray(_grating_data['fiber_coupling'])\n"
+        "        _coupling_db = np.asarray(_grating_data['fiber_coupling_db'])\n"
         "        _waveguide_mode_power = np.asarray(_grating_data['waveguide_mode_power_source_normalized'])\n"
         "        _waveguide_total_power = np.asarray(_grating_data['waveguide_total_power'])\n"
         "        _fiber_forward = np.asarray(_grating_data['fiber_forward_power'])\n"
@@ -6165,7 +7754,12 @@ def generate_lumerical_notebook(
         "    print('Selected waveguide mode: %d, neff %.8g' % (_selected_mode_number, _selected_neff))\n"
         "    print('Source-normalized selected waveguide-mode power: %.8g' % _waveguide_mode_power[_target_index])\n"
         "    print('Incident-normalized waveguide coupling efficiency (linear): %.8g' % _coupling_linear[_target_index])\n"
-        "    _figure, (_fiber_axis, _waveguide_axis) = plt.subplots(2, 1, figsize=(9.2, 8.0), sharex=True)\n"
+        "    print('Incident-normalized waveguide coupling efficiency (dB): %.6f dB' % _coupling_db[_target_index])\n"
+        "    _figure = plt.figure(figsize=(13.0, 8.2))\n"
+        "    _grid = _figure.add_gridspec(2, 2, height_ratios=(1.0, 1.05))\n"
+        "    _fiber_axis = _figure.add_subplot(_grid[0, :])\n"
+        "    _waveguide_axis = _figure.add_subplot(_grid[1, 0], sharex=_fiber_axis)\n"
+        "    _waveguide_db_axis = _figure.add_subplot(_grid[1, 1], sharex=_fiber_axis)\n"
         "    _fiber_axis.plot(_wavelength_nm, _fiber_forward, lw=2.2, color='#059669', label='power toward grating, |T_in|')\n"
         "    _fiber_axis.plot(_wavelength_nm, _fiber_reflected, lw=2.0, color='#dc2626', label='reflected power toward source, |T_out|')\n"
         "    _fiber_axis.plot(_wavelength_nm, _fiber_net, lw=2.0, color='#0284c7', label='net power toward grating, |T_in| - |T_out|')\n"
@@ -6173,8 +7767,10 @@ def generate_lumerical_notebook(
         "    _waveguide_axis.plot(_wavelength_nm, _coupling_linear, lw=2.6, color='#7c3aed', label='waveguide CE / measured forward fiber power')\n"
         "    _waveguide_axis.plot(_wavelength_nm, _waveguide_mode_power, lw=1.8, ls='--', color='#4f46e5', label='waveguide mode power / selected source')\n"
         "    _waveguide_axis.plot(_wavelength_nm, _waveguide_total_power, lw=1.8, ls=':', color='#f59e0b', label='waveguide total power / selected source')\n"
-        "    _waveguide_axis.set(xlabel='wavelength [nm]', ylabel='linear power or efficiency', title='Waveguide coupling')\n"
-        "    for _axis in (_fiber_axis, _waveguide_axis):\n"
+        "    _waveguide_axis.set(xlabel='wavelength [nm]', ylabel='linear power or efficiency', title='Waveguide coupling — linear')\n"
+        "    _waveguide_db_axis.plot(_wavelength_nm, _coupling_db, lw=2.6, color='#7c3aed', label='waveguide CE [dB]')\n"
+        "    _waveguide_db_axis.set(xlabel='wavelength [nm]', ylabel='coupling efficiency [dB]', title='Waveguide coupling — dB')\n"
+        "    for _axis in (_fiber_axis, _waveguide_axis, _waveguide_db_axis):\n"
         "        _axis.axvline(_target_nm, color='#64748b', ls='--', lw=1.0)\n"
         "        _axis.grid(alpha=0.3)\n"
         "        _axis.legend(loc='best')\n"
@@ -6214,14 +7810,13 @@ This notebook contains **{len(geometry)} embedded polygons**, **{len(ports)} sta
 The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect to Lambda, seed Ansys Shared Web, roam exactly three HPC Packs, build/run in that licensed session, save and fetch results, close FDTD, return the three packs, and finally close SSH. Lumerical is not required on the local Mac.
 
 - Every exported simulation is a **3D FDTD simulation**. A saved 2D preference is ignored; GPU is the default compute resource and is selected explicitly at solve time.
-- Before solving, the notebook renders and displays **XY, XZ, and YZ geometry projections** for visual verification. This common stage is included for every component type and full-layout export.
-- Before solving, every selected FDTD port also displays its calculated **|Ex| and |Ey| mode fields**. Grating exports stop before the GPU run unless the fiber source mode is Ey-dominant.
+- Optional first-cell switches render **XY, XZ, and YZ geometry projections** and selected-port **|Ex|/|Ey| fields**. They default off for speed and do not change the model. Required rotation-aware local-TE selection and effective-index checks still run during construction.
 - Stack rows are ordered bottom-to-top.
 - A material thickness of **0 µm means that material is absent**.
 - Etch depth **0 µm** keeps an unetched film; etch depth equal to film thickness creates a fully etched patterned layer.
 - Exported cross-section rows use Lumerical Layer Builder, including the selected waveguide sidewall angle (90° is vertical).
 - A partially etched cross-section can keep its unetched slab across the full FDTD plane or restrict it to the selected GDS geometry footprint.
-- Each stack row has a dimensionless mesh factor. The default **0.2** produces an isotropic step of `0.2 × λ₀/nmax` at the shortest simulated wavelength; anisotropic media use their largest index component.
+- Each stack row has a dimensionless mesh factor: **0 / Automatic** leaves meshing to Lumerical's FDTD mesh-accuracy setting, while a positive value produces an isotropic step of `factor × λ₀/nmax` at the shortest simulated wavelength (anisotropic media use their largest index component). New grating-coupler exports default to Automatic.
 - Surface monitors carry explicit x/y/z spans; their normal-axis span is zero (Z is the into-page axis in the layout view).
 - Ports are manual simulation-only objects from the left **Ports & monitors** library. No component, including a grating coupler, creates a default port automatically.
 - `PORTS_JSON` uses the exact compact-model structure and field names from the reviewed Lumerical JSON examples: `name`, `dir`, `loc`, `pos`, and `order`.
@@ -6231,14 +7826,15 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
 - A conformal cladding row is a continuous full-domain gap-fill volume: it fills every etched opening and covers every waveguide/grating polygon, flare, terminal arc, and extension. Lower mesh-order device material wins wherever the volumes overlap.
 - The FDTD boundary keeps at least λ/4 clearance from ordinary device features. Background films may extend through their PMLs, but ports never create additional waveguide-to-PML geometry; only the polygons exported from the layout are simulated.
 - `LiNbO3` is created as a frequency- and temperature-dependent anisotropic sampled material using the Zelmon/Moretti model and the selected X/Y/Z crystal cut.
-- Grating-coupler exports use the upper tilted fiber FDTD port as the only source. A second, passive tilted fiber port reports power toward the grating (`|T_in|`), reflected power toward the source (`|T_out|`), physical net (`|T_in| - |T_out|`), and the raw monitor-normal signed `Tnet` diagnostic. The reported coupling efficiency is the source-normalized selected waveguide-mode power divided by the forward power measured at that passive fiber port; source-normalized waveguide mode and total powers remain available separately. All reported powers are linear.
+- Grating-coupler exports calculate both near-degenerate fiber modes and excite only the verified local-TE mode (Ey for an unrotated grating). The passive tilted fiber port independently selects that same physical polarization and reports its power toward the grating (`|T_in|`), reflected power toward the source (`|T_out|`), physical net (`|T_in| - |T_out|`), and raw signed `Tnet` diagnostic. Orthogonal-polarization power is not added to the normalization. The reported coupling efficiency is the source-normalized selected waveguide-mode power divided by the selected-polarization forward power measured at that passive fiber port; source-normalized waveguide mode and total powers remain available separately. Power traces remain linear, while coupling efficiency is plotted side by side in both linear and dB units.
 - A 1×2 MMI export launches mode 1 from its input port, measures input power 2 µm before the input taper, plots both output powers relative to that measured input, and plots the normalized longitudinal |E|² distribution through the complete MMI.
 - GPU and CPU modes are selectable through `SETTINGS['resource_mode']`; GPU is the default for every 3D export.
+- The first cell exposes run, diagnostic-preview, and GPU-system-check switches. Project saving is mandatory: one inspection FSP is written before the solve and one solved/best FSP is written afterward.
 - Run the final release cell even after an interrupted simulation so the FDTD licence and roamed HPC Packs are returned.
 """
     notebook = {
         "cells": [
-            _notebook_cell("code", _PIRIS_PATHS_CELL),
+            _notebook_cell("code", _quick_run_options_cell(settings, workflow="single run")),
             _notebook_cell("markdown", intro),
             _notebook_cell("markdown", "## 1 · Connect to Lambda\n"),
             _notebook_cell("code", _LAMBDA_CONNECT_CELL),
@@ -6248,19 +7844,19 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
             _notebook_cell("code", payload_cell),
             _notebook_cell("markdown", "## 4 · Build the model inside the licensed Lambda session\n"),
             _notebook_cell("code", remote_build_cell),
-            _notebook_cell("markdown", "## 5 · Verify the built geometry in XY, XZ, and YZ\n\nThese three projections are generated from the exact polygons and process-stack values passed to the 3D Lumerical model.\n"),
+            _notebook_cell("markdown", "## 5 · Optional XY, XZ, and YZ geometry preview\n\nEnable `SHOW_GEOMETRY_PREVIEW` in cell 1 only when you want the diagnostic image. The simulation geometry is already built when this switch is off.\n"),
             _notebook_cell("code", geometry_projection_cell),
-            _notebook_cell("markdown", "## 6 · Verify selected port Ex and Ey fields\n\nThis calculates the selected eigenmode at each FDTD port and displays normalized |Ex| and |Ey| maps before GPU time is committed. For a grating coupler, the fiber source must be Ey-dominant. For a 1×2 MMI, separate rows show the input, upper-output, and lower-output access modes; all three are checked against one effective-index target.\n"),
+            _notebook_cell("markdown", "## 6 · Optional selected-port Ex and Ey images\n\nEnable `SHOW_PORT_MODE_PREVIEW` in cell 1 to render the diagnostic maps and boundary-confinement report. The required source-polarization selection and effective-index checks already run during model construction even when this image is skipped.\n"),
             _notebook_cell("code", port_mode_profiles_cell),
-            _notebook_cell("markdown", "## 7 · Configure resources and save the pre-solve FSP\n\nThis always downloads the exact model into the project's `fsp` folder before any solve begins.\n"),
+            _notebook_cell("markdown", "## 7 · Configure resources and save the inspection FSP\n\nThe GPU/CPU resources are configured, then the exact pre-solve FSP is always created and downloaded.\n"),
             _notebook_cell("code", resource_save_cell),
-            _notebook_cell("markdown", "## 8 · Inspect the FSP before solving\n\nUse the file link below to open the model in Lumerical FDTD. Lambda normally runs headless; an explicit remote-GUI switch is provided but stays off unless a display is available.\n"),
+            _notebook_cell("markdown", "## 8 · Inspect the saved pre-solve FSP\n\nThis section links the exact verified project that was saved before the simulation.\n"),
             _notebook_cell("code", review_project_cell),
-            _notebook_cell("markdown", "## 9 · Run the reviewed 3D model\n"),
+            _notebook_cell("markdown", "## 9 · Run the live 3D model\n"),
             _notebook_cell("code", solve_cell),
             *(
                 [
-                    _notebook_cell("markdown", "## 10 · Grating coupling efficiency\n\nThe upper tilted fiber port is the only source. A second passive port on the same fiber axis measures forward, reflected and net modal power below it. The coupling-efficiency curve is the selected waveguide-mode power normalized by that measured forward fiber power; source-normalized waveguide powers are retained separately. All quantities are linear.\n"),
+                    _notebook_cell("markdown", "## 10 · Grating coupling efficiency\n\nThe upper tilted fiber port is the only source. A second passive port on the same fiber axis measures forward, reflected and net modal power below it. The coupling-efficiency curve is the selected waveguide-mode power normalized by that measured forward fiber power; source-normalized waveguide powers are retained separately. Power accounting is linear, and coupling efficiency is displayed side by side in linear and dB units.\n"),
                     _notebook_cell("code", grating_analysis_cell),
                 ]
                 if grating_analysis
@@ -6276,7 +7872,7 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
             ),
             _notebook_cell("markdown", "## 11 · Save numerical results before releasing licences\n"),
             _notebook_cell("code", save_results_cell),
-            _notebook_cell("markdown", "## 12 · Fetch the verified project, geometry image, and result bundle\n"),
+            _notebook_cell("markdown", "## 12 · Fetch requested FSP files and compact results\n"),
             _notebook_cell("code", _FETCH_RESULTS_CELL),
             _notebook_cell("markdown", "## 13 · Release FDTD and return all roamed HPC Packs\n\nAlways run this cell, including after an interrupted solve.\n"),
             _notebook_cell("code", _RELEASE_LICENSES_CELL),
@@ -6609,7 +8205,17 @@ def generate_lumerical_sweep_notebook(
     # The downloadable inspection FSP is the untouched current-project model,
     # never an arbitrary endpoint from the sweep range.
     base_geometry = deepcopy(base["GEOMETRY"])
+    sweep_code_fingerprint = hashlib.sha256(
+        "\0".join((
+            _BUILD_CELL,
+            _REMOTE_RESOURCE_AND_SAVE,
+            _SWEEP_RUNTIME_REMOTE,
+            _SWEEP_RUNNER_REMOTE,
+            _MULTIGPU_SINGLE_CASE_REMOTE,
+        )).encode("utf-8")
+    ).hexdigest()
     sweep_hash_payload = {
+        "code_fingerprint": sweep_code_fingerprint,
         "spec": sweep_spec,
         "nominal_parameters": nominal_parameters,
         "nominal_geometry": base_geometry,
@@ -6632,6 +8238,7 @@ def generate_lumerical_sweep_notebook(
         "import base64 as _sweep_b64, json as _sweep_json, zlib as _sweep_zlib\n"
         f"SWEEP_SPEC = {pprint.pformat(sweep_spec, width=120, sort_dicts=False)}\n"
         f"SWEEP_HASH = {sweep_hash!r}\n"
+        f"SWEEP_CODE_FINGERPRINT = {sweep_code_fingerprint!r}\n"
         f"_SWEEP_CASES_B64 = {compressed_cases!r}\n"
         "SWEEP_CASES = _sweep_json.loads(_sweep_zlib.decompress(_sweep_b64.b64decode(_SWEEP_CASES_B64)).decode('utf-8'))\n"
         f"SWEEP_STATIC_GEOMETRY = {pprint.pformat(static_geometry, width=160, compact=True, sort_dicts=False)}\n"
@@ -6654,6 +8261,7 @@ def generate_lumerical_sweep_notebook(
         "print('Sweep points:', len(SWEEP_CASES), '| axes:', ', '.join(axis['parameter'] for axis in SWEEP_SPEC['axes']))\n"
         "for warning in EXPORT_WARNINGS:\n"
         "    print('Export note:', warning)\n"
+        + _runtime_setup_source(_BUILD_CELL)
     )
     remote_build_cell = (
         "# Build the nominal model once, then install the in-session geometry hot-swap runtime.\n"
@@ -6677,63 +8285,91 @@ def generate_lumerical_sweep_notebook(
         "    + 'EXPORT_WARNINGS = ' + repr(EXPORT_WARNINGS) + '\\n'\n"
         "    + 'SWEEP_SPEC = ' + repr(SWEEP_SPEC) + '\\n'\n"
         "    + 'SWEEP_HASH = ' + repr(SWEEP_HASH) + '\\n'\n"
+        "    + 'SWEEP_CODE_FINGERPRINT = ' + repr(SWEEP_CODE_FINGERPRINT) + '\\n'\n"
         "    + 'SWEEP_CASES = ' + repr(SWEEP_CASES) + '\\n'\n"
         "    + 'SWEEP_STATIC_GEOMETRY = ' + repr(SWEEP_STATIC_GEOMETRY) + '\\n'\n"
         "    + 'SWEEP_RECOMPUTE_MODES = ' + repr(SWEEP_RECOMPUTE_MODES) + '\\n'\n"
         "    + 'SWEEP_NOMINAL_PARAMETERS = ' + repr(SWEEP_NOMINAL_PARAMETERS) + '\\n'\n"
         ")\n"
-        "run_remote_checked(_remote_payload + REMOTE_MODEL_BUILDER + '\\n' + REMOTE_SWEEP_RUNTIME, 'Build one reusable 3D sweep model', timeout=1800)\n"
+        "run_remote_checked(_remote_payload + REMOTE_MODEL_BUILDER + '\\n' + REMOTE_SWEEP_RUNTIME, 'Build one live 3D sweep model directly', timeout=1800)\n"
+        "_SWEEP_BUILD_STATE = lam.get(\"{'port_modes': PORT_MODE_SELECTIONS}\")\n"
+        "print('Built one reusable live sweep model directly in memory.')\n"
+        "SWEEP_FIBER_MODE_SELECTIONS = dict(_SWEEP_BUILD_STATE.get('port_modes') or {})\n"
+        "if SWEEP_FIBER_MODE_SELECTIONS:\n"
+        "    print('Resolved rotation-aware fiber mode pairs:', SWEEP_FIBER_MODE_SELECTIONS)\n"
     )
     geometry_projection_cell = (
-        "# Verify the nominal geometry and the union FDTD domain once.\n"
+        "# Optionally verify the nominal geometry and union FDTD domain once.\n"
         f"REMOTE_GEOMETRY_PROJECTIONS = {repr(_GEOMETRY_PROJECTIONS_REMOTE)}\n"
-        "run_remote_checked(REMOTE_GEOMETRY_PROJECTIONS, 'Render nominal sweep geometry', timeout=1800)\n"
-        "GEOMETRY_PROJECTIONS_FILE = REMOTE_WORK.rstrip('/') + '/geometry_xyz_projections.png'\n"
-        "lam.show(GEOMETRY_PROJECTIONS_FILE, width=1400)\n"
+        "if SHOW_GEOMETRY_PREVIEW:\n"
+        "    run_remote_checked(REMOTE_GEOMETRY_PROJECTIONS, 'Render nominal sweep geometry', timeout=1800)\n"
+        "    GEOMETRY_PROJECTIONS_FILE = REMOTE_WORK.rstrip('/') + '/geometry_xyz_projections.png'\n"
+        "    lam.show(GEOMETRY_PROJECTIONS_FILE, width=1400)\n"
+        "else:\n"
+        "    print('Nominal sweep geometry preview skipped by cell 1.')\n"
     )
     port_mode_profiles_cell = (
-        "# Validate nominal port modes once; pitch/filling sweeps reuse them.\n"
+        "# Optionally display nominal port modes; required selection already ran during the build.\n"
         f"REMOTE_PORT_MODE_PROFILES = {repr(_PORT_MODE_PROFILES_REMOTE)}\n"
-        "run_remote_checked(REMOTE_PORT_MODE_PROFILES, 'Validate nominal sweep port modes', timeout=1800)\n"
-        "if PORTS:\n"
-        "    PORT_MODE_PROFILES_FILE = REMOTE_WORK.rstrip('/') + '/port_mode_Ex_Ey.png'\n"
-        "    lam.show(PORT_MODE_PROFILES_FILE, width=1400)\n"
-        "    if not bool(lam.get('PORT_MODE_VALID')):\n"
-        "        raise RuntimeError('Nominal port-mode validation failed; correct the port geometry before sweeping.')\n"
+        "if SHOW_PORT_MODE_PREVIEW:\n"
+        "    run_remote_checked(REMOTE_PORT_MODE_PROFILES, 'Validate nominal sweep port modes', timeout=1800)\n"
+        "    if PORTS:\n"
+        "        PORT_MODE_PROFILES_FILE = REMOTE_WORK.rstrip('/') + '/port_mode_Ex_Ey.png'\n"
+        "        lam.show(PORT_MODE_PROFILES_FILE, width=1400)\n"
+        "        if not bool(lam.get('PORT_MODE_VALID')):\n"
+        "            raise RuntimeError('Nominal port-mode validation failed; correct the port geometry before sweeping.')\n"
+        "else:\n"
+        "    print('Nominal port Ex/Ey images skipped by cell 1; mode selection and neff checks remain active.')\n"
     )
     resource_save_cell = (
-        "# Configure GPU once and save/download only one nominal pre-sweep FSP.\n"
+        "# Configure GPU once and save/download the required nominal inspection FSP.\n"
         f"REMOTE_RESOURCE_AND_SAVE = {repr(_REMOTE_RESOURCE_AND_SAVE)}\n"
-        "run_remote_checked(REMOTE_RESOURCE_AND_SAVE, 'Configure one sweep resource and save nominal FSP', timeout=1800)\n"
-        "REMOTE_PROJECT_FILE = lam.get('REMOTE_PROJECT_FILE')\n"
-        "LOCAL_PROJECT_FILE = PIRIS_FSP_DIR / os.path.basename(REMOTE_PROJECT_FILE)\n"
-        "lam.fetch(REMOTE_PROJECT_FILE, str(LOCAL_PROJECT_FILE))\n"
-        "print('saved nominal pre-sweep project ->', LOCAL_PROJECT_FILE)\n"
+        "run_remote_checked(REMOTE_RESOURCE_AND_SAVE, 'Configure one sweep resource and save inspection FSP', timeout=1800)\n"
+        "_SWEEP_RESOURCE_STATE = lam.get(\"{'project_file': REMOTE_PROJECT_FILE, 'inspection_file': REMOTE_INSPECTION_PROJECT_FILE, 'inspection_saved': bool(REMOTE_INSPECTION_FSP_SAVED)}\")\n"
+        "REMOTE_PROJECT_FILE = str(_SWEEP_RESOURCE_STATE['project_file'])\n"
+        "REMOTE_INSPECTION_PROJECT_FILE = str(_SWEEP_RESOURCE_STATE['inspection_file'])\n"
+        "REMOTE_INSPECTION_FSP_SAVED = bool(_SWEEP_RESOURCE_STATE['inspection_saved'])\n"
+        "if not REMOTE_INSPECTION_FSP_SAVED:\n"
+        "    raise RuntimeError('The required nominal inspection FSP was not saved')\n"
+        "LOCAL_INSPECTION_PROJECT_FILE = PIRIS_FSP_DIR / os.path.basename(REMOTE_INSPECTION_PROJECT_FILE)\n"
+        "lam.fetch(REMOTE_INSPECTION_PROJECT_FILE, str(LOCAL_INSPECTION_PROJECT_FILE))\n"
+        "print('saved nominal inspection project ->', LOCAL_INSPECTION_PROJECT_FILE)\n"
     )
     review_project_cell = (
-        "# Inspect the single nominal FSP; no FSP is saved for each sweep point.\n"
+        "# Inspect the required nominal FSP; no FSP is saved for each sweep point.\n"
         "from IPython.display import FileLink, display\n"
-        "display(FileLink(str(LOCAL_PROJECT_FILE)))\n"
+        "display(FileLink(str(LOCAL_INSPECTION_PROJECT_FILE)))\n"
         "print('The union FDTD domain covers every embedded sweep geometry.')\n"
     )
     sweep_run_cell = (
         "# Run the entire Cartesian sweep inside the one persistent Lumerical/GPU session.\n"
         f"REMOTE_SWEEP_RUNNER = {repr(_SWEEP_RUNNER_REMOTE)}\n"
+        "SWEEP_PROGRESS_FILE = REMOTE_WORK.rstrip('/') + '/sweep_live_progress.jsonl'\n"
         "if SETTINGS.get('run_after_build', True):\n"
         "    _sweep_timeout = max(21600, 21600 * len(SWEEP_CASES))\n"
-        "    solve_remote_checked(REMOTE_SWEEP_RUNNER, label='Lumerical GPU parameter sweep', timeout=_sweep_timeout)\n"
+        "    solve_remote_checked(\n"
+        "        REMOTE_SWEEP_RUNNER, label='Lumerical GPU parameter sweep',\n"
+        "        timeout=_sweep_timeout, progress_file=SWEEP_PROGRESS_FILE,\n"
+        "        progress_mode='sweep',\n"
+        "    )\n"
         "else:\n"
         "    print('Sweep run is disabled; only the nominal model was built.')\n"
+    )
+    local_results_cell = (
+        "if not SETTINGS.get('run_after_build', True):\n"
+        "    print('Sweep was not run, so there are no sweep results to fetch.')\n"
+        "else:\n"
+        + textwrap.indent(_SWEEP_LOCAL_RESULTS_CELL, "    ")
     )
     intro = f"""# Max Layout → Lumerical parameter sweep
 
 This notebook runs **{len(remote_cases)} Cartesian sweep points** for **{sweep_spec['component_kind']}** using the exact JSON parameter names: {', '.join(axis['parameter'] for axis in sweep_spec['axes'])}.
 
 - One Shared Web licence checkout and one persistent Lumerical session are used.
-- The inspection FSP and nominal model come from the untouched current project JSON, even when the first sweep value differs from the nominal parameter.
+- The live nominal model comes from the untouched current project JSON, even when the first sweep value differs from the nominal parameter. Its inspection FSP is always saved.
 - Materials, the union FDTD region, ports, and monitors are built once.
 - Each point hot-swaps only the embedded Layer Builder geometry and linked automatic companion positions.
-- The GPU is configured once and no per-point FSP is saved or downloaded.
+- The GPU is configured once and no per-point FSP is saved or downloaded. The final saved FSP is the winning design only.
 - A small numerical checkpoint is written after each completed point for safe restart.
 - After all electromagnetic solves, Lumerical is switched back to the 30-thread CPU resource and every plot is generated locally on CPU.
 - Grating sweeps save one CE spectrum per point using names such as `CE-P=0.75-F=0.56.png`, plus a maximum-CE summary heatmap and CSV.
@@ -6742,7 +8378,7 @@ This notebook runs **{len(remote_cases)} Cartesian sweep points** for **{sweep_s
 """
     notebook = {
         "cells": [
-            _notebook_cell("code", _PIRIS_PATHS_CELL),
+            _notebook_cell("code", _quick_run_options_cell(settings, workflow="sequential sweep")),
             _notebook_cell("markdown", intro),
             _notebook_cell("markdown", "## 1 · Connect to Lambda\n"),
             _notebook_cell("code", _LAMBDA_CONNECT_CELL),
@@ -6756,14 +8392,14 @@ This notebook runs **{len(remote_cases)} Cartesian sweep points** for **{sweep_s
             _notebook_cell("code", geometry_projection_cell),
             _notebook_cell("markdown", "## 6 · Verify nominal port modes\n\nFor a 1×2 MMI this shows Ex and Ey for the input, upper-output, and lower-output ports and verifies that all three modes lie around the same effective-index target.\n"),
             _notebook_cell("code", port_mode_profiles_cell),
-            _notebook_cell("markdown", "## 7 · Configure GPU and save one nominal FSP\n"),
+            _notebook_cell("markdown", "## 7 · Configure GPU and save one nominal inspection FSP\n"),
             _notebook_cell("code", resource_save_cell),
-            _notebook_cell("markdown", "## 8 · Inspect the nominal FSP\n"),
+            _notebook_cell("markdown", "## 8 · Inspect the saved nominal FSP\n"),
             _notebook_cell("code", review_project_cell),
             _notebook_cell("markdown", "## 9 · Run every sweep point on GPU\n"),
             _notebook_cell("code", sweep_run_cell),
             _notebook_cell("markdown", "## 10 · Fetch once and create all plots on CPU\n"),
-            _notebook_cell("code", _SWEEP_LOCAL_RESULTS_CELL),
+            _notebook_cell("code", local_results_cell),
             _notebook_cell("markdown", "## 11 · Release FDTD and return all roamed HPC Packs\n\nAlways run this cell, including after an interrupted sweep.\n"),
             _notebook_cell("code", _RELEASE_LICENSES_CELL),
         ],
@@ -6865,30 +8501,52 @@ def generate_lumerical_multigpu_sweep_notebook(
         "    + 'EXPORT_WARNINGS = ' + repr(EXPORT_WARNINGS) + '\\n'\n"
         "    + 'SWEEP_SPEC = ' + repr(SWEEP_SPEC) + '\\n'\n"
         "    + 'SWEEP_HASH = ' + repr(SWEEP_HASH) + '\\n'\n"
+        "    + 'SWEEP_CODE_FINGERPRINT = ' + repr(SWEEP_CODE_FINGERPRINT) + '\\n'\n"
         "    + 'SWEEP_CASES = ' + repr(SWEEP_CASES) + '\\n'\n"
         "    + 'SWEEP_STATIC_GEOMETRY = ' + repr(SWEEP_STATIC_GEOMETRY) + '\\n'\n"
         "    + 'SWEEP_RECOMPUTE_MODES = ' + repr(SWEEP_RECOMPUTE_MODES) + '\\n'\n"
         "    + 'SWEEP_NOMINAL_PARAMETERS = ' + repr(SWEEP_NOMINAL_PARAMETERS) + '\\n'\n"
         ")\n"
         "run_remote_checked(_remote_payload + REMOTE_MODEL_BUILDER + '\\n' + REMOTE_SWEEP_RUNTIME, "
-        "'Build one shared nominal 3D model', timeout=1800)\n"
+        "'Build one shared nominal 3D model directly', timeout=1800)\n"
+        "_MULTIGPU_BUILD_STATE = lam.get(\"{'ports': PORTS, 'monitors': MONITORS, 'grating': GRATING_ANALYSIS, 'mmi': MMI_ANALYSIS, 'port_modes': PORT_MODE_SELECTIONS}\")\n"
+        "PORTS = list(_MULTIGPU_BUILD_STATE.get('ports') or PORTS)\n"
+        "MONITORS = list(_MULTIGPU_BUILD_STATE.get('monitors') or MONITORS)\n"
+        "GRATING_ANALYSIS = dict(_MULTIGPU_BUILD_STATE.get('grating') or GRATING_ANALYSIS)\n"
+        "MMI_ANALYSIS = dict(_MULTIGPU_BUILD_STATE.get('mmi') or MMI_ANALYSIS)\n"
+        "SWEEP_FIBER_MODE_SELECTIONS = dict(_MULTIGPU_BUILD_STATE.get('port_modes') or {})\n"
+        "if SWEEP_FIBER_MODE_SELECTIONS:\n"
+        "    print('Resolved rotation-aware fiber mode pairs:', SWEEP_FIBER_MODE_SELECTIONS)\n"
+    )
+    shared_seed_source = (
+        "# Every worker needs one shared seed because it owns a separate Lumerical process.\n"
+        "if not REMOTE_INSPECTION_FSP_SAVED:\n"
+        "    raise RuntimeError('The required shared inspection FSP was not saved')\n"
+        "SHARED_NOMINAL_FSP = REMOTE_INSPECTION_PROJECT_FILE\n"
+        "print('Multi-GPU workers use the always-saved inspection FSP.')\n"
+        "if not str(SHARED_NOMINAL_FSP).startswith('/lambda/nfs/'):\n"
+        "    raise RuntimeError('The nominal FSP must be on the shared /lambda/nfs filesystem')\n"
+        "print('Shared seed FSP for every A100 worker:', SHARED_NOMINAL_FSP)\n"
     )
     resource_save_cell = (
         base_resource_save_cell
-        + "\n# Every worker loads this one shared pre-sweep FSP; no case-specific FSP is created.\n"
-        + "SHARED_NOMINAL_FSP = REMOTE_PROJECT_FILE\n"
-        + "if not str(SHARED_NOMINAL_FSP).startswith('/lambda/nfs/'):\n"
-        + "    raise RuntimeError('The nominal FSP must be on the shared /lambda/nfs filesystem')\n"
-        + "print('Shared nominal FSP for every A100 worker:', SHARED_NOMINAL_FSP)\n"
+        + "\nif SETTINGS.get('run_after_build', True):\n"
+        + textwrap.indent(shared_seed_source, "    ")
+        + "else:\n"
+        + "    SHARED_NOMINAL_FSP = None\n"
+        + "    print('Multi-GPU run disabled; no shared worker seed was created.')\n"
     )
 
     worker_resource_remote = _REMOTE_RESOURCE_AND_SAVE.split("\n_project_name =", 1)[0].rstrip() + "\n"
     orchestration_cell = (
         "# Acquire licences only now, then run one persistent process on each prepared A100 node.\n"
         "from concurrent.futures import ThreadPoolExecutor, as_completed\n"
+        "import json\n"
         "import os\n"
         "import queue\n"
+        "import re\n"
         "import threading\n"
+        "import time\n"
         f"REMOTE_LAYER_BUILDER_HELPER = {repr(_MULTIGPU_LAYER_BUILDER_HELPER_REMOTE)}\n"
         f"REMOTE_WORKER_RESOURCE_SETUP = {repr(worker_resource_remote)}\n"
         f"REMOTE_SINGLE_SWEEP_CASE = {repr(_MULTIGPU_SINGLE_CASE_REMOTE)}\n"
@@ -6901,11 +8559,50 @@ def generate_lumerical_multigpu_sweep_notebook(
         "MULTIGPU_FAILURES = []\n"
         "MULTIGPU_FATAL_ERRORS = []\n"
         "_failure_lock = threading.Lock()\n"
+        "_progress_lock = threading.Lock()\n"
+        "_progress_state = {'processed': 0, 'completed': 0, 'failed': 0, 'duration_sum': 0.0, 'duration_count': 0}\n"
+        "_progress_started = time.monotonic()\n"
         "_case_queue = queue.Queue()\n"
+        "\n"
+        "def _multigpu_result_record(output):\n"
+        "    markers = re.findall(r'__MAX_LAYOUT_SWEEP_RESULT__(\\{[^\\n]+\\})', str(output))\n"
+        "    if not markers:\n"
+        "        return {}\n"
+        "    try:\n"
+        "        return dict(json.loads(markers[-1]))\n"
+        "    except Exception:\n"
+        "        return {}\n"
+        "\n"
+        "def _report_multigpu_progress(status, case_index, worker_id, duration=0.0, result=None):\n"
+        "    result = dict(result or {})\n"
+        "    terminal = status in {'completed', 'reused', 'failed'}\n"
+        "    with _progress_lock:\n"
+        "        if terminal:\n"
+        "            _progress_state['processed'] += 1\n"
+        "            _progress_state['failed'] += int(status == 'failed')\n"
+        "            _progress_state['completed'] += int(status != 'failed')\n"
+        "            if status != 'reused':\n"
+        "                _progress_state['duration_sum'] += max(0.0, float(duration))\n"
+        "                _progress_state['duration_count'] += 1\n"
+        "        processed = int(_progress_state['processed'])\n"
+        "        total = len(SWEEP_CASES)\n"
+        "        percent = 100.0 * processed / total if total else 0.0\n"
+        "        elapsed = time.monotonic() - _progress_started\n"
+        "        average = _progress_state['duration_sum'] / max(1, _progress_state['duration_count'])\n"
+        "        workers = max(1, len(MULTIGPU_WORKER_RECORDS))\n"
+        "        eta = average * max(0, total - processed) / workers if processed else float('nan')\n"
+        "        filled = int(max(0.0, min(100.0, percent)) / 2.0)\n"
+        "        label = SWEEP_CASES[case_index]['display_label'] if 0 <= int(case_index) < total else 'preparing'\n"
+        "        result_text = ''\n"
+        "        if 'peak_response' in result:\n"
+        "            result_text = ' | peak %.6g at %.3f nm' % (float(result['peak_response']), float(result.get('peak_wavelength_nm', float('nan'))))\n"
+        "        eta_text = ('%.1f min' % (eta / 60.0)) if eta == eta else 'estimating'\n"
+        "        print('Multi-GPU sweep [%s%s] %6.2f%% | %d/%d finished | failed %d | elapsed %.1f min | ETA %s' % ('#' * filled, '-' * (50 - filled), percent, processed, total, _progress_state['failed'], elapsed / 60.0, eta_text), flush=True)\n"
+        "        print('Current: %s on %s — %s%s' % (status, worker_id, label, result_text), flush=True)\n"
         "\n"
         "def _worker_payload(worker_work):\n"
         "    return (\n"
-        "        'import os, numpy as np, lumapi\\nUM = 1e-6\\n'\n"
+        "        'import os, shutil, numpy as np, lumapi\\nUM = 1e-6\\n'\n"
         "        + 'REMOTE_WORK = ' + repr(worker_work) + '\\n'\n"
         "        + 'SWEEP_RESULTS_ROOT = ' + repr(_base_results_root) + '\\n'\n"
         "        + 'SWEEP_RESULTS_BASENAME = ' + repr(SWEEP_RESULTS_BASENAME) + '\\n'\n"
@@ -6920,13 +8617,17 @@ def generate_lumerical_multigpu_sweep_notebook(
         "        + 'MMI_ANALYSIS = ' + repr(MMI_ANALYSIS) + '\\n'\n"
         "        + 'SWEEP_SPEC = ' + repr(SWEEP_SPEC) + '\\n'\n"
         "        + 'SWEEP_HASH = ' + repr(SWEEP_HASH) + '\\n'\n"
+        "        + 'SWEEP_CODE_FINGERPRINT = ' + repr(SWEEP_CODE_FINGERPRINT) + '\\n'\n"
         "        + 'SWEEP_CASES = ' + repr(SWEEP_CASES) + '\\n'\n"
         "        + 'SWEEP_STATIC_GEOMETRY = ' + repr(SWEEP_STATIC_GEOMETRY) + '\\n'\n"
         "        + 'SWEEP_RECOMPUTE_MODES = ' + repr(SWEEP_RECOMPUTE_MODES) + '\\n'\n"
+        "        + 'SWEEP_FIBER_MODE_SELECTIONS = ' + repr(SWEEP_FIBER_MODE_SELECTIONS) + '\\n'\n"
         "        + 'os.makedirs(REMOTE_WORK, exist_ok=True)\\nos.chdir(REMOTE_WORK)\\n'\n"
-        "        + 'fdtd = lumapi.FDTD(hide=' + repr(bool(SETTINGS.get('hide_cad', False)))\n"
+        "        + 'WORKER_RUNTIME_FSP = os.path.join(REMOTE_WORK, \"_worker_runtime_seed.fsp\")\\n'\n"
+        "        + 'shutil.copy2(' + repr(SHARED_NOMINAL_FSP) + ', WORKER_RUNTIME_FSP)\\n'\n"
+        "        + 'fdtd = lumapi.FDTD(hide=' + repr(bool(SETTINGS.get('hide_cad', True)))\n"
         "        + ', serverArgs={\\\"threads\\\": ' + repr(str(int(SETTINGS.get('build_cpu_threads', 30)))) + '})\\n'\n"
-        "        + 'fdtd.load(' + repr(SHARED_NOMINAL_FSP) + ')\\n'\n"
+        "        + 'fdtd.load(WORKER_RUNTIME_FSP)\\n'\n"
         "        + REMOTE_LAYER_BUILDER_HELPER + '\\n' + REMOTE_SWEEP_RUNTIME + '\\n' + REMOTE_WORKER_RESOURCE_SETUP\n"
         "    )\n"
         "\n"
@@ -6946,6 +8647,8 @@ def generate_lumerical_multigpu_sweep_notebook(
         "        '_had_fdtd = \\\"fdtd\\\" in globals()\\n'\n"
         "        + 'if _had_fdtd:\\n    fdtd.close()\\n'\n"
         "        + 'globals().pop(\\\"fdtd\\\", None)\\n'\n"
+        "        + '_worker_runtime = globals().get(\\\"WORKER_RUNTIME_FSP\\\", \\\"\\\")\\n'\n"
+        "        + 'if _worker_runtime and os.path.isfile(_worker_runtime): os.remove(_worker_runtime)\\n'\n"
         "        + 'print(\\\"__MULTIGPU_FDTD_STOPPED__\\\")\\n'\n"
         "    )\n"
         "    stop_error = None\n"
@@ -7034,15 +8737,20 @@ def generate_lumerical_multigpu_sweep_notebook(
         "            except queue.Empty:\n"
         "                break\n"
         "            case = SWEEP_CASES[case_index]\n"
+        "            case_started = time.monotonic()\n"
+        "            _report_multigpu_progress('running', case_index, record['worker_id'])\n"
         "            try:\n"
         "                case_code = 'MULTIGPU_CASE_INDEX = ' + repr(case_index) + '\\n' + REMOTE_SINGLE_SWEEP_CASE\n"
-        "                _multigpu_run_checked(client, case_code, record['label'] + ' — ' + case['display_label'], timeout=21600)\n"
+        "                case_output = _multigpu_run_checked(client, case_code, record['label'] + ' — ' + case['display_label'], timeout=21600)\n"
+        "                result_record = _multigpu_result_record(case_output)\n"
+        "                case_status = str(result_record.get('status', 'completed'))\n"
         "                completed += 1\n"
-        "                print('[%s] completed %d/%d: %s' % (record['worker_id'], case_index + 1, len(SWEEP_CASES), case['display_label']))\n"
+        "                _report_multigpu_progress(case_status, case_index, record['worker_id'], time.monotonic() - case_started, result_record)\n"
         "            except Exception as exc:\n"
         "                error_text = str(exc)\n"
         "                with _failure_lock:\n"
         "                    MULTIGPU_FAILURES.append({'index': case_index, 'values': case['values'], 'worker': record['worker_id'], 'error': error_text})\n"
+        "                _report_multigpu_progress('failed', case_index, record['worker_id'], time.monotonic() - case_started)\n"
         "                print('[%s] FAILED %s: %s' % (record['worker_id'], case['display_label'], error_text[-500:]))\n"
         "                if getattr(client, '_poisoned', False) or 'timed out after' in error_text.lower() or 'remote session died' in error_text.lower():\n"
         "                    record['poisoned'] = True\n"
@@ -7088,10 +8796,18 @@ def generate_lumerical_multigpu_sweep_notebook(
         "    schema_preflight_code = (\n"
         "        'MULTIGPU_CASE_INDEX = ' + repr(schema_preflight_index) + '\\n' + REMOTE_SINGLE_SWEEP_CASE\n"
         "    )\n"
-        "    _multigpu_run_checked(\n"
-        "        schema_preflight_record['client'], schema_preflight_code,\n"
-        "        'Result-schema preflight — ' + schema_preflight_case['display_label'], timeout=21600,\n"
-        "    )\n"
+        "    _preflight_started = time.monotonic()\n"
+        "    _report_multigpu_progress('running', schema_preflight_index, schema_preflight_record['worker_id'])\n"
+        "    try:\n"
+        "        _preflight_output = _multigpu_run_checked(\n"
+        "            schema_preflight_record['client'], schema_preflight_code,\n"
+        "            'Result-schema preflight — ' + schema_preflight_case['display_label'], timeout=21600,\n"
+        "        )\n"
+        "    except BaseException:\n"
+        "        _report_multigpu_progress('failed', schema_preflight_index, schema_preflight_record['worker_id'], time.monotonic() - _preflight_started)\n"
+        "        raise\n"
+        "    _preflight_result = _multigpu_result_record(_preflight_output)\n"
+        "    _report_multigpu_progress(str(_preflight_result.get('status', 'completed')), schema_preflight_index, schema_preflight_record['worker_id'], time.monotonic() - _preflight_started, _preflight_result)\n"
         "    print('Result-schema preflight passed; its checkpoint will be reused during aggregation.')\n"
         "    for case_index in range(len(SWEEP_CASES)):\n"
         "        if case_index != schema_preflight_index:\n"
@@ -7119,7 +8835,8 @@ def generate_lumerical_multigpu_sweep_notebook(
         "    'REMOTE_WORK': _base_results_root, 'SWEEP_SHARED_CHECKPOINT_DIR': SWEEP_SHARED_CHECKPOINT_DIR,\n"
         "    'SWEEP_RESULTS_ROOT': _base_results_root, 'SWEEP_RESULTS_BASENAME': SWEEP_RESULTS_BASENAME,\n"
         "    'SWEEP_EXECUTION_MODE': 'multi-node-parallel-workers', 'SWEEP_SPEC': SWEEP_SPEC,\n"
-        "    'SWEEP_HASH': SWEEP_HASH, 'SWEEP_CASES': SWEEP_CASES, 'SWEEP_STATIC_GEOMETRY': SWEEP_STATIC_GEOMETRY,\n"
+        "    'SWEEP_HASH': SWEEP_HASH, 'SWEEP_CODE_FINGERPRINT': SWEEP_CODE_FINGERPRINT,\n"
+        "    'SWEEP_CASES': SWEEP_CASES, 'SWEEP_STATIC_GEOMETRY': SWEEP_STATIC_GEOMETRY,\n"
         "    'SWEEP_RECOMPUTE_MODES': SWEEP_RECOMPUTE_MODES, 'SWEEP_NOMINAL_PARAMETERS': SWEEP_NOMINAL_PARAMETERS,\n"
         "    'SETTINGS': SETTINGS, 'MATERIAL_STACK': MATERIAL_STACK, 'BOUNDING_BOX_UM': BOUNDING_BOX_UM,\n"
         "    'SOURCE_COMPONENTS_JSON': SOURCE_COMPONENTS_JSON, 'GEOMETRY': GEOMETRY, 'PORTS': PORTS, 'FIBER_GEOMETRIES': FIBER_GEOMETRIES,\n"
@@ -7128,10 +8845,66 @@ def generate_lumerical_multigpu_sweep_notebook(
         "try:\n"
         "    exec(REMOTE_SWEEP_RUNTIME, _finalize_namespace)\n"
         "    effective_failures = [failure for failure in MULTIGPU_FAILURES if not _finalize_namespace['_sweep_case_is_complete'](failure['index'])]\n"
-        "    _finalize_namespace['_finalize_sweep_results'](effective_failures)\n"
+        "    _best_multigpu_index = int(_finalize_namespace['_finalize_sweep_results'](effective_failures))\n"
+        "    _best_fsp_name = os.path.basename(str(SETTINGS.get('project_file', 'lumerical_sweep.fsp')))\n"
+        "    if not _best_fsp_name.lower().endswith('.fsp'):\n"
+        "        _best_fsp_name += '.fsp'\n"
+        "    REMOTE_BEST_SWEEP_FSP = os.path.join(os.path.dirname(REMOTE_PROJECT_FILE), 'best_' + _best_fsp_name)\n"
+        "    _best_work = os.path.join(MULTIGPU_WORKER_ROOT, 'winning_fsp_replay')\n"
+        "    _best_packs_acquired = False\n"
+        "    _best_fdtd_open = False\n"
+        "    try:\n"
+        "        _best_checkout = _multigpu_run_checked(lam, MULTIGPU_LICENSE_CHECKOUT_REMOTE, 'Reserve controller licences for winning-FSP replay', timeout=300)\n"
+        "        if '__MULTIGPU_LICENSE_ACQUIRED__' not in _best_checkout:\n"
+        "            raise RuntimeError('Winning-FSP replay licence marker missing')\n"
+        "        _best_packs_acquired = True\n"
+        "        CONTROLLER_PACKS_CHECKED_OUT = True\n"
+        "        _multigpu_run_checked(lam, _worker_payload(_best_work), 'Load shared seed for winning-FSP replay', timeout=1800)\n"
+        "        _best_fdtd_open = True\n"
+        "        _best_save_code = (\n"
+        "            '_apply_sweep_case(' + repr(_best_multigpu_index) + ')\\n'\n"
+        "            + 'fdtd.run(\"FDTD\", \"GPU\")\\n'\n"
+        "            + 'fdtd.save(' + repr(REMOTE_BEST_SWEEP_FSP) + ')\\n'\n"
+        "            + 'import os\\n'\n"
+        "            + 'assert os.path.isfile(' + repr(REMOTE_BEST_SWEEP_FSP) + ') and os.path.getsize(' + repr(REMOTE_BEST_SWEEP_FSP) + ') > 0\\n'\n"
+        "            + 'print(\"Saved solved winning multi-GPU FSP.\")'\n"
+        "        )\n"
+        "        _multigpu_run_checked(lam, _best_save_code, 'Solve and save winning multi-GPU design', timeout=21600)\n"
+        "        _results_json_path = _finalize_namespace['SWEEP_RESULTS_JSON']\n"
+        "        with open(_results_json_path, 'r', encoding='utf-8') as _best_manifest_stream:\n"
+        "            _best_manifest = json.load(_best_manifest_stream)\n"
+        "        _best_manifest['best_fsp'] = REMOTE_BEST_SWEEP_FSP\n"
+        "        with open(_results_json_path, 'w', encoding='utf-8') as _best_manifest_stream:\n"
+        "            json.dump(_best_manifest, _best_manifest_stream, indent=2)\n"
+        "        with open(_finalize_namespace['SWEEP_TEXT_SUMMARY'], 'a', encoding='utf-8') as _best_summary_stream:\n"
+        "            _best_summary_stream.write('\\nWinning solved FSP\\n------------------\\n' + REMOTE_BEST_SWEEP_FSP + '\\n')\n"
+        "        print('Saved the solved winning multi-GPU design:', REMOTE_BEST_SWEEP_FSP)\n"
+        "    finally:\n"
+        "        if _best_fdtd_open:\n"
+        "            try:\n"
+        "                _multigpu_run_checked(lam, 'import os\\nfdtd.close()\\nglobals().pop(\"fdtd\", None)\\n_p = globals().get(\"WORKER_RUNTIME_FSP\", \"\")\\nif _p and os.path.isfile(_p): os.remove(_p)', 'Close winning-FSP replay FDTD', timeout=180)\n"
+        "            except BaseException as _best_close_exc:\n"
+        "                MULTIGPU_FATAL_ERRORS.append({'worker': 'winning-FSP replay', 'error': 'close: ' + str(_best_close_exc)})\n"
+        "        if _best_packs_acquired:\n"
+        "            try:\n"
+        "                _best_release = _multigpu_run_checked(lam, MULTIGPU_LICENSE_RELEASE_REMOTE, 'Return winning-FSP replay licences', timeout=300)\n"
+        "                if '__MULTIGPU_LICENSE_RELEASED__' not in _best_release:\n"
+        "                    raise RuntimeError('Winning-FSP replay release marker missing')\n"
+        "                CONTROLLER_PACKS_CHECKED_OUT = False\n"
+        "            except BaseException as _best_release_exc:\n"
+        "                CONTROLLER_PACKS_CHECKED_OUT = True\n"
+        "                MULTIGPU_FATAL_ERRORS.append({'worker': 'winning-FSP replay', 'error': 'release: ' + str(_best_release_exc)})\n"
         "except BaseException as finalize_exc:\n"
         "    MULTIGPU_FATAL_ERRORS.append({'worker': 'checkpoint aggregation', 'error': str(finalize_exc)})\n"
         "\n"
+        "try:\n"
+        "    _multigpu_run_checked(\n"
+        "        lam,\n"
+        "        'import os\\n_p = globals().get(\"REMOTE_RUNTIME_PROJECT_FILE\", \"\")\\nif _p and os.path.isfile(_p): os.remove(_p)\\nprint(\"Controller runtime FSP cleanup complete.\")',\n"
+        "        'Remove controller transient runtime FSP', timeout=120,\n"
+        "    )\n"
+        "except BaseException as _controller_runtime_cleanup_exc:\n"
+        "    print('Controller runtime-FSP cleanup warning:', str(_controller_runtime_cleanup_exc)[:240])\n"
         "uncertain = [record['label'] for record in MULTIGPU_WORKER_RECORDS if record.get('packs_checked_out') or record.get('cleanup_uncertain')]\n"
         "if uncertain:\n"
         "    MULTIGPU_FATAL_ERRORS.append({'worker': 'licence cleanup', 'error': 'Unconfirmed cleanup: ' + ', '.join(uncertain)})\n"
@@ -7139,9 +8912,21 @@ def generate_lumerical_multigpu_sweep_notebook(
         "    raise RuntimeError('Multi-GPU sweep completed with fatal worker/cleanup errors after aggregating every valid checkpoint: ' + repr(MULTIGPU_FATAL_ERRORS)) from _orchestration_exception\n"
         "print('All valid checkpoints were aggregated; every worker confirmed FDTD stopped and returned its HPC Packs.')\n"
     )
+    orchestration_cell = (
+        "if not SETTINGS.get('run_after_build', True):\n"
+        "    print('Multi-GPU sweep disabled by RUN_SIMULATION in cell 1.')\n"
+        "else:\n"
+        + textwrap.indent(orchestration_cell, "    ")
+    )
 
     local_results_cell = _SWEEP_LOCAL_RESULTS_CELL.replace(
         "lumerical_sweep_results", "lumerical_sweep_multithread_results"
+    )
+    local_results_cell = (
+        "if not SETTINGS.get('run_after_build', True):\n"
+        "    print('Multi-GPU sweep was not run, so there are no sweep results to fetch.')\n"
+        "else:\n"
+        + textwrap.indent(local_results_cell, "    ")
     )
     intro = f"""# Max Layout → Lumerical sweep-multithread
 
@@ -7149,7 +8934,7 @@ This notebook runs **{len(sweep_cases)} Cartesian sweep points** for **{sweep_sp
 
 - It is a separate export; the ordinary one-session sweep notebook is unchanged.
 - Production mode runs exactly one simulation per GPU. Add A100 nodes for more concurrency; same-GPU oversubscription is intentionally disabled.
-- The controller builds and saves one nominal FSP. Every worker loads that shared FSP and hot-swaps only the selected geometry.
+- The controller builds one nominal model and always saves it as the shared inspection FSP used to start the independent GPU workers. No FSP is saved per sweep case.
 - Workers use unique workspaces and persistent Lumerical processes, while a dynamic queue balances sweep points across nodes.
 - Atomic checkpoints are shared on `/lambda/nfs`, so rerunning resumes completed cases without rebuilding or resolving them.
 - Every worker switches back to CPU, closes FDTD, and returns its own three roamed HPC Packs in `finally` cleanup before local CPU plotting.
@@ -7160,7 +8945,7 @@ Keep the Piris 3D Launcher terminal open until the sweep and final cleanup cell 
 """
     notebook = {
         "cells": [
-            _notebook_cell("code", _PIRIS_PATHS_CELL),
+            _notebook_cell("code", _quick_run_options_cell(configuration, workflow="multi-gpu sweep")),
             _notebook_cell("markdown", intro),
             _notebook_cell("markdown", "## 1 · Embedded sweep specification\n"),
             _notebook_cell("code", payload_cell),
@@ -7176,9 +8961,9 @@ Keep the Piris 3D Launcher terminal open until the sweep and final cleanup cell 
             _notebook_cell("code", geometry_projection_cell),
             _notebook_cell("markdown", "## 7 · Verify nominal port modes\n"),
             _notebook_cell("code", port_mode_profiles_cell),
-            _notebook_cell("markdown", "## 8 · Configure the controller GPU and save one nominal FSP\n"),
+            _notebook_cell("markdown", "## 8 · Configure the controller GPU and prepare one shared worker seed\n"),
             _notebook_cell("code", resource_save_cell),
-            _notebook_cell("markdown", "## 9 · Inspect the one nominal FSP\n"),
+            _notebook_cell("markdown", "## 9 · Inspect the saved nominal FSP\n"),
             _notebook_cell("code", review_project_cell),
             _notebook_cell("markdown", "## 10 · Run sweep points concurrently on independent A100 workers\n"),
             _notebook_cell("code", orchestration_cell),
