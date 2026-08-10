@@ -13,12 +13,8 @@ from build_windows_bundle import bundle_payload
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_CMD = ROOT / "Max Layout Windows.cmd"
-LAMBDA_CMD = ROOT / "Start Piris 3D Simulations Windows.cmd"
 MAX_PS = ROOT / "windows" / "Install-And-Launch-MaxLayout.ps1"
-LAMBDA_PS = ROOT / "windows" / "Start-Piris3DSimulations.ps1"
-COMPATIBILITY_WRAPPER = ROOT / "windows" / "run_piris_3d_windows.py"
 GUI_REQUIREMENTS = ROOT / "windows" / "requirements-windows.txt"
-LAMBDA_REQUIREMENTS = ROOT / "windows" / "requirements-3d-launcher.txt"
 BUNDLE_BUILDER = ROOT / "build_windows_bundle.py"
 TRACKED_BUNDLE = ROOT / "Max Layout Windows.zip"
 
@@ -26,12 +22,8 @@ BUNDLE_FILES = {
     "LICENSE": ROOT / "LICENSE",
     "Max Layout.pyz": ROOT / "Max Layout.pyz",
     "Max Layout Windows.cmd": MAX_CMD,
-    "Start Piris 3D Simulations Windows.cmd": LAMBDA_CMD,
     "windows/Install-And-Launch-MaxLayout.ps1": MAX_PS,
     "windows/requirements-windows.txt": GUI_REQUIREMENTS,
-    "windows/Start-Piris3DSimulations.ps1": LAMBDA_PS,
-    "windows/requirements-3d-launcher.txt": LAMBDA_REQUIREMENTS,
-    "windows/run_piris_3d_windows.py": COMPATIBILITY_WRAPPER,
     "windows/README.txt": ROOT / "windows" / "README.txt",
 }
 
@@ -65,16 +57,6 @@ class WindowsCommandLauncherTests(unittest.TestCase):
         self.assertIn("pause", lower)
         self.assertNotIn("set-executionpolicy", lower)
 
-    def test_lambda_cmd_forwards_all_launcher_arguments(self) -> None:
-        text = _text(LAMBDA_CMD)
-        lower = text.casefold()
-        self.assertIn('set "app_root=%~dp0."', lower)
-        self.assertIn('set "bootstrap=%~dp0windows\\start-piris3dsimulations.ps1"', lower)
-        self.assertIn("powershell.exe -sta", lower)
-        self.assertIn('-file "%bootstrap%"', lower)
-        self.assertIn('-searchroot "%app_root%" %*', lower)
-        self.assertNotIn("set-executionpolicy", lower)
-
 
 class WindowsPowerShellBootstrapTests(unittest.TestCase):
     def test_max_layout_bootstrap_contract(self) -> None:
@@ -104,84 +86,6 @@ class WindowsPowerShellBootstrapTests(unittest.TestCase):
         self.assertNotIn('"-3.13"', lower)
         self.assertNotIn("set-executionpolicy", lower)
 
-    def test_lambda_bootstrap_contract(self) -> None:
-        text = _text(LAMBDA_PS)
-        lower = text.casefold()
-        for required in (
-            "valuefromremainingarguments",
-            "$launcherarguments",
-            "folderbrowserdialog",
-            "confidential piris 3d launcher",
-            "openssh.client",
-            "ssh.exe",
-            "scp.exe",
-            "ssh-keygen.exe",
-            "requirements.sha256",
-            "get-filehash",
-            "run_piris_3d_windows.py",
-            "--launcher-script",
-            "@launcherarguments",
-            "(3, 10) <= sys.version_info",
-            "python 3.10-3.13",
-            "psutil",
-            "function test-launcherenvironment",
-            "replacing an incompatible or incomplete launcher environment",
-            "remove-item -literalpath $venvroot -recurse -force",
-            "short-lived jupyter url token",
-            "$transcriptstarted = $false",
-            "x64 python is still unavailable",
-            "$missing = @(",
-            "windows powershell 5.1 collapses",
-        ):
-            self.assertIn(required, lower)
-        self.assertNotIn('"-3.9"', lower)
-        self.assertNotIn("(3, 9) <= sys.version_info", lower)
-        self.assertNotIn("set-executionpolicy", lower)
-
-
-class WindowsCompatibilityTests(unittest.TestCase):
-    def test_compatibility_wrapper_is_valid_python(self) -> None:
-        source = _text(COMPATIBILITY_WRAPPER)
-        ast.parse(source, filename=str(COMPATIBILITY_WRAPPER))
-
-    def test_compatibility_wrapper_covers_windows_only_gaps(self) -> None:
-        source = _text(COMPATIBILITY_WRAPPER)
-        lower = source.casefold()
-        for required in (
-            "webbrowser.open",
-            "psutil.process",
-            "creationflags",
-            "create_new_process_group",
-            "detached_process",
-            "create_no_window",
-            "icacls",
-            "--idle-watchdog",
-            "--watchdog-config",
-            "--lumerical-inventory",
-            "piris_lumerical_inventory",
-            "run_once",
-            "stop_work_processes",
-            "--launcher-script",
-            "piris_shared_ssh_private_key",
-            "piris_alik",
-            "_create_user_ssh_key",
-            "register",
-        ):
-            self.assertIn(required, lower)
-
-    def test_public_wrapper_contains_no_private_credential_file(self) -> None:
-        lower = _text(COMPATIBILITY_WRAPPER).casefold()
-        self.assertNotIn("lumerical-504521-7c755c2c58a7.json", lower)
-        self.assertNotIn("remote-token.json", lower)
-        self.assertNotIn("begin openssh private key", lower)
-
-    def test_explicit_shared_key_override_precedes_saved_key(self) -> None:
-        source = _text(COMPATIBILITY_WRAPPER)
-        self.assertLess(
-            source.index('shared_override = os.environ.get("PIRIS_SHARED_SSH_PRIVATE_KEY")'),
-            source.index('saved = module._read_user_config().get("private_key")'),
-        )
-
 
 class WindowsDependencyTests(unittest.TestCase):
     def test_gui_bootstrap_has_only_the_three_runtime_packages(self) -> None:
@@ -192,12 +96,6 @@ class WindowsDependencyTests(unittest.TestCase):
         text = _text(GUI_REQUIREMENTS).casefold()
         self.assertNotIn("torch", text)
         self.assertNotIn("cupy", text)
-
-    def test_lambda_bootstrap_has_only_google_and_watchdog_packages(self) -> None:
-        self.assertEqual(
-            _requirement_names(LAMBDA_REQUIREMENTS),
-            {"google-auth", "google-api-python-client", "psutil"},
-        )
 
 
 class WindowsBundleTests(unittest.TestCase):

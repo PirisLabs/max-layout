@@ -15,28 +15,12 @@ BUNDLE_FILES = (
     (ROOT / "Max Layout.pyz", "Max Layout.pyz"),
     (ROOT / "Max Layout Windows.cmd", "Max Layout Windows.cmd"),
     (
-        ROOT / "Start Piris 3D Simulations Windows.cmd",
-        "Start Piris 3D Simulations Windows.cmd",
-    ),
-    (
         ROOT / "windows" / "Install-And-Launch-MaxLayout.ps1",
         "windows/Install-And-Launch-MaxLayout.ps1",
     ),
     (
         ROOT / "windows" / "requirements-windows.txt",
         "windows/requirements-windows.txt",
-    ),
-    (
-        ROOT / "windows" / "Start-Piris3DSimulations.ps1",
-        "windows/Start-Piris3DSimulations.ps1",
-    ),
-    (
-        ROOT / "windows" / "requirements-3d-launcher.txt",
-        "windows/requirements-3d-launcher.txt",
-    ),
-    (
-        ROOT / "windows" / "run_piris_3d_windows.py",
-        "windows/run_piris_3d_windows.py",
     ),
     (ROOT / "windows" / "README.txt", "windows/README.txt"),
 )

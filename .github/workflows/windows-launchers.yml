@@ -1,4 +1,4 @@
-name: Windows launchers
+name: Max Layout Windows launcher
 
 on:
   pull_request:
@@ -8,7 +8,6 @@ on:
       - "Max Layout.pyz"
       - "LICENSE"
       - ".gitignore"
-      - "Start Piris 3D Simulations Windows.cmd"
       - "windows/**"
       - "build_windows_bundle.py"
       - "tests/test_windows_launchers.py"
@@ -20,7 +19,6 @@ on:
       - "Max Layout.pyz"
       - "LICENSE"
       - ".gitignore"
-      - "Start Piris 3D Simulations Windows.cmd"
       - "windows/**"
       - "build_windows_bundle.py"
       - "tests/test_windows_launchers.py"

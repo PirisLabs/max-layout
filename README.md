@@ -109,33 +109,6 @@ prefer the manual route, download `Max Layout.pyz` and run:
 py "Max Layout.pyz"
 ```
 
-### Start a Lambda node / 3D simulation on Windows
-
-The same extracted package includes
-`Start Piris 3D Simulations Windows.cmd`. Double-click it to start the project,
-notebook, Lambda-node, browser, result-sync, and one-hour idle-termination
-workflow used by the Mac launcher.
-
-The confidential **Piris 3D Launcher** folder is deliberately not included in
-this public repository or ZIP because it contains company credentials. On first
-launch, Windows searches common locations and then asks you to select that
-private folder. Its location is remembered locally. The setup installs the
-Google Drive packages and Windows OpenSSH Client when needed; it does not copy
-credentials into Max Layout or GitHub.
-
-For SSH access, the launcher offers the Ali shared key from
-`%USERPROFILE%\.ssh\piris_alik` (or the path in
-`PIRIS_SHARED_SSH_PRIVATE_KEY`). It can instead create a new key dedicated to
-that Windows computer; the new public key is registered and the matching
-private key is used immediately for the selected Lambda node. Private keys are
-never included in the public repository or Windows ZIP.
-
-Its setup logs are stored under:
-
-```text
-%LOCALAPPDATA%\PirisLabs\3DLauncher\logs
-```
-
 ## Troubleshooting
 
 **`py` or `python3` is not found**
@@ -154,9 +127,8 @@ shown above. Then run Max Layout again.
 **The Windows first-run setup stops**
 
 Read the final message in the setup window, then open the newest log under
-`%LOCALAPPDATA%\PirisLabs\MaxLayout\logs`. For the Lambda launcher, use
-`%LOCALAPPDATA%\PirisLabs\3DLauncher\logs`. Make sure the complete ZIP was
-extracted before double-clicking either launcher.
+`%LOCALAPPDATA%\PirisLabs\MaxLayout\logs`. Make sure the complete ZIP was
+extracted before double-clicking the launcher.
 
 **Large layouts feel slow**
 
@@ -260,12 +232,9 @@ GPU, per-worker licence cleanup, and CPU-only result aggregation. The node count
 remains selectable and defaults to eight A100 nodes, but production exports
 intentionally allow only one independent Lumerical process per GPU. Multiple
 processes on one GPU remain unavailable until model-memory and licence preflight
-is implemented. Multi-node notebooks require the matching Piris 3D
-Launcher/Requirements update. Every selected node must already exist, be an
-idle 1xA100, share `/lambda/nfs`, and contain its own private
-`~/remote-token.json`; the launcher does not copy credentials between nodes.
-The notebook stops before checking out GPU licences when this private inventory
-cannot be validated.
+is implemented. Multi-node notebooks require a compatible private remote
+execution environment; that confidential launcher and its credentials are not
+distributed in this repository or the public Windows package.
 
 **Lumerical optimization…** is a separate 3D alignment + shape-adjoint export. Its first
 page selects continuous geometry and grating-alignment parameters by their exact project-JSON names,
@@ -333,11 +302,12 @@ their lower and upper planes, including slab faces and patterned sidewalls,
 rather than as colored top planes only. Very thick first/last background layers are
 cropped by the chosen domain and continue through the PML.
 
-Every generated notebook follows the Piris Lambda licence
-lifecycle: seed Shared Web, roam three HPC Packs, build/run, save and fetch all
-results, close FDTD, check the packs back in, then close the remote session.
-Remote build, solve, analysis, and save stages are checked explicitly so a hidden remote
-traceback cannot turn into misleading missing-file messages at the end.
+Every generated Lumerical notebook manages the complete remote licence
+lifecycle: acquire the required solver and HPC licences, build and run, save
+and fetch results, close FDTD, release the HPC packs, and close the remote
+session. Remote build, solve, analysis, and save stages are checked explicitly
+so a hidden remote traceback cannot become a misleading missing-file message.
+
 Every completed single run, sequential sweep, multi-GPU sweep, and adjoint
 optimization also writes and fetches `summary.txt`. It records the exact source
 JSON parameters while also presenting the major device values one per line.
@@ -426,8 +396,7 @@ python3 build_windows_bundle.py
 ```
 
 That writes `Max Layout Windows.zip` from an explicit public-file allowlist.
-The bundle contains both Windows launchers and their bootstrap files, but never
-the private Piris 3D Launcher, Lambda tokens, Google credentials, or SSH keys.
+The bundle contains Max Layout and its Windows bootstrap files only.
 
 To run straight from source without building:
 
