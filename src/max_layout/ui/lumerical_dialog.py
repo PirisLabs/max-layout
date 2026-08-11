@@ -11,6 +11,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QBrush, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QTableWidget,
@@ -1714,8 +1716,15 @@ class LumericalExportDialog(QDialog):
         self.scope_options = scope_options
         self.saved = deepcopy(saved or {})
         self.setWindowTitle("Export Lumerical simulation notebook")
-        self.resize(1420, 860)
-        self.setMinimumSize(1180, 720)
+        screen = parent.screen() if parent is not None else QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            target_width = min(1420, max(640, available.width() - 48))
+            target_height = min(860, max(480, available.height() - 48))
+        else:
+            target_width, target_height = 1420, 860
+        self.resize(target_width, target_height)
+        self.setMinimumSize(min(900, target_width), min(540, target_height))
         outer = QVBoxLayout(self)
         summary = QLabel(
             "Choose exactly what geometry to embed, define the bottom-to-top material stack, "
@@ -1724,18 +1733,26 @@ class LumericalExportDialog(QDialog):
         summary.setWordWrap(True)
         outer.addWidget(summary)
 
+        # Keep the primary actions pinned above the option-heavy tab pages.
+        # They remain reachable on laptop displays even while the current tab
+        # scrolls through a long stack or solver form.
+        self.export_buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.export_buttons.setObjectName("lumericalExportActions")
+        self.export_buttons.button(QDialogButtonBox.StandardButton.Save).setText(
+            "Choose notebook file…"
+        )
+        self.export_buttons.accepted.connect(self.accept)
+        self.export_buttons.rejected.connect(self.reject)
+        outer.addWidget(self.export_buttons)
+
         self.tabs = QTabWidget()
-        outer.addWidget(self.tabs)
+        outer.addWidget(self.tabs, 1)
         self._make_geometry_tab()
         self._make_stack_tab()
         self._make_solver_tab()
         self._make_preview_tab()
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Choose notebook file…")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        outer.addWidget(buttons)
 
     def _make_geometry_tab(self) -> None:
         tab = QWidget()
@@ -1959,7 +1976,18 @@ class LumericalExportDialog(QDialog):
 
     def _make_solver_tab(self) -> None:
         tab = QWidget()
-        form = QFormLayout(tab)
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        self.solver_scroll_area = QScrollArea()
+        self.solver_scroll_area.setObjectName("lumericalSolverScrollArea")
+        self.solver_scroll_area.setWidgetResizable(True)
+        self.solver_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        solver_contents = QWidget()
+        form = QFormLayout(solver_contents)
+        self.solver_scroll_area.setWidget(solver_contents)
+        tab_layout.addWidget(self.solver_scroll_area)
         self.wavelength_start = QDoubleSpinBox(); self.wavelength_start.setRange(0.01, 1000); self.wavelength_start.setDecimals(6); self.wavelength_start.setValue(float(self.saved.get("wavelength_start_um", 1.25)))
         self.wavelength_stop = QDoubleSpinBox(); self.wavelength_stop.setRange(0.01, 1000); self.wavelength_stop.setDecimals(6); self.wavelength_stop.setValue(float(self.saved.get("wavelength_stop_um", 1.35)))
         saved_domain = dict(self.saved.get("domain_padding_um", {}))
