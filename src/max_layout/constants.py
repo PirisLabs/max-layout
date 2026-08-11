@@ -38,6 +38,7 @@ LAYER_NAME_MAP = {
 SIMULATION_COMPONENT_KINDS = {
     "FDTD port",
     "Fiber-axis FDTD port",
+    "Gaussian source",
     "Fiber geometry",
     # Legacy combined object: older projects still load, but it is hidden from
     # the library and exports as geometry only so it never creates a port.
@@ -134,6 +135,15 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                      # One parent-level tilt drives the fiber core/cladding,
                      # source port, and passive fiber-power plane together.
                      'angle_theta': 7.0,
+                     # The source can be either the existing fiber eigenmode
+                     # port or a direct Gaussian beam.  Snake-case values are
+                     # stable in saved JSON and deliberately independent of
+                     # the friendlier labels shown in the property editor.
+                     'excitation_type': 'fiber_mode',
+                     'gaussian_waist_radius_um': 4.5,
+                     'gaussian_distance_from_waist_um': 0.0,
+                     'gaussian_source_span_um': 20.0,
+                     'gaussian_multifrequency_points': 5,
                      'fiber_power_monitor_below_source_um': 0.1,
                      'fdtd_port_offset_from_waveguide_end_um': 2.0,
                      # Automatic TFLN waveguide planes use at least 3 um and
@@ -783,6 +793,11 @@ DEFAULT_COMPONENT_VALUES["GC-SOI"] = {
     # Canonical parent-level fiber/source tilt.  Older projects used
     # ``fiber_tilt_deg`` and are migrated when loaded.
     "angle_theta": 10.0,
+    "excitation_type": "fiber_mode",
+    "gaussian_waist_radius_um": 4.5,
+    "gaussian_distance_from_waist_um": 0.0,
+    "gaussian_source_span_um": 20.0,
+    "gaussian_multifrequency_points": 5,
     "fiber_tox_offset_um": 0.65,
     "fiber_core_diameter_um": 9.0,
     "fiber_core_index": 1.44427,
@@ -845,6 +860,23 @@ DEFAULT_COMPONENT_VALUES.update(
             "align to fiber axis": True,
             "rotation offset_um": 4.420244193,
         },
+        "Gaussian source": {
+            "name": "gaussian_source",
+            "injection axis": "Z",
+            "direction": "Backward",
+            "z reference": "top of stack",
+            "distance_um": 0.0,
+            "angle theta": 7.0,
+            "angle phi": 0.0,
+            "polarization": "local TE",
+            "polarization angle": 90.0,
+            "waist radius_um": 4.5,
+            "distance from waist_um": 0.0,
+            "span_um": 20.0,
+            "amplitude": 1.0,
+            "multifrequency beam calculation": True,
+            "frequency points": 5,
+        },
         "Fiber geometry": {
             "name": "fiber", "distance_um": 0.0, "z reference": "top of SiO2 cladding",
             "angle theta": 7.0, "angle phi": 0.0,
@@ -896,9 +928,15 @@ INTEGER_PARAMETERS.add("waveguide_mode_search_count")
 
 INTEGER_PARAMETERS.add("mode search count")
 
+INTEGER_PARAMETERS.add("gaussian_multifrequency_points")
+
+INTEGER_PARAMETERS.add("frequency points")
+
 BOOL_PARAMETERS.add("align to fiber axis")
 
 BOOL_PARAMETERS.add("multifrequency mode injection")
+
+BOOL_PARAMETERS.add("multifrequency beam calculation")
 
 PHOTONIC_COMPONENT_KINDS = (
     set(DEFAULT_COMPONENT_VALUES)
@@ -952,9 +990,12 @@ CHOICE_PARAMETERS.update({"lattice":["triangular","square"],"hole_shape":["circu
 CHOICE_PARAMETERS.update({"slab_shape":["rectangle","ellipse","hexagon"],"device_type":["bulk crystal","line-defect waveguide"],"mask_tone":["positive: holes only","negative: slab minus holes"]})
 
 CHOICE_PARAMETERS.update({
+    "excitation_type": ["fiber_mode", "gaussian_beam"],
     "port geometry": ["line", "surface"],
     "monitor geometry": ["line", "surface"],
     "plane normal": ["X", "Y", "Z"],
+    "injection axis": ["X", "Y", "Z"],
+    "direction": ["Forward", "Backward"],
     "dir": ["Bidirectional", "Forward", "Backward"],
     "pos": ["Left", "Right", "Top", "Bottom"],
     "z reference": ["top of SiO2 cladding", "top of stack", "device top"],
@@ -981,6 +1022,7 @@ COMPONENT_DISPLAY_NAMES={
     "4-inch wafer outline":"4-inch (100 mm) wafer outline with primary flat",
     "FDTD port":"Ansys standard FDTD port — waveguide",
     "Fiber-axis FDTD port":"Ansys standard FDTD port — fiber axis",
+    "Gaussian source":"Gaussian excitation port (Lumerical beam source)",
     "Fiber geometry":"Ansys fiber geometry group — core + cladding",
     "Fiber port":"Legacy combined fiber object",
     "Power monitor":"Power monitor",

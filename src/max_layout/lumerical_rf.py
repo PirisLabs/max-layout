@@ -1359,20 +1359,88 @@ print("Saved RF summary:", summary_path)
 '''
 
 
-_RF_RELEASE_CELL = r'''# Release in the reference order: close CAD, return three HPC Packs, close SSH.
-try:
-    lam.run(
-        "try:\n    fdtd.close()\nexcept Exception:\n    pass\n",
-        timeout=90,
-    )
-finally:
-    _release = subprocess.run(_SSH + [HOST,
-        f'{LIC}/LicensingSettings web shared products checkin '
-        '--name "Ansys HPC Pack - Shared Web" --count 3 --mode user'],
+_RF_RELEASE_CELL = r'''# Close CAD, then return and verify the named roaming HPC Pack reservation.
+import json
+
+_rf_hpc_name = "Ansys HPC Pack - Shared Web"
+
+def _rf_license_json(raw, label, require_usage=False):
+    text = str(raw or "")
+    decoder = json.JSONDecoder()
+    objects = []
+    for offset, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[offset:])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict) and "status" in value:
+            objects.append(value)
+    if not objects:
+        raise RuntimeError(label + " returned no readable LicensingSettings JSON: " + text[-700:])
+    value = objects[-1]
+    if str(value.get("status", "")).upper() != "SUCCESS":
+        raise RuntimeError(label + " failed: " + repr(value))
+    if require_usage and (
+        not isinstance(value.get("usage"), list)
+        or any(not isinstance(item, dict) for item in value["usage"])
+    ):
+        raise RuntimeError(label + " returned an invalid usage list: " + repr(value))
+    return value
+
+def _rf_in_use(label):
+    result = subprocess.run(_SSH + [HOST,
+        f'{LIC}/LicensingSettings web shared products in-use '
+        '--type roaming --licenseModel "Shared Web" --mode user'],
         capture_output=True, text=True, timeout=180)
-    _release_out = (_release.stdout + _release.stderr).strip()
-    print("HPC Packs:", "3 returned to Shared Web" if "SUCCESS" in _release_out else _release_out[:400])
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        raise RuntimeError(label + " command failed: " + output[-700:])
+    return _rf_license_json(output, label, require_usage=True)
+
+_release_error = None
+try:
+    _stop_output = lam.run(
+        "_fdtd_owner = globals().pop('fdtd', None)\n"
+        "if _fdtd_owner is not None:\n    _fdtd_owner.close()\n"
+        "print('__MAX_LAYOUT_RF_FDTD_CLOSED__')\n",
+        quiet=True, timeout=120,
+    )
+    if "__MAX_LAYOUT_RF_FDTD_CLOSED__" not in str(_stop_output):
+        raise RuntimeError("RF FDTD close was not confirmed; HPC Packs were not checked in")
+    if callable(getattr(lam, "stop_work_processes", None)):
+        _stop_report = lam.stop_work_processes(timeout=25)
+        if not (
+            isinstance(_stop_report, dict)
+            and _stop_report.get("confirmed") is True
+            and not _stop_report.get("remaining_pids", [])
+        ):
+            raise RuntimeError("RF process stop was not confirmed: " + repr(_stop_report))
+    _before = _rf_in_use("RF HPC Pack pre-release check")
+    _present = [item for item in _before["usage"] if str(item.get("name", "")) == _rf_hpc_name]
+    if any(item.get("roaming") is not True for item in _present):
+        raise RuntimeError("RF pre-release query reported a non-roaming HPC Pack: " + repr(_present))
+    if _present:
+        _release = subprocess.run(_SSH + [HOST,
+            f'{LIC}/LicensingSettings web shared products checkin '
+            f'--name "{_rf_hpc_name}" --type roaming '
+            '--licenseModel "Shared Web" --mode user'],
+            capture_output=True, text=True, timeout=180)
+        _release_out = (_release.stdout + _release.stderr).strip()
+        if _release.returncode != 0:
+            raise RuntimeError("RF HPC Pack checkin command failed: " + _release_out[-700:])
+        _rf_license_json(_release_out, "RF HPC Pack checkin")
+    _after = _rf_in_use("RF HPC Pack post-release check")
+    if any(str(item.get("name", "")) == _rf_hpc_name for item in _after["usage"]):
+        raise RuntimeError("RF HPC Pack still appears in structured post-check usage: " + repr(_after["usage"]))
+    print("HPC Packs: named roaming reservation returned and absent from post-check in-use output")
+except Exception as _release_exc:
+    _release_error = str(_release_exc)
+finally:
     lam.close()
+if _release_error is not None:
+    raise RuntimeError(_release_error)
 '''
 
 

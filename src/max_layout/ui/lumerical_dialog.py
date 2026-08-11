@@ -840,31 +840,59 @@ class ThreeDModelPreview(QWidget):
                 painter.setPen(QPen(QColor(14, 116, 144, 110), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 painter.drawLine(start, stop)
             elif kind in {
-                "FDTD port", "Fiber-axis FDTD port", "Power monitor",
+                "FDTD port", "Fiber-axis FDTD port", "Gaussian source", "Power monitor",
                 "Mode expansion monitor", "Field profile monitor",
                 "RF mode port", "RF power monitor",
             } and self.show_ports:
-                normal = str(params.get("plane normal", "X")).upper()
+                beam_arrow = None
+                normal = str(
+                    params.get("plane normal", params.get("injection axis", "X"))
+                ).upper()
                 span = 0.5 * float(params.get("span_um", max(params.get("x span", 0.0), params.get("y span", 0.0), 2.5)))
                 if normal == "Z":
                     cx, cy, port_z = _fiber_axis_plane_center(
                         component, state["components"], state["stack_ranges"], device_top, stack_top
                     )
-                    theta = math.radians(float(params.get("angle theta", 0.0)))
-                    phi = math.radians(float(component.get("orientation_deg", 0.0)) + float(params.get("angle phi", 0.0)))
-                    transverse = np.asarray([-math.sin(phi), math.cos(phi), 0.0], dtype=float)
-                    tilted = np.asarray(
-                        [math.cos(theta) * math.cos(phi), math.cos(theta) * math.sin(phi), -math.sin(theta)],
-                        dtype=float,
+                    x_half = 0.5 * max(
+                        1e-6,
+                        float(params.get("x span", params.get("span_um", 2.5))),
                     )
-                    center_3d = np.asarray([cx, cy, port_z], dtype=float)
+                    y_half = 0.5 * max(
+                        1e-6,
+                        float(params.get("y span", params.get("span_um", 2.5))),
+                    )
+                    # ``injection axis = Z`` creates a horizontal XY object
+                    # plane in the solver.  Angle theta/phi rotate the beam's
+                    # propagation vector, not the source or monitor plane.
                     vertices = [
-                        center_3d - span * transverse - span * tilted,
-                        center_3d + span * transverse - span * tilted,
-                        center_3d + span * transverse + span * tilted,
-                        center_3d - span * transverse + span * tilted,
+                        (cx - x_half, cy - y_half, port_z),
+                        (cx + x_half, cy - y_half, port_z),
+                        (cx + x_half, cy + y_half, port_z),
+                        (cx - x_half, cy + y_half, port_z),
                     ]
-                    plane = [screen(raw(tuple(vertex))) for vertex in vertices]
+                    plane = [screen(raw(vertex)) for vertex in vertices]
+                    if kind == "Gaussian source":
+                        theta = math.radians(float(params.get("angle theta", 0.0)))
+                        phi = math.radians(
+                            float(component.get("orientation_deg", 0.0))
+                            + float(params.get("angle phi", 0.0))
+                        )
+                        propagation_sign = (
+                            -1.0
+                            if str(params.get("direction", "Backward")).lower()
+                            == "backward"
+                            else 1.0
+                        )
+                        arrow_length = max(1.0, 0.35 * max(x_half, y_half) * 2.0)
+                        arrow_stop = (
+                            cx + arrow_length * math.sin(theta) * math.cos(phi),
+                            cy + arrow_length * math.sin(theta) * math.sin(phi),
+                            port_z + propagation_sign * arrow_length * math.cos(theta),
+                        )
+                        beam_arrow = (
+                            screen(raw((cx, cy, port_z))),
+                            screen(raw(arrow_stop)),
+                        )
                 else:
                     normal_angle = float(component.get("orientation_deg", 0.0)) + (90.0 if normal == "Y" else 0.0)
                     nearest = int(round(normal_angle / 90.0) * 90) % 360
@@ -900,6 +928,29 @@ class ThreeDModelPreview(QWidget):
                 painter.setPen(QPen(QColor("#059669" if is_monitor else "#7c3aed"), 1.7))
                 painter.setBrush(QBrush(QColor(5, 150, 105, 42) if is_monitor else QColor(124, 58, 237, 42)))
                 painter.drawPolygon(QPolygonF(plane))
+                if beam_arrow is not None:
+                    arrow_start, arrow_stop = beam_arrow
+                    painter.setPen(QPen(QColor("#ea580c"), 2.2))
+                    painter.drawLine(arrow_start, arrow_stop)
+                    dx = arrow_stop.x() - arrow_start.x()
+                    dy = arrow_stop.y() - arrow_start.y()
+                    length_px = max(math.hypot(dx, dy), 1e-9)
+                    ux, uy = dx / length_px, dy / length_px
+                    wing = 7.0
+                    painter.drawLine(
+                        arrow_stop,
+                        QPointF(
+                            arrow_stop.x() - wing * ux + 0.55 * wing * uy,
+                            arrow_stop.y() - wing * uy - 0.55 * wing * ux,
+                        ),
+                    )
+                    painter.drawLine(
+                        arrow_stop,
+                        QPointF(
+                            arrow_stop.x() - wing * ux - 0.55 * wing * uy,
+                            arrow_stop.y() - wing * uy + 0.55 * wing * ux,
+                        ),
+                    )
 
         corners = {(ix, iy, iz): screen(raw((x, y, z))) for ix, x in enumerate((x0, x1)) for iy, y in enumerate((y0, y1)) for iz, z in enumerate((z0, z1))}
         edges = []
@@ -2129,7 +2180,7 @@ class LumericalExportDialog(QDialog):
         all_points = []
         for component in self._preview_components():
             if component.get("kind") == "E-beam multipass" or component.get("kind") in {
-                "FDTD port", "Fiber-axis FDTD port", "Fiber geometry", "Fiber port",
+                "FDTD port", "Fiber-axis FDTD port", "Gaussian source", "Fiber geometry", "Fiber port",
                 "Power monitor", "Mode expansion monitor", "Field profile monitor",
             }:
                 continue
@@ -2146,13 +2197,15 @@ class LumericalExportDialog(QDialog):
         y_values = [float(point[1]) for point in all_points]
         for component in self._preview_components():
             kind = str(component.get("kind", ""))
-            if kind not in {"FDTD port", "Fiber-axis FDTD port", "Power monitor", "Mode expansion monitor", "Field profile monitor"}:
+            if kind not in {"FDTD port", "Fiber-axis FDTD port", "Gaussian source", "Power monitor", "Mode expansion monitor", "Field profile monitor"}:
                 continue
             params = component.get("params", {})
             span = float(params.get("span_um", max(params.get("x span", 0.0), params.get("y span", 0.0), 2.0)))
             half = 0.5 * max(0.0, span)
             cx, cy = float(component.get("x", 0.0)), float(component.get("y", 0.0))
-            normal = str(params.get("plane normal", "X")).upper()
+            normal = str(
+                params.get("plane normal", params.get("injection axis", "X"))
+            ).upper()
             if normal != "Z":
                 normal_angle = float(component.get("orientation_deg", 0.0)) + (90.0 if normal == "Y" else 0.0)
                 nearest = int(round(normal_angle / 90.0) * 90) % 360
@@ -2195,9 +2248,11 @@ class LumericalExportDialog(QDialog):
         for component in self._preview_components():
             kind = str(component.get("kind", ""))
             params = component.get("params", {})
-            if kind not in {"FDTD port", "Fiber-axis FDTD port", "Power monitor", "Mode expansion monitor", "Field profile monitor"}:
+            if kind not in {"FDTD port", "Fiber-axis FDTD port", "Gaussian source", "Power monitor", "Mode expansion monitor", "Field profile monitor"}:
                 continue
-            plane_normal = str(params.get("plane normal", "X")).upper()
+            plane_normal = str(
+                params.get("plane normal", params.get("injection axis", "X"))
+            ).upper()
             if plane_normal == "Z":
                 reference_z = _stack_reference_z(params, stack_ranges, device_top, stack_top)
                 plane_z = reference_z + float(params.get("distance_um", 0.0))

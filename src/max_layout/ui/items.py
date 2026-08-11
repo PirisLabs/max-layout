@@ -155,7 +155,9 @@ def component_local_polygons(component: dict[str, Any]) -> list[tuple[np.ndarray
             distance = float(params.get("distance_um", 0.0))
             geometry = str(params.get("port geometry", params.get("monitor geometry", "surface"))).lower()
             thickness = max(0.08, min(1.0 if geometry == "surface" else 0.15, span / 10.0))
-            plane_normal = str(params.get("plane normal", "X")).upper()
+            plane_normal = str(
+                params.get("plane normal", params.get("injection axis", "X"))
+            ).upper()
             x_span = max(0.0, float(params.get("x span", span if plane_normal != "X" else 0.0)))
             y_span = max(0.0, float(params.get("y span", span if plane_normal != "Y" else 0.0)))
             transverse_span = max(x_span, y_span, span)

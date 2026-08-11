@@ -241,7 +241,34 @@ def migrate_grating_fiber_offset_parameter(component: dict[str, Any]) -> bool:
     if "fiber_tilt_deg" in params:
         params.pop("fiber_tilt_deg", None)
         changed = True
+    gaussian_defaults: dict[str, Any] = {
+        "excitation_type": "fiber_mode",
+        "gaussian_waist_radius_um": 4.5,
+        "gaussian_distance_from_waist_um": 0.0,
+        "gaussian_source_span_um": 20.0,
+        "gaussian_multifrequency_points": 5,
+    }
+    for key, default in gaussian_defaults.items():
+        if key not in params:
+            params[key] = default
+            changed = True
+    raw_excitation = str(params.get("excitation_type", "fiber_mode")).strip().lower()
+    normalized_excitation = (
+        "gaussian_beam"
+        if raw_excitation.replace("-", "_").replace(" ", "_")
+        in {"gaussian", "gaussian_beam", "gaussian_source", "gaussian_port"}
+        else "fiber_mode"
+    )
+    if params.get("excitation_type") != normalized_excitation:
+        params["excitation_type"] = normalized_excitation
+        changed = True
     return changed
+
+
+def grating_excitation_type(component: dict[str, Any]) -> str:
+    """Return the canonical grating source choice stored in project JSON."""
+    migrate_grating_fiber_offset_parameter(component)
+    return str(component.get("params", {}).get("excitation_type", "fiber_mode"))
 
 
 def grating_angle_theta_deg(component: dict[str, Any]) -> float:
@@ -295,6 +322,179 @@ def grating_fiber_center_local_um(component: dict[str, Any]) -> tuple[float, flo
         if kind == "Grating coupler" and any(key in params for key in legacy_keys):
             offset_um += _standard_grating_focus_offset_um(params)
     return grating_first_flare_local_x_um(component) + offset_um, 0.0
+
+
+def _automatic_grating_excitation_companions(
+    window: Any,
+    component: dict[str, Any],
+    source_port_order: int,
+) -> list[dict[str, Any]]:
+    """Build one exclusive grating source family and its input-power plane.
+
+    ``fiber_mode`` retains the established fiber geometry plus eigenmode FDTD
+    port. ``gaussian_beam`` replaces both with one native Gaussian source.
+    The passive Z-normal power monitor is shared by both choices so coupling
+    efficiencies always use measured incident power rather than an assumed
+    unit source amplitude.
+    """
+    if str(component.get("kind", "")) not in {"Grating coupler", "GC-SOI"}:
+        return []
+    migrate_grating_fiber_offset_parameter(component)
+    params = component.get("params", {})
+    is_soi = str(component.get("kind", "")) == "GC-SOI"
+    excitation_type = grating_excitation_type(component)
+    local_x, local_y = grating_fiber_center_local_um(component)
+    offset_um = float(params["fiber_offset"])
+    theta_deg = grating_angle_theta_deg(component)
+    orientation_deg = float(component.get("orientation_deg", 0.0))
+    orientation_rad = math.radians(orientation_deg)
+    source_x = (
+        float(component.get("x", 0.0))
+        + local_x * math.cos(orientation_rad)
+        - local_y * math.sin(orientation_rad)
+    )
+    source_y = (
+        float(component.get("y", 0.0))
+        + local_x * math.sin(orientation_rad)
+        + local_y * math.cos(orientation_rad)
+    )
+    source_distance_um = 0.0
+    source_z_reference = "top of stack"
+    if is_soi:
+        tox_offset_um = float(params.get("fiber_tox_offset_um", 0.65))
+        source_distance_um = (
+            tox_offset_um * math.cos(math.radians(theta_deg)) - 0.35
+        )
+        source_z_reference = "top of SiO2 cladding"
+
+    built: list[dict[str, Any]] = []
+    if excitation_type == "fiber_mode":
+        fiber = window.make_component("Fiber geometry", source_x, source_y)
+        fiber["orientation_deg"] = orientation_deg
+        fiber["auto_placed"] = True
+        fiber["simulation_parent_uid"] = int(component["uid"])
+        fiber["fiber_offset_um"] = offset_um
+        fiber["params"].update(
+            {
+                "name": f"uid_{int(component['uid'])}_fiber",
+                "angle theta": theta_deg,
+                "angle phi": 0.0,
+                "distance_um": 0.0,
+                "z reference": (
+                    "center of SiO2 cladding" if is_soi
+                    else "top of SiO2 cladding"
+                ),
+                "core diameter_um": float(params.get("fiber_core_diameter_um", 9.0)),
+                "core index": float(params.get("fiber_core_index", 1.44427)),
+                "cladding diameter_um": float(params.get("fiber_cladding_diameter_um", 50.0)),
+                "cladding index": float(params.get("fiber_cladding_index", 1.43482)),
+                "fiber length_um": float(params.get("fiber_length_um", 20.0)),
+            }
+        )
+        built.append(fiber)
+
+        source = window.make_component("Fiber-axis FDTD port", source_x, source_y)
+        source["orientation_deg"] = orientation_deg
+        source["auto_placed"] = True
+        source["simulation_parent_uid"] = int(component["uid"])
+        source["fiber_offset_um"] = offset_um
+        source["params"].update(
+            {
+                "name": f"uid_{int(component['uid'])}_fiber_axis",
+                "order": int(source_port_order),
+                "dir": "Backward",
+                "fiber plane role": "source",
+                "angle theta": theta_deg,
+                "angle phi": 0.0,
+                "align to fiber axis": True,
+                "rotation offset_um": 4.0
+                * float(params.get("fiber_core_diameter_um", 9.0))
+                * math.tan(math.radians(theta_deg)),
+                "distance_um": source_distance_um,
+                "z reference": source_z_reference,
+            }
+        )
+        source_span_um = float(source["params"].get("span_um", 20.0))
+    else:
+        source = window.make_component("Gaussian source", source_x, source_y)
+        source["orientation_deg"] = orientation_deg
+        source["auto_placed"] = True
+        source["simulation_parent_uid"] = int(component["uid"])
+        source["simulation_parent_port"] = "gaussian_source"
+        source["fiber_offset_um"] = offset_um
+        source["params"].update(
+            {
+                "name": f"uid_{int(component['uid'])}_gaussian_source",
+                "injection axis": "Z",
+                "direction": "Backward",
+                "angle theta": theta_deg,
+                "angle phi": 0.0,
+                "polarization": "local TE",
+                "polarization angle": 90.0,
+                "waist radius_um": max(
+                    0.001, float(params.get("gaussian_waist_radius_um", 4.5))
+                ),
+                "distance from waist_um": float(
+                    params.get("gaussian_distance_from_waist_um", 0.0)
+                ),
+                "span_um": max(
+                    0.001, float(params.get("gaussian_source_span_um", 20.0))
+                ),
+                "amplitude": 1.0,
+                "multifrequency beam calculation": True,
+                "frequency points": max(
+                    1, int(params.get("gaussian_multifrequency_points", 5))
+                ),
+                # Shared placement fields keep the preview and exporter on
+                # the same stack-relative source plane as the fiber option.
+                "z reference": source_z_reference,
+                "distance_um": source_distance_um,
+            }
+        )
+        source_span_um = float(source["params"]["span_um"])
+    built.append(source)
+
+    below_source_um = max(
+        0.001, float(params.get("fiber_power_monitor_below_source_um", 0.1))
+    )
+    source_phi_rad = orientation_rad + math.radians(
+        float(source["params"].get("angle phi", 0.0))
+    )
+    lateral_um = below_source_um * math.tan(math.radians(theta_deg))
+    projected_span_um = source_span_um / max(
+        math.cos(math.radians(theta_deg)), 1e-3
+    )
+    input_power = window.make_component(
+        "Power monitor",
+        source_x - lateral_um * math.cos(source_phi_rad),
+        source_y - lateral_um * math.sin(source_phi_rad),
+    )
+    input_power["orientation_deg"] = orientation_deg
+    input_power["auto_placed"] = True
+    input_power["simulation_parent_uid"] = int(component["uid"])
+    input_power["simulation_parent_port"] = "fiber_input_power"
+    input_power["fiber_offset_um"] = offset_um
+    input_power["params"].update(
+        {
+            "name": f"uid_{int(component['uid'])}_fiber_input_power",
+            "fiber plane role": "input power measurement",
+            "monitor geometry": "surface",
+            "plane normal": "Z",
+            "z reference": source_z_reference,
+            "distance_um": source_distance_um - below_source_um,
+            "x span": projected_span_um,
+            "y span": projected_span_um,
+            "z span": 0.0,
+            # Alignment metadata follows the source axis while the actual DFT
+            # monitor remains an ordinary horizontal Z-normal plane.
+            "angle theta": theta_deg,
+            "angle phi": float(source["params"].get("angle phi", 0.0)),
+            "align to fiber axis": True,
+            "expected propagation sign": -1.0,
+        }
+    )
+    built.append(input_power)
+    return built
 
 
 def add_fixed_default_row(table: QTableWidget, row: int, key: str, value: Any) -> tuple[str, Any, bool, Any]:
@@ -1881,6 +2081,12 @@ class NativeLayoutWindow(QMainWindow):
             )
             params["name"] = f"opt_{order}"
             params["order"] = order
+        elif kind == "Gaussian source":
+            count = 1 + sum(
+                component.get("kind") == "Gaussian source"
+                for component in self.components
+            )
+            params["name"] = f"gaussian_source_{count}"
         elif kind in {"Power monitor", "Mode expansion monitor", "Field profile monitor"}:
             prefix = {
                 "Power monitor": "power_monitor",
@@ -2142,141 +2348,92 @@ class NativeLayoutWindow(QMainWindow):
             companions.append(profile)
 
         if kind in {"Grating coupler", "GC-SOI"}:
-            # Place the fiber on the grating side: straight lead + complete
-            # flare anchor + the user-controlled local-X fiber offset.
-            grating_params = component.get("params", {})
-            migrate_grating_fiber_offset_parameter(component)
-            local_x, local_y = grating_fiber_center_local_um(component)
-            fiber_offset_um = float(component["params"]["fiber_offset"])
-            fiber_angle_deg = grating_angle_theta_deg(component)
-            angle = math.radians(float(component.get("orientation_deg", 0.0)))
-            fiber_x = (
-                float(component.get("x", 0.0))
-                + local_x * math.cos(angle)
-                - local_y * math.sin(angle)
+            source_family = _automatic_grating_excitation_companions(
+                self, component, automatic_order_base
             )
-            fiber_y = (
-                float(component.get("y", 0.0))
-                + local_x * math.sin(angle)
-                + local_y * math.cos(angle)
-            )
-            fiber = self.make_component("Fiber geometry", fiber_x, fiber_y)
-            fiber["orientation_deg"] = float(component.get("orientation_deg", 0.0))
-            fiber["auto_placed"] = True
-            fiber["simulation_parent_uid"] = int(component["uid"])
-            fiber["fiber_offset_um"] = fiber_offset_um
-            fiber["params"].update(
-                {
-                    "name": f"uid_{int(component['uid'])}_fiber",
-                    "angle theta": fiber_angle_deg,
-                    "angle phi": 0.0,
-                    "distance_um": 0.0,
-                    "z reference": (
-                        "center of SiO2 cladding" if kind == "GC-SOI"
-                        else "top of SiO2 cladding"
-                    ),
-                    "core diameter_um": float(grating_params.get("fiber_core_diameter_um", 9.0)),
-                    "core index": float(grating_params.get("fiber_core_index", 1.44427)),
-                    "cladding diameter_um": float(grating_params.get("fiber_cladding_diameter_um", 50.0)),
-                    "cladding index": float(grating_params.get("fiber_cladding_index", 1.43482)),
-                    "fiber length_um": float(grating_params.get("fiber_length_um", 20.0)),
-                }
-            )
-            companions.append(fiber)
-
-            port_local_x = local_x
-            port_distance_um = 0.0
-            if kind == "GC-SOI":
-                tox_offset_um = float(grating_params.get("fiber_tox_offset_um", 0.65))
-                # Official model: TOX center + 0.65 cos(theta), with the port
-                # measured here from the 0.70 um TOX top. The fiber and port
-                # intentionally retain the same top-view center.
-                port_distance_um = tox_offset_um * math.cos(math.radians(fiber_angle_deg)) - 0.35
-            fiber_port_x = float(component.get("x", 0.0)) + port_local_x * math.cos(angle)
-            fiber_port_y = float(component.get("y", 0.0)) + port_local_x * math.sin(angle)
-            fiber_port = self.make_component("Fiber-axis FDTD port", fiber_port_x, fiber_port_y)
-            fiber_port["orientation_deg"] = float(component.get("orientation_deg", 0.0))
-            fiber_port["auto_placed"] = True
-            fiber_port["simulation_parent_uid"] = int(component["uid"])
-            fiber_port["fiber_offset_um"] = fiber_offset_um
-            fiber_port["params"].update(
-                {
-                    "name": f"uid_{int(component['uid'])}_fiber_axis",
-                    # Match the official Ansys grating model: fiber is the
-                    # first/source port and waveguide is the second/receiver.
-                    "order": automatic_order_base,
-                    "dir": "Backward",
-                    "fiber plane role": "source",
-                    "angle theta": fiber_angle_deg,
-                    "angle phi": 0.0,
-                    "align to fiber axis": True,
-                    "rotation offset_um": 4.0 * float(grating_params.get("fiber_core_diameter_um", 9.0)) * math.tan(math.radians(fiber_angle_deg)),
-                    "distance_um": port_distance_um,
-                    "z reference": "top of SiO2 cladding" if kind == "GC-SOI" else "top of stack",
-                }
+            companions.extend(source_family)
+            # A fiber source occupies port order 1.  A Gaussian source is not
+            # part of the FDTD port group, so the waveguide receiver is port 1.
+            receiver_order = (
+                automatic_order_base + 1
+                if grating_excitation_type(component) == "fiber_mode"
+                else automatic_order_base
             )
             for companion in companions:
-                if companion.get("kind") == "FDTD port":
+                if (
+                    companion.get("kind") == "FDTD port"
+                    and companion.get("simulation_parent_port") == "waveguide_point"
+                ):
                     companion.setdefault("params", {}).update(
                         {
-                            "order": automatic_order_base + 1,
+                            "order": receiver_order,
                             "mode": "fundamental TE mode",
                             "span_um": automatic_waveguide_port_span_um(
                                 component, "waveguide_point"
                             ),
                         }
                     )
-            companions.append(fiber_port)
-
-            # A non-modal Z-normal power monitor measures the actual incident
-            # flux below the tilted source.  Lumerical DFT monitors cannot be
-            # rotated; the monitor is centered on the tilted fiber-axis
-            # intersection and made wide enough to capture its full projected
-            # beam.  Its signed T is negative for the downward (-Z) source.
-            monitor_below_source_um = max(
-                0.001,
-                float(grating_params.get("fiber_power_monitor_below_source_um", 0.1)),
-            )
-            measurement_phi_rad = angle + math.radians(
-                float(fiber_port["params"].get("angle phi", 0.0))
-            )
-            measurement_lateral_um = monitor_below_source_um * math.tan(
-                math.radians(fiber_angle_deg)
-            )
-            projected_monitor_span_um = float(
-                fiber_port["params"].get("span_um", 20.0)
-            ) / max(math.cos(math.radians(fiber_angle_deg)), 1e-3)
-            fiber_power_x = fiber_port_x - measurement_lateral_um * math.cos(measurement_phi_rad)
-            fiber_power_y = fiber_port_y - measurement_lateral_um * math.sin(measurement_phi_rad)
-            fiber_power = self.make_component("Power monitor", fiber_power_x, fiber_power_y)
-            fiber_power["orientation_deg"] = float(component.get("orientation_deg", 0.0))
-            fiber_power["auto_placed"] = True
-            fiber_power["simulation_parent_uid"] = int(component["uid"])
-            fiber_power["simulation_parent_port"] = "fiber_input_power"
-            fiber_power["fiber_offset_um"] = fiber_offset_um
-            fiber_power["params"].update(
-                {
-                    "name": f"uid_{int(component['uid'])}_fiber_input_power",
-                    "fiber plane role": "input power measurement",
-                    "monitor geometry": "surface",
-                    "plane normal": "Z",
-                    "z reference": fiber_port["params"]["z reference"],
-                    "distance_um": port_distance_um - monitor_below_source_um,
-                    "x span": projected_monitor_span_um,
-                    "y span": projected_monitor_span_um,
-                    "z span": 0.0,
-                    "angle theta": fiber_angle_deg,
-                    "angle phi": float(fiber_port["params"].get("angle phi", 0.0)),
-                    "align to fiber axis": True,
-                    "expected propagation sign": -1.0,
-                }
-            )
-            companions.append(fiber_power)
         return companions
 
     def synchronize_automatic_simulation_companions(self, component: dict[str, Any]) -> bool:
         """Keep automatically placed ports/fiber aligned after parent edits."""
         parent_uid = int(component.get("uid", 0))
+        is_grating = str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"}
+        if is_grating:
+            desired_excitation = grating_excitation_type(component)
+            incompatible_kinds = (
+                {"Gaussian source"}
+                if desired_excitation == "fiber_mode"
+                else {"Fiber geometry", "Fiber-axis FDTD port"}
+            )
+            # A source dragged by hand still belongs to this parent. Switching
+            # the parent's excitation family must therefore remove the stale
+            # parent-owned source as well as untouched automatic companions.
+            self.components[:] = [
+                candidate
+                for candidate in self.components
+                if not (
+                    int(candidate.get("simulation_parent_uid", -1)) == parent_uid
+                    and candidate.get("kind") in incompatible_kinds
+                    and candidate.get("simulation_parent_port") != "fiber_input_power"
+                )
+            ]
+            parent_linked = [
+                candidate
+                for candidate in self.components
+                if int(candidate.get("simulation_parent_uid", -1)) == parent_uid
+            ]
+            required_source_kind = (
+                "Fiber-axis FDTD port"
+                if desired_excitation == "fiber_mode"
+                else "Gaussian source"
+            )
+            has_required_source = any(
+                candidate.get("kind") == required_source_kind
+                and candidate.get("simulation_parent_port") != "fiber_input_power"
+                for candidate in parent_linked
+            )
+            has_required_fiber_geometry = (
+                desired_excitation != "fiber_mode"
+                or any(candidate.get("kind") == "Fiber geometry" for candidate in parent_linked)
+            )
+            has_input_power = any(
+                candidate.get("kind") == "Power monitor"
+                and candidate.get("simulation_parent_port") == "fiber_input_power"
+                for candidate in parent_linked
+            )
+            if not has_required_source or not has_required_fiber_geometry or not has_input_power:
+                generated = _automatic_grating_excitation_companions(self, component, 1)
+                for candidate in generated:
+                    candidate_kind = str(candidate.get("kind", ""))
+                    candidate_role = candidate.get("simulation_parent_port")
+                    if candidate_kind == required_source_kind and has_required_source:
+                        continue
+                    if candidate_kind == "Fiber geometry" and has_required_fiber_geometry:
+                        continue
+                    if candidate_kind == "Power monitor" and candidate_role == "fiber_input_power" and has_input_power:
+                        continue
+                    self.components.append(candidate)
         companions = [
             candidate for candidate in self.components
             if int(candidate.get("simulation_parent_uid", -1)) == parent_uid
@@ -2401,7 +2558,7 @@ class NativeLayoutWindow(QMainWindow):
             fiber_source = next(
                 (
                     candidate for candidate in companions
-                    if candidate.get("kind") == "Fiber-axis FDTD port"
+                    if candidate.get("kind") in {"Fiber-axis FDTD port", "Gaussian source"}
                     and candidate.get("simulation_parent_port") != "fiber_input_power"
                 ),
                 None,
@@ -2485,6 +2642,15 @@ class NativeLayoutWindow(QMainWindow):
                 )
                 self.components.append(fiber_power)
                 companions.append(fiber_power)
+            receiver_order = 2 if grating_excitation_type(component) == "fiber_mode" else 1
+            for candidate in companions:
+                if (
+                    candidate.get("kind") == "FDTD port"
+                    and candidate.get("simulation_parent_port") == "waveguide_point"
+                ):
+                    candidate.setdefault("params", {})["order"] = receiver_order
+                elif candidate.get("kind") == "Fiber-axis FDTD port":
+                    candidate.setdefault("params", {})["order"] = 1
         global_ports = component_global_ports(component)
         for companion in companions:
             parent_port_name = companion.get("simulation_parent_port")
@@ -2612,7 +2778,7 @@ class NativeLayoutWindow(QMainWindow):
             if (
                 str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"}
                 and (
-                    companion.get("kind") in {"Fiber geometry", "Fiber-axis FDTD port"}
+                    companion.get("kind") in {"Fiber geometry", "Fiber-axis FDTD port", "Gaussian source"}
                     or (
                         companion.get("kind") == "Power monitor"
                         and companion.get("simulation_parent_port") == "fiber_input_power"
@@ -2684,6 +2850,38 @@ class NativeLayoutWindow(QMainWindow):
                             "rotation offset_um": rotation_offset_um,
                         }
                     )
+                elif companion.get("kind") == "Gaussian source":
+                    companion["simulation_parent_port"] = "gaussian_source"
+                    companion["params"].update(
+                        {
+                            "name": f"uid_{parent_uid}_gaussian_source",
+                            "injection axis": "Z",
+                            "direction": "Backward",
+                            "z reference": source_z_reference,
+                            "distance_um": source_distance_um,
+                            "angle theta": theta_deg,
+                            "angle phi": 0.0,
+                            "polarization": "local TE",
+                            "polarization angle": 90.0,
+                            "waist radius_um": max(
+                                0.001,
+                                float(params.get("gaussian_waist_radius_um", 4.5)),
+                            ),
+                            "distance from waist_um": float(
+                                params.get("gaussian_distance_from_waist_um", 0.0)
+                            ),
+                            "span_um": max(
+                                0.001,
+                                float(params.get("gaussian_source_span_um", 20.0)),
+                            ),
+                            "amplitude": 1.0,
+                            "multifrequency beam calculation": True,
+                            "frequency points": max(
+                                1,
+                                int(params.get("gaussian_multifrequency_points", 5)),
+                            ),
+                        }
+                    )
                 elif companion.get("kind") == "Power monitor":
                     below_source_um = max(
                         0.001,
@@ -2692,7 +2890,7 @@ class NativeLayoutWindow(QMainWindow):
                     source_port = next(
                         (
                             item for item in companions
-                            if item.get("kind") == "Fiber-axis FDTD port"
+                            if item.get("kind") in {"Fiber-axis FDTD port", "Gaussian source"}
                             and item.get("simulation_parent_port") != "fiber_input_power"
                         ),
                         None,
@@ -3250,8 +3448,20 @@ class NativeLayoutWindow(QMainWindow):
             return widget
         if kind == "choice":
             widget = QComboBox()
-            widget.addItems([str(choice) for choice in spec[2]])
-            widget.setCurrentText(str(value))
+            if key == "excitation_type":
+                labels = {
+                    "fiber_mode": "Fiber mode (FDTD port + fiber geometry)",
+                    "gaussian_beam": "Gaussian beam source",
+                }
+                for choice in spec[2]:
+                    stored = str(choice)
+                    widget.addItem(labels.get(stored, stored), stored)
+                selected = widget.findData(str(value))
+                widget.setCurrentIndex(max(0, selected))
+                widget.setProperty("max_layout_choice_uses_data", True)
+            else:
+                widget.addItems([str(choice) for choice in spec[2]])
+                widget.setCurrentText(str(value))
             return widget
         if kind == "int":
             widget = QSpinBox()
@@ -3272,6 +3482,8 @@ class NativeLayoutWindow(QMainWindow):
         if spec_type == "bool":
             return bool(widget.isChecked())
         if spec_type == "choice":
+            if bool(widget.property("max_layout_choice_uses_data")):
+                return str(widget.currentData())
             return str(widget.currentText())
         if spec_type == "int":
             return int(widget.value())
@@ -3380,8 +3592,8 @@ class NativeLayoutWindow(QMainWindow):
                     f"{float(value):.9g}° — controlled by the parent grating angle_theta"
                 )
                 controlled.setToolTip(
-                    "Edit Angle theta on the parent grating coupler. The fiber geometry, "
-                    "source plane, and passive measurement plane update together."
+                    "Edit Angle theta on the parent grating coupler. Its fiber-mode or "
+                    "Gaussian source plane and passive measurement plane update together."
                 )
                 self.properties_form.addRow("Angle theta (parent controlled)", controlled)
                 continue
@@ -3403,9 +3615,14 @@ class NativeLayoutWindow(QMainWindow):
                     "linspace(start, stop). The component supplies the tooth count automatically."
                 )
             parameter_label = (
-                "Fiber offset (µm)" if key == "fiber_offset"
+                "Grating excitation" if key == "excitation_type"
+                else "Fiber offset (µm)" if key == "fiber_offset"
                 else "Angle theta (degrees)" if key == "angle_theta"
-                else "Horizontal fiber-input monitor below source (µm)" if key == "fiber_power_monitor_below_source_um"
+                else "Gaussian waist radius (µm)" if key == "gaussian_waist_radius_um"
+                else "Gaussian distance from waist (µm)" if key == "gaussian_distance_from_waist_um"
+                else "Gaussian source span (µm)" if key == "gaussian_source_span_um"
+                else "Gaussian multifrequency points" if key == "gaussian_multifrequency_points"
+                else "Horizontal input-power monitor below source (µm)" if key == "fiber_power_monitor_below_source_um"
                 else "Waveguide mode-monitor offset from end (µm)" if key == "fdtd_port_offset_from_waveguide_end_um"
                 else "Waveguide monitor span (µm)" if key == "waveguide_monitor_span_um"
                 else "Total-power monitor before receiver port (µm)" if key == "waveguide_total_power_before_mode_um"
@@ -7061,6 +7278,10 @@ ENDFLOW
         gc_keys = (
             "pitch", "fill_factor", "duty_cycle", "fill_factors", "tooth_shape", "N", "target_length",
             "alpha_t", "taper_L", "L_extra", "wg_width", "wg_length",
+            "excitation_type", "fiber_offset", "angle_theta",
+            "gaussian_waist_radius_um", "gaussian_distance_from_waist_um",
+            "gaussian_source_span_um", "gaussian_multifrequency_points",
+            "fiber_power_monitor_below_source_um",
             "gc_pitch", "gc_fill_factor", "gc_fill_factors", "gc_N", "gc_alpha_t", "gc_taper_L", "gc_wg_length",
         )
         mmi_keys = (

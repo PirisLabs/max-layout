@@ -671,25 +671,65 @@ def _objective_ports(
         if not analysis:
             raise ValueError(
                 "Grating adjoint optimization needs the complete grating simulation setup: "
-                "fiber source, fiber input-power monitor, passive waveguide receiver, and waveguide total-power monitor."
+                "optical source, input-power monitor, passive waveguide receiver, and waveguide total-power monitor."
             )
-        source_name = str(analysis.get("fiber_port_name", ""))
+        excitation_type = str(
+            analysis.get("excitation_type", "fiber_mode")
+        ).strip().lower()
+        source_kind = str(
+            analysis.get(
+                "source_kind",
+                "gaussian" if excitation_type == "gaussian_beam" else "fiber_port",
+            )
+        ).strip().lower()
+        is_gaussian = excitation_type == "gaussian_beam" or source_kind in {
+            "gaussian", "gaussian_beam", "gaussian source",
+        }
+        source_name = str(
+            analysis.get("source_name", "")
+            or (
+                analysis.get("gaussian_source_name", "")
+                if is_gaussian
+                else analysis.get("fiber_port_name", "")
+            )
+        )
         receiver_name = str(analysis.get("waveguide_port_name", ""))
         receiver = next(
             (port for port in ports if str(port.get("name", "")) == receiver_name),
             None,
         )
+        gaussian_sources = [
+            source for source in payload.get("GAUSSIAN_SOURCES", [])
+            if int(source.get("parent_component_uid", -1)) == uid
+        ]
+        gaussian_source = next(
+            (
+                source for source in gaussian_sources
+                if str(source.get("name", "")) == source_name
+            ),
+            None,
+        )
         if not source_name or not receiver_name or receiver is None:
             raise ValueError(
-                "Grating adjoint optimization needs a fiber-axis source port and a waveguide receiver FDTD port."
+                "Grating adjoint optimization needs an optical source and a waveguide receiver FDTD port."
+            )
+        if is_gaussian and gaussian_source is None:
+            raise ValueError(
+                "Gaussian-beam grating optimization could not find the exported independent Gaussian source."
             )
         angle = float(receiver.get("outward_orientation_deg", 0.0)) % 360.0
         nearest = int(round(angle / 90.0) * 90) % 360
         direction = "Forward" if nearest in {0, 90} else "Backward"
         return {
             "kind": "grating coupling efficiency",
+            "excitation_type": "gaussian_beam" if is_gaussian else "fiber_mode",
+            "source_kind": "gaussian" if is_gaussian else "fiber_port",
+            "source_name": source_name,
             "source_port": source_name,
-            "source_mode": str(analysis.get("fiber_source_mode", "mode 1")),
+            "source_mode": (
+                "" if is_gaussian
+                else str(analysis.get("fiber_source_mode", "mode 1"))
+            ),
             "monitor_port": receiver_name,
             "direction": direction,
             "mode_number": max(1, int(receiver.get("mode number", 1))),
@@ -703,7 +743,11 @@ def _objective_ports(
             "waveguide_port_modal_direction": str(
                 analysis.get("waveguide_port_modal_direction", "T_out")
             ),
-            "normalization": "waveguide fundamental-TE port T_out / measured fiber input-monitor power",
+            "normalization": (
+                "waveguide fundamental-TE port T_out / measured Gaussian input-monitor power"
+                if is_gaussian
+                else "waveguide fundamental-TE port T_out / measured fiber input-monitor power"
+            ),
         }
 
     analysis = payload.get("MMI_ANALYSIS")
@@ -741,12 +785,12 @@ def _fiber_pose_contract(
     component: dict[str, Any],
     specification: dict[str, Any],
 ) -> dict[str, Any]:
-    """Describe the synchronized grating fiber/source/input-monitor alignment.
+    """Describe synchronized grating source/input-monitor alignment.
 
     The contract stores absolute simulation coordinates after layout-origin
     translation.  The generated notebook can therefore update the scripted
-    fiber group, tilted source port, and ordinary input-power monitor without
-    rebuilding the device or guessing stack heights at optimization time.
+    fiber group and tilted port, or the independent Gaussian source, together
+    with the ordinary input-power monitor without rebuilding the device.
     """
 
     kind = str(specification.get("component_kind", ""))
@@ -757,6 +801,123 @@ def _fiber_pose_contract(
     if kind not in {"Grating coupler", "GC-SOI"} or not active:
         return {}
     uid = int(specification["component_uid"])
+    analysis = dict(payload.get("GRATING_ANALYSIS") or {})
+    excitation_type = str(
+        analysis.get("excitation_type", "fiber_mode")
+    ).strip().lower()
+    source_kind = str(
+        analysis.get(
+            "source_kind",
+            "gaussian" if excitation_type == "gaussian_beam" else "fiber_port",
+        )
+    ).strip().lower()
+    is_gaussian = excitation_type == "gaussian_beam" or source_kind in {
+        "gaussian", "gaussian_beam", "gaussian source",
+    }
+    source_name = str(
+        analysis.get("source_name", "")
+        or (
+            analysis.get("gaussian_source_name", "")
+            if is_gaussian
+            else analysis.get("fiber_port_name", "")
+        )
+    )
+    levels = _stack_vertical_levels(list(payload.get("MATERIAL_STACK", [])))
+    input_monitor_name = str(analysis.get("fiber_input_power_monitor_name", ""))
+    input_monitors = [
+        monitor for monitor in payload.get("MONITORS", [])
+        if int(monitor.get("parent_component_uid", -1)) == uid
+        and str(monitor.get("monitor_kind", "")) == "Power monitor"
+        and str(monitor.get("plane normal", "Z")).upper() == "Z"
+        and str(monitor.get("name", "")) == input_monitor_name
+    ]
+    if len(input_monitors) != 1:
+        raise ValueError(
+            "Grating alignment optimization needs exactly one ordinary input-power monitor."
+        )
+
+    params = component.get("params", {})
+    common = {
+        "active_parameters": active,
+        "component_kind": kind,
+        "excitation_type": "gaussian_beam" if is_gaussian else "fiber_mode",
+        "source_kind": "gaussian" if is_gaussian else "fiber_port",
+        "source_name": source_name,
+        "nominal_angle_theta": float(params["angle_theta"]),
+        "nominal_fiber_offset": float(params.get("fiber_offset", 0.0)),
+        "fiber_tox_offset_um": float(params.get("fiber_tox_offset_um", 0.65)),
+        "fiber_power_monitor_below_source_um": max(
+            0.001, float(params.get("fiber_power_monitor_below_source_um", 0.1))
+        ),
+    }
+
+    monitor_contracts = []
+    for monitor in input_monitors:
+        reference_z_um = _item_vertical_reference(monitor, levels)
+        distance_um = float(monitor.get("distance_um", 0.0))
+        monitor_contracts.append(
+            {
+                "name": str(monitor["name"]),
+                "role": str(monitor.get("fiber plane role", "input power measurement")),
+                "reference_z_um": float(reference_z_um),
+                "base_distance_um": distance_um,
+                "base_z_um": float(reference_z_um + distance_um),
+                "center_um": list(map(float, monitor.get("center", (0.0, 0.0)))),
+                "x_span_um": max(
+                    1e-6,
+                    float(monitor.get("x span", monitor.get("span_um", 4.0))),
+                ),
+                "y_span_um": max(
+                    1e-6,
+                    float(monitor.get("y span", monitor.get("span_um", 4.0))),
+                ),
+                "expected_propagation_sign": float(
+                    monitor.get("expected propagation sign", -1.0)
+                ),
+            }
+        )
+
+    if is_gaussian:
+        gaussian_sources = [
+            source for source in payload.get("GAUSSIAN_SOURCES", [])
+            if int(source.get("parent_component_uid", -1)) == uid
+            and str(source.get("name", "")) == source_name
+        ]
+        if not source_name or len(gaussian_sources) != 1:
+            raise ValueError(
+                "Gaussian alignment optimization needs exactly one independent Gaussian source."
+            )
+        source = gaussian_sources[0]
+        reference_z_um = _item_vertical_reference(source, levels)
+        distance_um = float(source.get("distance_um", 0.0))
+        source_z_um = reference_z_um + distance_um
+        source_span_um = max(
+            1e-6,
+            float(
+                source.get(
+                    "span_um",
+                    max(source.get("x span", 0.0), source.get("y span", 0.0), 20.0),
+                )
+            ),
+        )
+        common.update(
+            {
+                "phi_deg": float(source.get("angle phi", component.get("orientation_deg", 0.0))),
+                "source": {
+                    "name": str(source["name"]),
+                    "reference_z_um": float(reference_z_um),
+                    "base_distance_um": distance_um,
+                    "base_z_um": float(source_z_um),
+                    "center_um": list(map(float, source.get("center", (0.0, 0.0)))),
+                    "span_um": source_span_um,
+                    "polarization_angle_deg": 90.0,
+                },
+                "ports": [],
+                "monitors": monitor_contracts,
+            }
+        )
+        return common
+
     fibers = [
         fiber for fiber in payload.get("FIBER_GEOMETRIES", [])
         if int(fiber.get("parent_component_uid", -1)) == uid
@@ -766,32 +927,16 @@ def _fiber_pose_contract(
             "Grating alignment optimization needs exactly one automatic fiber geometry."
         )
     fiber = fibers[0]
-    source_name = str(
-        (payload.get("GRATING_ANALYSIS") or {}).get("fiber_port_name", "")
-    )
     tilted_ports = [
         port for port in payload.get("PORTS", [])
         if int(port.get("parent_component_uid", -1)) == uid
         and str(port.get("plane normal", "X")).upper() == "Z"
         and str(port.get("name", "")) == source_name
     ]
-    input_monitor_name = str(
-        (payload.get("GRATING_ANALYSIS") or {}).get(
-            "fiber_input_power_monitor_name", ""
-        )
-    )
-    input_monitors = [
-        monitor for monitor in payload.get("MONITORS", [])
-        if int(monitor.get("parent_component_uid", -1)) == uid
-        and str(monitor.get("monitor_kind", "")) == "Power monitor"
-        and str(monitor.get("plane normal", "Z")).upper() == "Z"
-        and str(monitor.get("name", "")) == input_monitor_name
-    ]
     if not source_name or len(tilted_ports) != 1 or len(input_monitors) != 1:
         raise ValueError(
             "Grating alignment optimization needs exactly one tilted fiber source port and one ordinary fiber input-power monitor."
         )
-    levels = _stack_vertical_levels(list(payload.get("MATERIAL_STACK", [])))
     fiber_reference_z_um = _item_vertical_reference(fiber, levels)
     fiber_z_um = fiber_reference_z_um + float(fiber.get("distance_um", 0.0))
     port_contracts = []
@@ -830,43 +975,136 @@ def _fiber_pose_contract(
                 ),
             }
         )
-    monitor_contracts = []
-    for monitor in input_monitors:
-        reference_z_um = _item_vertical_reference(monitor, levels)
-        distance_um = float(monitor.get("distance_um", 0.0))
-        z_um = reference_z_um + distance_um
-        monitor_contracts.append(
-            {
-                "name": str(monitor["name"]),
-                "role": str(monitor.get("fiber plane role", "input power measurement")),
-                "reference_z_um": float(reference_z_um),
-                "base_distance_um": distance_um,
-                "base_z_um": float(z_um),
-                "base_axis_height_um": float(z_um - fiber_z_um),
-                "center_um": list(map(float, monitor.get("center", (0.0, 0.0)))),
-                "expected_propagation_sign": float(
-                    monitor.get("expected propagation sign", -1.0)
-                ),
-            }
+    for monitor in monitor_contracts:
+        monitor["base_axis_height_um"] = float(
+            monitor["base_z_um"] - fiber_z_um
         )
-    params = component.get("params", {})
-    return {
-        "active_parameters": active,
-        "component_kind": kind,
+    common.update({
         "fiber_name": str(fiber["name"]),
         "fiber_center_um": list(map(float, fiber.get("center", (0.0, 0.0)))),
         "fiber_z_um": float(fiber_z_um),
         "phi_deg": float(fiber.get("angle phi", component.get("orientation_deg", 0.0))),
         "core_diameter_um": max(1e-6, float(fiber.get("core diameter_um", 9.0))),
-        "nominal_angle_theta": float(params["angle_theta"]),
-        "nominal_fiber_offset": float(params.get("fiber_offset", 0.0)),
-        "fiber_tox_offset_um": float(params.get("fiber_tox_offset_um", 0.65)),
-        "fiber_power_monitor_below_source_um": max(
-            0.001, float(params.get("fiber_power_monitor_below_source_um", 0.1))
-        ),
         "ports": port_contracts,
         "monitors": monitor_contracts,
+    })
+    return common
+
+
+def _gaussian_alignment_domain_envelope(
+    fiber_pose: dict[str, Any], specification: dict[str, Any]
+) -> list[float] | None:
+    """Union every bounded Gaussian source/input-plane pose in XYZ.
+
+    The adjoint seed FDTD region is fixed before the alignment optimizer
+    starts.  Reserve the complete Cartesian endpoint envelope up front so an
+    allowed ``fiber_offset`` or ``angle_theta`` value cannot move the source
+    or its measured-input plane onto/outside a PML boundary.
+    """
+
+    if (
+        str(fiber_pose.get("excitation_type", "fiber_mode")) != "gaussian_beam"
+        or not fiber_pose.get("source")
+        or not fiber_pose.get("monitors")
+    ):
+        return None
+    rows = {
+        str(row["parameter"]): row
+        for row in specification.get("parameters", [])
     }
+    nominal_theta = float(fiber_pose["nominal_angle_theta"])
+    nominal_offset = float(fiber_pose.get("nominal_fiber_offset", 0.0))
+
+    def endpoint_values(name: str, nominal: float) -> list[float]:
+        row = rows.get(name)
+        if row is None:
+            return [nominal]
+        return list(dict.fromkeys((
+            float(row["minimum"]), nominal, float(row["maximum"]),
+        )))
+
+    theta_values = endpoint_values("angle_theta", nominal_theta)
+    offset_values = endpoint_values("fiber_offset", nominal_offset)
+    phi_rad = math.radians(float(fiber_pose.get("phi_deg", 0.0)))
+    axis = np.asarray([math.cos(phi_rad), math.sin(phi_rad)], dtype=float)
+    source = dict(fiber_pose["source"])
+    source_nominal_center = np.asarray(source["center_um"], dtype=float)
+    source_half_span = 0.5 * max(1e-6, float(source.get("span_um", 20.0)))
+    is_soi = str(fiber_pose.get("component_kind", "")) == "GC-SOI"
+    theta_is_active = "angle_theta" in rows
+    xy_bounds: list[tuple[float, float, float, float]] = []
+    z_positions: list[float] = []
+
+    for theta_deg in theta_values:
+        if not 0.0 <= theta_deg < 90.0:
+            raise ValueError(
+                "Gaussian alignment envelope requires angle_theta in [0, 90) degrees."
+            )
+        for offset_um in offset_values:
+            source_center = (
+                source_nominal_center
+                + (offset_um - nominal_offset) * axis
+            )
+            source_distance = float(source["base_distance_um"])
+            if is_soi and theta_is_active:
+                source_distance = (
+                    float(fiber_pose["fiber_tox_offset_um"])
+                    * math.cos(math.radians(theta_deg))
+                    - 0.35
+                )
+            source_z = float(source["reference_z_um"]) + source_distance
+            xy_bounds.append((
+                float(source_center[0]) - source_half_span,
+                float(source_center[1]) - source_half_span,
+                float(source_center[0]) + source_half_span,
+                float(source_center[1]) + source_half_span,
+            ))
+            z_positions.append(source_z)
+
+            for monitor in fiber_pose.get("monitors", []):
+                monitor_distance = float(monitor["base_distance_um"])
+                if is_soi and theta_is_active:
+                    monitor_distance = source_distance - float(
+                        fiber_pose["fiber_power_monitor_below_source_um"]
+                    )
+                monitor_z = float(monitor["reference_z_um"]) + monitor_distance
+                monitor_center = source_center + (
+                    (monitor_z - source_z)
+                    * math.tan(math.radians(theta_deg))
+                    * axis
+                )
+                # Match ``_fiber_pose_updates`` exactly: the horizontal Pin
+                # plane expands by 1/cos(theta) so it still captures the
+                # complete oblique Gaussian footprint at every allowed pose.
+                projected_span = max(
+                    1e-6,
+                    float(source.get("span_um", 20.0)),
+                    float(source.get("span_um", 20.0))
+                    / max(math.cos(math.radians(theta_deg)), 1e-3),
+                )
+                x_half = 0.5 * projected_span
+                y_half = 0.5 * projected_span
+                xy_bounds.append((
+                    float(monitor_center[0]) - x_half,
+                    float(monitor_center[1]) - y_half,
+                    float(monitor_center[0]) + x_half,
+                    float(monitor_center[1]) + y_half,
+                ))
+                z_positions.append(monitor_z)
+
+    if not xy_bounds or not z_positions:
+        return None
+    envelope = [
+        min(bound[0] for bound in xy_bounds),
+        min(bound[1] for bound in xy_bounds),
+        min(z_positions),
+        max(bound[2] for bound in xy_bounds),
+        max(bound[3] for bound in xy_bounds),
+        max(z_positions),
+    ]
+    if not np.all(np.isfinite(envelope)):
+        raise ValueError("Gaussian alignment bounds produced a non-finite FDTD envelope.")
+    return list(map(float, envelope))
 
 
 def _ensure_porttransmission_receiver(
@@ -1017,12 +1255,52 @@ def _numeric_source_mode_label(value):
 
 
 def _require_numeric_source_mode():
-    """Validate and canonicalize the one source-mode label used by all solves."""
+    """Validate and canonicalize the fiber-port source-mode label."""
     source_mode = _numeric_source_mode_label(
         OPT_OBJECTIVE_PORTS.get("source_mode", "")
     )
     OPT_OBJECTIVE_PORTS["source_mode"] = source_mode
     return source_mode
+
+
+def _uses_gaussian_source():
+    return (
+        str(OPT_OBJECTIVE_PORTS.get("excitation_type", "fiber_mode")).strip().lower()
+        == "gaussian_beam"
+        or str(OPT_OBJECTIVE_PORTS.get("source_kind", "fiber_port")).strip().lower()
+        in {"gaussian", "gaussian_beam", "gaussian source"}
+    )
+
+
+def _require_optimization_source():
+    """Validate the independent Gaussian source or numeric fiber-port mode."""
+    source_name = str(
+        OPT_OBJECTIVE_PORTS.get(
+            "source_name", OPT_OBJECTIVE_PORTS.get("source_port", "")
+        )
+    ).strip()
+    if not source_name:
+        raise RuntimeError("The optimization source name is empty")
+    OPT_OBJECTIVE_PORTS["source_name"] = source_name
+    OPT_OBJECTIVE_PORTS["source_port"] = source_name
+    if _uses_gaussian_source():
+        return source_name, None
+    return source_name, _require_numeric_source_mode()
+
+
+def _configure_optimization_source(fdtd_session):
+    """Activate exactly one source while leaving the waveguide port passive."""
+    source_name, source_mode = _require_optimization_source()
+    fdtd_session.select("FDTD::ports")
+    if _uses_gaussian_source():
+        # An empty source-port selection makes every FDTD port passive.  The
+        # independent Gaussian object then owns the only injected field.
+        fdtd_session.set("source port", "")
+        _set_named(fdtd_session, "::model::" + source_name, "enabled", True)
+    else:
+        fdtd_session.set("source port", source_name)
+        fdtd_session.set("source mode", source_mode)
+    return source_name, source_mode
 
 
 def _positive_unique_modes(values):
@@ -1106,6 +1384,27 @@ def _resolved_runtime_port_mode(port_contract):
 
 def _synchronize_resolved_fiber_mode_contract():
     """Copy seed-build mode choices into the persistent optimization contract."""
+    gaussian_source = (
+        str(OPT_OBJECTIVE_PORTS.get("excitation_type", "fiber_mode")).strip().lower()
+        == "gaussian_beam"
+        or str(OPT_OBJECTIVE_PORTS.get("source_kind", "fiber_port")).strip().lower()
+        in {"gaussian", "gaussian_beam", "gaussian source"}
+    )
+    if gaussian_source:
+        source_name = str(
+            OPT_OBJECTIVE_PORTS.get(
+                "source_name", OPT_OBJECTIVE_PORTS.get("source_port", "")
+            )
+        ).strip()
+        if not source_name:
+            raise RuntimeError("The optimization Gaussian source name is empty")
+        OPT_OBJECTIVE_PORTS["source_name"] = source_name
+        OPT_OBJECTIVE_PORTS["source_port"] = source_name
+        if globals().get("GRATING_ANALYSIS"):
+            GRATING_ANALYSIS["excitation_type"] = "gaussian_beam"
+            GRATING_ANALYSIS["source_kind"] = "gaussian"
+            GRATING_ANALYSIS["source_name"] = source_name
+        return
     if not OPT_FIBER_POSE:
         if str(OPT_OBJECTIVE_PORTS.get("kind", "")).startswith("grating"):
             source_mode_number, selected_order = _resolved_runtime_port_mode({
@@ -1281,7 +1580,7 @@ def _shape_parameter_map(parameters):
 
 
 def _fiber_pose_updates(alignment_parameters, shape_parameters=None):
-    """Return one synchronized fiber/group/source/measurement pose."""
+    """Return one synchronized source and input-measurement pose."""
     if not OPT_FIBER_POSE:
         return {}
     alignment_values = np.asarray(alignment_parameters, dtype=float).ravel()
@@ -1325,13 +1624,83 @@ def _fiber_pose_updates(alignment_parameters, shape_parameters=None):
         current_center_x = _flare_x(current) + float(current["fiber_offset"])
         center_delta_um = current_center_x - nominal_center_x
 
-    phi_rad = np.deg2rad(float(OPT_FIBER_POSE["phi_deg"]))
+    phi_deg = float(OPT_FIBER_POSE["phi_deg"])
+    phi_rad = np.deg2rad(phi_deg)
     axis_unit = np.asarray([np.cos(phi_rad), np.sin(phi_rad)], dtype=float)
+    if str(OPT_FIBER_POSE.get("excitation_type", "fiber_mode")) == "gaussian_beam":
+        source_contract = dict(OPT_FIBER_POSE["source"])
+        source_center_um = (
+            np.asarray(source_contract["center_um"], dtype=float)
+            + center_delta_um * axis_unit
+        )
+        source_distance_um = float(source_contract["base_distance_um"])
+        if (
+            str(OPT_FIBER_POSE["component_kind"]) == "GC-SOI"
+            and "angle_theta" in alignment_parameter_names
+        ):
+            source_distance_um = (
+                float(OPT_FIBER_POSE["fiber_tox_offset_um"])
+                * np.cos(np.deg2rad(theta_deg))
+                - 0.35
+            )
+        source_z_um = float(source_contract["reference_z_um"]) + source_distance_um
+        updates = {
+            "source_kind": "gaussian",
+            "source": {
+                "name": str(source_contract["name"]),
+                "center_um": source_center_um,
+                "z_um": source_z_um,
+                "theta_deg": theta_deg,
+                "phi_deg": phi_deg,
+                # S polarization is normal to the grating plane of incidence
+                # and therefore remains local TE for every component rotation.
+                "polarization_angle_deg": 90.0,
+                "span_um": float(source_contract.get("span_um", 20.0)),
+            },
+            "ports": [],
+            "monitors": [],
+        }
+        for monitor in OPT_FIBER_POSE.get("monitors", []):
+            distance_um = float(monitor["base_distance_um"])
+            if (
+                str(OPT_FIBER_POSE["component_kind"]) == "GC-SOI"
+                and "angle_theta" in alignment_parameter_names
+            ):
+                distance_um = source_distance_um - float(
+                    OPT_FIBER_POSE["fiber_power_monitor_below_source_um"]
+                )
+            z_um = float(monitor["reference_z_um"]) + distance_um
+            # The ordinary DFT plane stays horizontal.  Only its center follows
+            # the tilted beam axis from the independent source plane.
+            center_um = source_center_um + (
+                (z_um - source_z_um)
+                * np.tan(np.deg2rad(theta_deg))
+                * axis_unit
+            )
+            updates["monitors"].append(
+                {
+                    "name": str(monitor["name"]),
+                    "center_um": center_um,
+                    "z_um": z_um,
+                    "expected_propagation_sign": float(
+                        monitor.get("expected_propagation_sign", -1.0)
+                    ),
+                    "projected_span_um": max(
+                        float(source_contract.get("span_um", 20.0)),
+                        float(source_contract.get("span_um", 20.0))
+                        / max(np.cos(np.deg2rad(theta_deg)), 1e-3),
+                    ),
+                    "role": str(monitor.get("role", "input power measurement")),
+                }
+            )
+        return updates
+
     bottom_center_um = (
         np.asarray(OPT_FIBER_POSE["fiber_center_um"], dtype=float)
         + center_delta_um * axis_unit
     )
     updates = {
+        "source_kind": "fiber_port",
         "fiber": {
             "name": str(OPT_FIBER_POSE["fiber_name"]),
             "center_um": bottom_center_um,
@@ -1428,17 +1797,33 @@ def _set_named(session, path, property_name, value):
 def _apply_fiber_pose_to_session(
     alignment_parameters, fdtd_session, shape_parameters=None, update_modes=True
 ):
-    """Apply angle/offset to fiber, source port, and input monitor atomically."""
+    """Apply angle/offset to the selected source and input monitor atomically."""
     updates = _fiber_pose_updates(alignment_parameters, shape_parameters)
     if not updates:
         return
     fdtd_session.switchtolayout()
-    fiber = updates["fiber"]
-    fiber_path = "::model::" + str(fiber["name"])
-    _set_named(fdtd_session, fiber_path, "x", float(fiber["center_um"][0]) * UM)
-    _set_named(fdtd_session, fiber_path, "y", float(fiber["center_um"][1]) * UM)
-    _set_named(fdtd_session, fiber_path, "theta", float(fiber["theta_deg"]))
-    fdtd_session.runsetup()
+    if str(updates.get("source_kind", "fiber_port")) == "gaussian":
+        source = updates["source"]
+        source_path = "::model::" + str(source["name"])
+        _set_named(fdtd_session, source_path, "x", float(source["center_um"][0]) * UM)
+        _set_named(fdtd_session, source_path, "y", float(source["center_um"][1]) * UM)
+        _set_named(fdtd_session, source_path, "z", float(source["z_um"]) * UM)
+        _set_named(fdtd_session, source_path, "angle theta", float(source["theta_deg"]))
+        _set_named(fdtd_session, source_path, "angle phi", float(source["phi_deg"]))
+        _set_named(
+            fdtd_session,
+            source_path,
+            "polarization angle",
+            90.0,
+        )
+        _set_named(fdtd_session, source_path, "enabled", True)
+    else:
+        fiber = updates["fiber"]
+        fiber_path = "::model::" + str(fiber["name"])
+        _set_named(fdtd_session, fiber_path, "x", float(fiber["center_um"][0]) * UM)
+        _set_named(fdtd_session, fiber_path, "y", float(fiber["center_um"][1]) * UM)
+        _set_named(fdtd_session, fiber_path, "theta", float(fiber["theta_deg"]))
+        fdtd_session.runsetup()
     for port in updates["ports"]:
         port_path = "FDTD::ports::" + str(port["name"])
         _set_named(fdtd_session, port_path, "x", float(port["center_um"][0]) * UM)
@@ -1561,8 +1946,25 @@ def _apply_fiber_pose_to_session(
             float(monitor["projected_span_um"]) * UM,
         )
     fdtd_session.select("FDTD::ports")
-    fdtd_session.set("source port", str(OPT_OBJECTIVE_PORTS["source_port"]))
-    fdtd_session.set("source mode", _require_numeric_source_mode())
+    gaussian_source = (
+        str(OPT_OBJECTIVE_PORTS.get("excitation_type", "fiber_mode")).strip().lower()
+        == "gaussian_beam"
+        or str(OPT_OBJECTIVE_PORTS.get("source_kind", "fiber_port")).strip().lower()
+        in {"gaussian", "gaussian_beam", "gaussian source"}
+    )
+    if gaussian_source:
+        source_name = str(
+            OPT_OBJECTIVE_PORTS.get(
+                "source_name", OPT_OBJECTIVE_PORTS.get("source_port", "")
+            )
+        ).strip()
+        if not source_name:
+            raise RuntimeError("The optimization Gaussian source name is empty")
+        fdtd_session.set("source port", "")
+        _set_named(fdtd_session, "::model::" + source_name, "enabled", True)
+    else:
+        fdtd_session.set("source port", str(OPT_OBJECTIVE_PORTS["source_port"]))
+        fdtd_session.set("source mode", _require_numeric_source_mode())
 
 
 objective = dict(OPTIMIZATION_SPEC["objective"])
@@ -1713,7 +2115,7 @@ def _alignment_loss(alignment_values, fdtd_session, shape_values):
     values = np.asarray(alignment_values, dtype=float).ravel()
     _activate_cpu_model_work(fdtd_session)
     _apply_fiber_pose_to_session(values, fdtd_session, shape_values, update_modes=True)
-    _require_numeric_source_mode()
+    _require_optimization_source()
     _activate_gpu_solve(fdtd_session)
     fdtd_session.run("FDTD", "GPU")
     score = _alignment_port_score(fdtd_session)
@@ -1823,7 +2225,7 @@ def _import_lumopt2():
 
 def _run_lumopt2(module):
     """Official v261+ lumopt2 path; Parametrization returns object::property."""
-    _require_numeric_source_mode()
+    _require_optimization_source()
     required = (
         "Box", "Parametrization", "PortResults", "Fom", "PNorm", "Project",
         "FdtdSession", "LocalRunner", "ScipyOptimizer", "Optimization",
@@ -1982,7 +2384,7 @@ def _run_lumopt2(module):
 
 def _run_legacy_lumopt():
     """Verified bundled legacy API fallback; still a genuine shape adjoint."""
-    _require_numeric_source_mode()
+    _require_optimization_source()
     from lumopt.figures_of_merit.PortTransmission import PortTransmission
     from lumopt.geometries.parameterized_geometry import ParameterizedGeometry
     from lumopt.optimization import Optimization
@@ -2184,10 +2586,7 @@ try:
         best_params,
         update_modes=True,
     )
-    ADJOINT_FDTD_OWNER.select("FDTD::ports")
-    ADJOINT_FDTD_OWNER.set("source port", str(OPT_OBJECTIVE_PORTS["source_port"]))
-    ADJOINT_FDTD_OWNER.set("source mode", _require_numeric_source_mode())
-    _require_numeric_source_mode()
+    _configure_optimization_source(ADJOINT_FDTD_OWNER)
     _activate_gpu_solve(ADJOINT_FDTD_OWNER)
     ADJOINT_FDTD_OWNER.run("FDTD", "GPU")
 
@@ -2308,7 +2707,7 @@ try:
         ) * np.interp(validation_wavelength_m, total_wavelength_m, total_signed)
         if np.any(input_power <= 1e-15):
             raise RuntimeError(
-                "Best-design fiber input monitor has wrong/near-zero signed flux"
+                "Best-design incident input monitor has wrong/near-zero signed flux"
             )
         primary_ratio = modal_power / input_power
         total_ratio = total_power / input_power
@@ -2323,7 +2722,7 @@ try:
             }
         )
         validation_summary = {
-            "definition": "Selected-TE waveguide receiver and nearby total-waveguide power, each divided by measured fiber input-monitor power.",
+            "definition": "Selected-TE waveguide receiver and nearby total-waveguide power, each divided by measured incident input-monitor power.",
             "wavelength_m": validation_wavelength_m.tolist(),
             "fiber_input_power": input_power.tolist(),
             "waveguide_te_over_input": primary_ratio.tolist(),
@@ -2863,11 +3262,11 @@ try:
     else:
         response_axis.plot(
             wavelength_nm, primary_ratio, lw=2.4, color="#7c3aed",
-            label="selected TE / measured fiber input",
+            label="selected TE / measured input",
         )
         response_axis.plot(
             wavelength_nm, total_ratio, lw=2.0, color="#f59e0b",
-            label="total waveguide / measured fiber input",
+            label="total waveguide / measured input",
         )
         response_axis.set_ylabel("normalized linear power")
         response_db_axis.plot(
@@ -2875,14 +3274,14 @@ try:
             10.0 * np.log10(np.maximum(primary_ratio, 1e-15)),
             lw=2.4,
             color="#7c3aed",
-            label="selected TE / measured fiber input",
+            label="selected TE / measured input",
         )
         response_db_axis.plot(
             wavelength_nm,
             10.0 * np.log10(np.maximum(total_ratio, 1e-15)),
             lw=2.0,
             color="#f59e0b",
-            label="total waveguide / measured fiber input",
+            label="total waveguide / measured input",
         )
         response_db_axis.set_xlabel("wavelength [nm]")
         response_db_axis.set_ylabel("normalized power [dB]")
@@ -2979,6 +3378,29 @@ def generate_lumerical_adjoint_notebook(
     warnings = list(warnings)
     _ensure_porttransmission_receiver(payload, specification, warnings)
     fiber_pose = _fiber_pose_contract(payload, target, specification)
+    gaussian_alignment_envelope = _gaussian_alignment_domain_envelope(
+        fiber_pose, specification
+    )
+    if gaussian_alignment_envelope is not None:
+        x_min, y_min, z_min, x_max, y_max, z_max = (
+            gaussian_alignment_envelope
+        )
+        nominal_bounds = list(map(float, payload["BOUNDING_BOX_UM"]))
+        payload["BOUNDING_BOX_UM"] = [
+            min(nominal_bounds[0], x_min),
+            min(nominal_bounds[1], y_min),
+            max(nominal_bounds[2], x_max),
+            max(nominal_bounds[3], y_max),
+        ]
+        payload["SETTINGS"]["fixed_sampling_z_bounds_um"] = [z_min, z_max]
+        fiber_pose["fixed_domain_envelope_um"] = list(
+            gaussian_alignment_envelope
+        )
+        warnings.append(
+            "The fixed adjoint FDTD region reserves every Gaussian source and "
+            "input-power-monitor pose allowed by the selected fiber_offset and "
+            "angle_theta bounds."
+        )
     shape_snapshots = _shape_snapshots(target, list(payload["GEOMETRY"]), specification)
     mesh_um = max(1e-4, float(specification.get("optimization_mesh_um", 0.05)))
     specification["optimization_mesh_um"] = mesh_um
@@ -2987,6 +3409,10 @@ def generate_lumerical_adjoint_notebook(
     )
     objective_ports = _objective_ports(payload, specification)
     specification["objective"]["ports"] = deepcopy(objective_ports)
+    gaussian_excitation = (
+        str(objective_ports.get("excitation_type", "fiber_mode"))
+        == "gaussian_beam"
+    )
 
     warnings.extend(
         [
@@ -3011,6 +3437,7 @@ def generate_lumerical_adjoint_notebook(
         + f"GEOMETRY = {pprint.pformat(payload['GEOMETRY'], width=160, compact=True, sort_dicts=False)}\n"
         + f"PORTS = {pprint.pformat(payload['PORTS'], width=120, sort_dicts=False)}\n"
         + f"FIBER_GEOMETRIES = {pprint.pformat(payload['FIBER_GEOMETRIES'], width=120, sort_dicts=False)}\n"
+        + f"GAUSSIAN_SOURCES = {pprint.pformat(payload.get('GAUSSIAN_SOURCES', []), width=120, sort_dicts=False)}\n"
         + f"PORTS_JSON = {pprint.pformat(payload['PORTS_JSON'], width=120, sort_dicts=False)}\n"
         + f"MONITORS = {pprint.pformat(payload['MONITORS'], width=120, sort_dicts=False)}\n"
         + f"GRATING_ANALYSIS = {pprint.pformat(payload['GRATING_ANALYSIS'], width=120, sort_dicts=False)}\n"
@@ -3039,6 +3466,7 @@ def generate_lumerical_adjoint_notebook(
         "    + 'GEOMETRY = ' + repr(GEOMETRY) + '\\n'\n"
         "    + 'PORTS = ' + repr(PORTS) + '\\n'\n"
         "    + 'FIBER_GEOMETRIES = ' + repr(FIBER_GEOMETRIES) + '\\n'\n"
+        "    + 'GAUSSIAN_SOURCES = ' + repr(GAUSSIAN_SOURCES) + '\\n'\n"
         "    + 'PORTS_JSON = ' + repr(PORTS_JSON) + '\\n'\n"
         "    + 'MONITORS = ' + repr(MONITORS) + '\\n'\n"
         "    + 'GRATING_ANALYSIS = ' + repr(GRATING_ANALYSIS) + '\\n'\n"
@@ -3139,24 +3567,39 @@ else:
         f"`{name}`" for name in specification.get("adjoint_geometry_parameters", [])
     ) or "none"
     objective_text = (
-        "selected-TE waveguide power divided by the measured fiber input-monitor power"
+        (
+            "selected-TE waveguide power divided by the measured Gaussian input-monitor power"
+            if gaussian_excitation
+            else "selected-TE waveguide power divided by the measured fiber input-monitor power"
+        )
         if specification["component_kind"] in {"Grating coupler", "GC-SOI"}
         else "upper-output fundamental-TE power divided by launched input-port power"
     )
+    alignment_label = "source-alignment" if gaussian_excitation else "fiber-alignment"
+    alignment_contract_text = (
+        "`angle_theta` drives the independent Gaussian source and its local-TE S polarization; "
+        "the ordinary horizontal input-power monitor follows the tilted beam-axis intersection. "
+        "`fiber_offset` moves the source/monitor assembly along the grating local X axis."
+        if gaussian_excitation
+        else "`angle_theta` drives the fiber core/cladding, tilted source port, and ordinary "
+        "Z-normal input-power monitor together. The monitor follows the tilted-axis intersection "
+        "and is never treated as a modal port. `fiber_offset` moves that assembly along the "
+        "grating local X axis."
+    )
     intro = f"""# Max Layout → Lumerical 3D alignment + LumOpt shape-adjoint optimization
 
-This notebook optimizes **{specification['component_kind']} (UID {specification['component_uid']})**. Continuous device geometry uses a true bundled-LumOpt shape-adjoint stage with official v261+ `lumopt2.Parametrization` when available and verified legacy `ParameterizedGeometry` otherwise. Grating fiber alignment uses bounded GPU forward solves because moving the excitation/measurement basis is not an ordinary material-boundary adjoint derivative.
+This notebook optimizes **{specification['component_kind']} (UID {specification['component_uid']})**. Continuous device geometry uses a true bundled-LumOpt shape-adjoint stage with official v261+ `lumopt2.Parametrization` when available and verified legacy `ParameterizedGeometry` otherwise. Grating {alignment_label} uses bounded GPU forward solves because moving the excitation/measurement basis is not an ordinary material-boundary adjoint derivative.
 
 **Optimized JSON parameters:** {parameter_names}  
-**Synchronized fiber-alignment parameters:** {alignment_names}  
+**Synchronized {alignment_label} parameters:** {alignment_names}
 **Shape-adjoint geometry parameters:** {shape_names}  
 **Objective:** maximize linear {objective_text} from **{specification['objective']['wavelength_start_um']:.9g} µm** to **{specification['objective']['wavelength_stop_um']:.9g} µm** using **{specification['objective']['wavelength_points']}** wavelength sample(s).
 
 - The build stage uses up to 30 CPU threads. Fiber-alignment evaluations, forward solves, adjoint solves, and best-design validation use the saved GPU resource configuration. Plotting, JSON/NPZ serialization, and final artifact handling switch back to CPU.
-- During the blocking solve, the cell redraws a live table after every completed fiber-alignment or shape-adjoint iteration. Each row reports the current linear objective and the complete selected JSON parameter vector; no extra FDTD solve is performed for reporting.
+- During the blocking solve, the cell redraws a live table after every completed {alignment_label} or shape-adjoint iteration. Each row reports the current linear objective and the complete selected JSON parameter vector; no extra FDTD solve is performed for reporting.
 - Exactly one FDTD owner exists at a time: the seed builder is closed before LumOpt opens its persistent owner. One Shared Web checkout surrounds the entire build/optimization/save workflow.
 - `store_all_simulations=False`: no per-iteration FSP is retained or fetched. Compact history, summary, editor-patch, graph artifacts, the inspection FSP, and the best-geometry FSP are always saved.
-- `angle_theta` drives the fiber core/cladding, tilted source port, and ordinary Z-normal input-power monitor together. The monitor follows the tilted-axis intersection and is never treated as a modal port. `fiber_offset` moves that assembly along the grating local X axis. Both are frozen at their best forward-solve values during the shape-adjoint stage.
+- {alignment_contract_text} Both parameters are frozen at their best forward-solve values during the shape-adjoint stage.
 - Integer tooth counts, device topology, waveguide receivers, material stack, and process thicknesses remain fixed. GC-SOI keeps exactly **{specification.get('fixed_period_count', 'N/A')}** periods.
 - The geometry callback uses exact nominal/minimum/maximum editor-built polygons and fixed-topology, nominal-centered piecewise-linear interpolation. This is genuine adjoint optimization, but it is not a symbolic reimplementation of every editor geometry formula. Keep bounds moderate; inspection and best-design FSP files are stored automatically.
 - Always run the final release cell after success, failure, or interruption.

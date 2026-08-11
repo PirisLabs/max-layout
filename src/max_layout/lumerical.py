@@ -410,6 +410,38 @@ def _standalone_fiber_geometry(component: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
+def _standalone_gaussian_source(component: dict[str, Any]) -> dict[str, Any]:
+    """Transform one movable editor Gaussian plane into solver coordinates."""
+    params = deepcopy(component.get("params", {}))
+    component_angle = float(component.get("orientation_deg", 0.0)) % 360.0
+    params.update(
+        {
+            "name": str(params.get("name", "gaussian_source")),
+            "center": [
+                float(component.get("x", 0.0)),
+                float(component.get("y", 0.0)),
+            ],
+            "component_uid": int(component.get("uid", 0)),
+            "component_kind": "Gaussian source",
+            "injection axis": "Z",
+            "direction": "Backward",
+            "angle phi": (
+                component_angle + float(params.get("angle phi", 0.0))
+            )
+            % 360.0,
+            # S polarization is perpendicular to the incidence/grating plane,
+            # so this remains local TE for every in-plane device rotation.
+            "polarization": "local TE",
+            "polarization angle": 90.0,
+        }
+    )
+    if component.get("simulation_parent_uid") is not None:
+        params["parent_component_uid"] = int(component["simulation_parent_uid"])
+    if component.get("simulation_parent_port") is not None:
+        params["parent_port_name"] = str(component["simulation_parent_port"])
+    return params
+
+
 def _standalone_monitor(component: dict[str, Any]) -> dict[str, Any]:
     params = deepcopy(component.get("params", {}))
     local_normal = str(params.get("plane normal", "X")).upper()
@@ -464,14 +496,50 @@ def _collect_export_data(
     components: list[dict[str, Any]],
     included_layers: set[tuple[int, int]],
     origin_um: Iterable[float] | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[float], list[str]]:
+) -> tuple[
+    list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]],
+    list[dict[str, Any]], list[dict[str, Any]], list[float], list[str],
+]:
     geometry: list[dict[str, Any]] = []
     ports: list[dict[str, Any]] = []
     fiber_geometries: list[dict[str, Any]] = []
+    gaussian_sources: list[dict[str, Any]] = []
     monitors: list[dict[str, Any]] = []
     warnings: list[str] = []
+    grating_excitation_by_uid = {
+        int(component.get("uid", 0)): str(
+            component.get("params", {}).get("excitation_type", "fiber_mode")
+        ).strip().lower()
+        for component in components
+        if str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"}
+    }
     for component in components:
         component_kind = str(component.get("kind", ""))
+        parent_uid = int(component.get("simulation_parent_uid", -1))
+        parent_excitation = grating_excitation_by_uid.get(parent_uid)
+        component_plane_normal = str(
+            component.get("params", {}).get("plane normal", "X")
+        ).upper()
+        is_parent_fiber_object = (
+            component_kind in {"Fiber geometry", "Fiber port", "Fiber-axis FDTD port"}
+            or (
+                component_kind == "FDTD port"
+                and component_plane_normal == "Z"
+                and str(component.get("simulation_parent_port", "")) != "waveguide_point"
+            )
+        )
+        if parent_excitation == "gaussian_beam" and is_parent_fiber_object:
+            warnings.append(
+                "UID %s: removed stale parent-owned %s because the grating uses Gaussian excitation."
+                % (component.get("uid", 0), component_kind)
+            )
+            continue
+        if parent_excitation == "fiber_mode" and component_kind == "Gaussian source":
+            warnings.append(
+                "UID %s: removed stale parent-owned Gaussian source because the grating uses fiber-mode excitation."
+                % component.get("uid", 0)
+            )
+            continue
         if component_kind not in SIMULATION_COMPONENT_KINDS and component_kind != "E-beam multipass":
             try:
                 polygons, _ = component_geometry_arrays(component)
@@ -502,6 +570,9 @@ def _collect_export_data(
                     "place a standard Fiber-axis FDTD port through it."
                 )
             continue
+        if component_kind == "Gaussian source":
+            gaussian_sources.append(_standalone_gaussian_source(component))
+            continue
         if component_kind in {"Power monitor", "Mode expansion monitor", "Field profile monitor"}:
             monitors.append(_standalone_monitor(component))
             continue
@@ -530,10 +601,13 @@ def _collect_export_data(
             monitor["center"] = [float(monitor["center"][0] - origin[0]), float(monitor["center"][1] - origin[1])]
         for fiber in fiber_geometries:
             fiber["center"] = [float(fiber["center"][0] - origin[0]), float(fiber["center"][1] - origin[1])]
+        for source in gaussian_sources:
+            source["center"] = [float(source["center"][0] - origin[0]), float(source["center"][1] - origin[1])]
     else:
         centers = (
             [port.get("center", (0.0, 0.0)) for port in ports]
             + [fiber.get("center", (0.0, 0.0)) for fiber in fiber_geometries]
+            + [source.get("center", (0.0, 0.0)) for source in gaussian_sources]
             + [monitor.get("center", (0.0, 0.0)) for monitor in monitors]
         )
         if centers:
@@ -550,6 +624,8 @@ def _collect_export_data(
                 monitor["center"] = [float(monitor["center"][0] - origin[0]), float(monitor["center"][1] - origin[1])]
             for fiber in fiber_geometries:
                 fiber["center"] = [float(fiber["center"][0] - origin[0]), float(fiber["center"][1] - origin[1])]
+            for source in gaussian_sources:
+                source["center"] = [float(source["center"][0] - origin[0]), float(source["center"][1] - origin[1])]
             shifted = points - origin
             bbox = [float(shifted[:, 0].min() - 1.0), float(shifted[:, 1].min() - 1.0),
                     float(shifted[:, 0].max() + 1.0), float(shifted[:, 1].max() + 1.0)]
@@ -563,13 +639,17 @@ def _collect_export_data(
             "No physical device polygons were selected. This notebook contains only ports/monitors and the background stack; "
             "choose a device-containing scope before solving a component response."
         )
-    return geometry, ports, fiber_geometries, monitors, bbox, warnings + [f"Layout origin moved by ({origin[0]:.6g}, {origin[1]:.6g}) µm for simulation."]
+    return (
+        geometry, ports, fiber_geometries, gaussian_sources, monitors, bbox,
+        warnings + [f"Layout origin moved by ({origin[0]:.6g}, {origin[1]:.6g}) µm for simulation."],
+    )
 
 
 def _apply_authoritative_grating_angles(
     components: list[dict[str, Any]],
     ports: list[dict[str, Any]],
     fiber_geometries: list[dict[str, Any]],
+    gaussian_sources: list[dict[str, Any]],
     monitors: list[dict[str, Any]],
     warnings: list[str],
 ) -> None:
@@ -597,7 +677,7 @@ def _apply_authoritative_grating_angles(
         else:
             matching_values = [
                 float(item["angle theta"])
-                for item in [*fiber_geometries, *ports, *monitors]
+                for item in [*fiber_geometries, *gaussian_sources, *ports, *monitors]
                 if int(item.get("parent_component_uid", -1))
                 == int(component.get("uid", 0))
                 and "angle theta" in item
@@ -619,7 +699,7 @@ def _apply_authoritative_grating_angles(
             )
         canonical_by_uid[int(component.get("uid", 0))] = theta_deg
 
-    for item in [*fiber_geometries, *ports, *monitors]:
+    for item in [*fiber_geometries, *gaussian_sources, *ports, *monitors]:
         parent_uid = int(item.get("parent_component_uid", -1))
         if parent_uid not in canonical_by_uid:
             continue
@@ -787,6 +867,75 @@ def _synchronize_fiber_port_parameters(
                 monitor["x span"] = projected_span_um
                 monitor["y span"] = projected_span_um
                 monitor["expected propagation sign"] = -1.0
+
+
+def _synchronize_gaussian_source_parameters(
+    gaussian_sources: list[dict[str, Any]],
+    monitors: list[dict[str, Any]],
+    warnings: list[str],
+    material_stack: list[dict[str, Any]],
+) -> None:
+    """Keep a Gaussian source and its horizontal Pin monitor on one beam axis."""
+    levels = _stack_vertical_levels(material_stack)
+    for source in gaussian_sources:
+        parent_uid = int(source.get("parent_component_uid", -1))
+        theta_deg = float(source.get("angle theta", 0.0))
+        phi_deg = float(source.get("angle phi", 0.0)) % 360.0
+        if not math.isfinite(theta_deg) or theta_deg < 0.0 or theta_deg >= 90.0:
+            raise ValueError(
+                "Gaussian source %s angle theta must be at least 0 and below 90 degrees"
+                % source.get("name", "gaussian_source")
+            )
+        source["injection axis"] = "Z"
+        source["direction"] = "Backward"
+        source["polarization"] = "local TE"
+        source["polarization angle"] = 90.0
+        source["angle phi"] = phi_deg
+        waist_um = float(source.get("waist radius_um", 4.5))
+        span_um = float(source.get("span_um", 20.0))
+        if not math.isfinite(waist_um) or waist_um <= 0.0:
+            raise ValueError("Gaussian waist radius must be positive")
+        if not math.isfinite(span_um) or span_um <= 2.0 * waist_um:
+            warnings.append(
+                "Gaussian source %s span %.6g um is not larger than its %.6g um "
+                "1/e^2-power diameter; the injected beam may be clipped."
+                % (source.get("name", "gaussian_source"), span_um, 2.0 * waist_um)
+            )
+        source_z_um = _item_vertical_reference(source, levels) + float(
+            source.get("distance_um", 0.0)
+        )
+        input_monitors = [
+            monitor for monitor in monitors
+            if int(monitor.get("parent_component_uid", -2)) == parent_uid
+            and str(monitor.get("parent_port_name", "")) == "fiber_input_power"
+            and str(monitor.get("monitor_kind", "")) == "Power monitor"
+        ]
+        for monitor in input_monitors:
+            monitor_z_um = _item_vertical_reference(monitor, levels) + float(
+                monitor.get("distance_um", 0.0)
+            )
+            axial_delta_um = source_z_um - monitor_z_um
+            lateral_um = axial_delta_um * math.tan(math.radians(theta_deg))
+            phi_rad = math.radians(phi_deg)
+            source_center = np.asarray(source.get("center", (0.0, 0.0)), dtype=float)
+            monitor_center = source_center - lateral_um * np.asarray(
+                [math.cos(phi_rad), math.sin(phi_rad)]
+            )
+            projected_span_um = span_um / max(
+                math.cos(math.radians(theta_deg)), 1e-3
+            )
+            monitor.update(
+                {
+                    "center": [float(monitor_center[0]), float(monitor_center[1])],
+                    "angle theta": theta_deg,
+                    "angle phi": phi_deg,
+                    "align to fiber axis": True,
+                    "x span": projected_span_um,
+                    "y span": projected_span_um,
+                    "z span": 0.0,
+                    "expected propagation sign": -1.0,
+                }
+            )
 
 
 def _normalize_grating_measurement_objects(
@@ -1338,10 +1487,56 @@ def solve_remote_checked(
 '''
 
 
-_LICENSE_CHECKOUT_CELL = r'''import subprocess
+_LICENSE_CHECKOUT_CELL = r'''import json
+import subprocess
 from lambda_remote import _SSH, HOST
 
 LIC = "/opt/lumerical/v261/licensingclient/linx64"
+HPC_PACK_NAME = "Ansys HPC Pack - Shared Web"
+
+
+def _ansys_json_object(raw_output, label):
+    """Extract and validate the LicensingSettings JSON object, ignoring warnings."""
+    text = str(raw_output or "")
+    decoder = json.JSONDecoder()
+    objects = []
+    for offset, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[offset:])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict) and "status" in value:
+            objects.append(value)
+    if not objects:
+        raise RuntimeError(label + " returned no readable LicensingSettings JSON: " + text[-700:])
+    value = objects[-1]
+    if str(value.get("status", "")).upper() != "SUCCESS":
+        raise RuntimeError(label + " failed: " + repr(value))
+    return value
+
+
+def _ansys_in_use(raw_output, label):
+    value = _ansys_json_object(raw_output, label)
+    usage = value.get("usage")
+    if not isinstance(usage, list) or any(not isinstance(item, dict) for item in usage):
+        raise RuntimeError(label + " returned an invalid usage list: " + repr(value))
+    return usage
+
+
+def _hpc_pack_count(usage, label):
+    total = 0
+    for item in usage:
+        if str(item.get("name", "")) != HPC_PACK_NAME:
+            continue
+        if item.get("roaming") is not True:
+            raise RuntimeError(label + " reported the HPC Pack as non-roaming: " + repr(item))
+        count = item.get("count")
+        if isinstance(count, bool) or not isinstance(count, (int, float)) or int(count) != count or count < 0:
+            raise RuntimeError(label + " reported an invalid HPC Pack count: " + repr(item))
+        total += int(count)
+    return total
 
 # 1. seed the Ansys web sign-in from the shared token (no-op if already seeded)
 r = subprocess.run(_SSH + [HOST,
@@ -1352,14 +1547,47 @@ r = subprocess.run(_SSH + [HOST,
     'echo "sign-in seeded from ~/remote-token.json"'],
     capture_output=True, text=True, timeout=180)
 print((r.stdout + r.stderr).strip())
+if r.returncode != 0:
+    raise RuntimeError("Ansys web sign-in could not be seeded")
 
-# 2. roam 3 HPC Packs to this session for 4 h.
-r = subprocess.run(_SSH + [HOST,
-    f'{LIC}/LicensingSettings web shared products checkout '
-    '--name "Ansys HPC Pack - Shared Web" --count 3 --expires "PT4H" --mode user'],
-    capture_output=True, text=True, timeout=180)
-out = (r.stdout + r.stderr).strip()
-print("HPC Packs:", "3 roamed to this session for 4 h" if "SUCCESS" in out else out[:400])
+# 2. Query this host first so rerunning the cell never blindly reserves another 3.
+_in_use_command = (
+    f'{LIC}/LicensingSettings web shared products in-use '
+    '--type roaming --licenseModel "Shared Web" --mode user'
+)
+_before = subprocess.run(
+    _SSH + [HOST, _in_use_command], capture_output=True, text=True, timeout=180
+)
+_before_out = (_before.stdout + _before.stderr).strip()
+if _before.returncode != 0:
+    raise RuntimeError("Pre-check of roaming HPC Packs failed: " + _before_out[-700:])
+_existing_count = _hpc_pack_count(_ansys_in_use(_before_out, "HPC Pack pre-check"), "HPC Pack pre-check")
+
+# 3. Bring the local roaming total to three, with a four-hour expiry.
+_needed_count = max(0, 3 - _existing_count)
+if _needed_count:
+    r = subprocess.run(_SSH + [HOST,
+        f'{LIC}/LicensingSettings web shared products checkout '
+        f'--name "{HPC_PACK_NAME}" --count {_needed_count} --expires "PT4H" '
+        '--type roaming --licenseModel "Shared Web" --mode user'],
+        capture_output=True, text=True, timeout=180)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode != 0:
+        raise RuntimeError("HPC Pack checkout command failed: " + out[-700:])
+    _ansys_json_object(out, "HPC Pack checkout")
+else:
+    print("HPC Packs: existing local roaming reservation already satisfies 3 packs")
+
+_after = subprocess.run(
+    _SSH + [HOST, _in_use_command], capture_output=True, text=True, timeout=180
+)
+_after_out = (_after.stdout + _after.stderr).strip()
+if _after.returncode != 0:
+    raise RuntimeError("Post-check of roaming HPC Packs failed: " + _after_out[-700:])
+_verified_count = _hpc_pack_count(_ansys_in_use(_after_out, "HPC Pack post-check"), "HPC Pack post-check")
+if _verified_count < 3:
+    raise RuntimeError("HPC Pack checkout was not verified: %d of 3 packs are visible" % _verified_count)
+print("HPC Packs: %d roaming packs verified on this host (requested expiry PT4H)" % _verified_count)
 '''
 
 
@@ -1373,6 +1601,7 @@ import numpy as np
 import lumapi
 
 UM = 1e-6
+GAUSSIAN_SOURCES = list(globals().get("GAUSSIAN_SOURCES", []))
 
 # A notebook cell may be rerun after changing its first-cell options.  Close
 # the previous CAD owner before creating/loading another one; otherwise the
@@ -2127,6 +2356,118 @@ set("rotation 1",theta);
             "as through-going cylinders centered on the nominal contact at (%.6g, %.6g) um "
             "(mesh precedence clips the effective fiber material; no source or port was created)."
             % (name, bottom_x_um, bottom_y_um)
+        )
+
+
+def _add_gaussian_sources(
+    fdtd, device_top_um, stack_top_um,
+    silica_cladding_top_um, silica_cladding_center_um,
+):
+    """Create analytic Gaussian excitation planes; these are not FDTD ports."""
+    used_names = set()
+    for index, source in enumerate(GAUSSIAN_SOURCES, start=1):
+        name = str(source.get("name") or "gaussian_%d" % index)
+        if name in used_names:
+            name = "uid_%s_%s" % (source.get("component_uid", 0), name)
+        used_names.add(name)
+        x_um, y_um = map(float, source.get("center", (0.0, 0.0)))
+        z_um = _vertical_reference_um(
+            source, device_top_um, stack_top_um,
+            silica_cladding_top_um, silica_cladding_center_um,
+        ) + float(source.get("distance_um", 0.0))
+        theta_deg = float(source.get("angle theta", 0.0))
+        phi_deg = float(source.get("angle phi", 0.0))
+        span_um = max(1e-6, float(source.get("span_um", 20.0)))
+        waist_um = max(1e-9, float(source.get("waist radius_um", 4.5)))
+        distance_from_waist_um = float(
+            source.get("distance from waist_um", 0.0)
+        )
+        fdtd.addgaussian()
+        fdtd.set("name", name)
+        fdtd.set("injection axis", "z")
+        fdtd.set("direction", "backward")
+        fdtd.set("x", x_um * UM)
+        fdtd.set("x span", span_um * UM)
+        fdtd.set("y", y_um * UM)
+        fdtd.set("y span", span_um * UM)
+        fdtd.set("z", z_um * UM)
+        fdtd.set("angle theta", theta_deg)
+        fdtd.set("angle phi", phi_deg)
+        fdtd.set("polarization angle", 90.0)
+        fdtd.set("amplitude", float(source.get("amplitude", 1.0)))
+        fdtd.set("use scalar approximation", True)
+        fdtd.set("waist radius w0", waist_um * UM)
+        fdtd.set("distance from waist", distance_from_waist_um * UM)
+        if bool(source.get("multifrequency beam calculation", True)):
+            requested_profile_samples = max(
+                2, int(source.get("frequency points", 5))
+            )
+            # In v261 the Gaussian object's sample-count property is the
+            # authoritative multifrequency control.  Set it before enabling
+            # multifrequency mode when possible.  Some older builds expose
+            # that property only after activation, so retry in that order and
+            # then verify both values rather than silently falling back to a
+            # single-frequency beam.
+            try:
+                fdtd.set(
+                    "number of field profile samples",
+                    requested_profile_samples,
+                )
+            except Exception as samples_first_exc:
+                print(
+                    "Gaussian multifrequency activation-order fallback for %s: %s"
+                    % (name, str(samples_first_exc)[:180])
+                )
+                try:
+                    fdtd.set("multifrequency beam calculation", True)
+                    fdtd.set(
+                        "number of field profile samples",
+                        requested_profile_samples,
+                    )
+                except Exception as fallback_exc:
+                    raise RuntimeError(
+                        "Gaussian source %s could not enable its requested %d-point "
+                        "multifrequency field profile: %s"
+                        % (
+                            name,
+                            requested_profile_samples,
+                            str(fallback_exc)[:240],
+                        )
+                    ) from fallback_exc
+            else:
+                fdtd.set("multifrequency beam calculation", True)
+            try:
+                actual_profile_samples = int(round(float(np.asarray(
+                    fdtd.get("number of field profile samples")
+                ).squeeze())))
+                multifrequency_enabled = bool(np.asarray(
+                    fdtd.get("multifrequency beam calculation")
+                ).squeeze())
+            except Exception as readback_exc:
+                raise RuntimeError(
+                    "Gaussian source %s multifrequency settings were written but "
+                    "could not be verified: %s"
+                    % (name, str(readback_exc)[:240])
+                ) from readback_exc
+            if (
+                actual_profile_samples != requested_profile_samples
+                or not multifrequency_enabled
+            ):
+                raise RuntimeError(
+                    "Gaussian source %s rejected its multifrequency settings: "
+                    "requested %d samples/enabled, read back %d/%r"
+                    % (
+                        name,
+                        requested_profile_samples,
+                        actual_profile_samples,
+                        multifrequency_enabled,
+                    )
+                )
+        source["name"] = name
+        print(
+            "Added Gaussian grating source %s: backward Z, theta %.6g deg, "
+            "phi %.6g deg, S/local-TE polarization, waist radius %.6g um."
+            % (name, theta_deg, phi_deg, waist_um)
         )
 
 
@@ -3017,6 +3358,13 @@ def build_simulation():
             bounds[1] = min(bounds[1], y_um - y_half)
             bounds[2] = max(bounds[2], x_um + x_half)
             bounds[3] = max(bounds[3], y_um + y_half)
+    for source in GAUSSIAN_SOURCES:
+        x_um, y_um = map(float, source.get("center", (0.0, 0.0)))
+        half_span_um = 0.5 * max(1e-6, float(source.get("span_um", 20.0)))
+        bounds[0] = min(bounds[0], x_um - half_span_um)
+        bounds[1] = min(bounds[1], y_um - half_span_um)
+        bounds[2] = max(bounds[2], x_um + half_span_um)
+        bounds[3] = max(bounds[3], y_um + half_span_um)
     for monitor in MONITORS:
         actual = float(monitor.get("orientation_deg", 0.0)) % 360.0
         distance_um = float(monitor.get("distance_um", 0.0))
@@ -3120,6 +3468,16 @@ def build_simulation():
             )
             z_extent_min_um = min(z_extent_min_um, sampling_z_min_um)
             z_extent_max_um = max(z_extent_max_um, sampling_z_max_um)
+    for source in GAUSSIAN_SOURCES:
+        source_z_um = _vertical_reference_um(
+            source, device_top_um, stack_top_um,
+            silica_cladding_top_um, silica_cladding_center_um,
+        ) + float(source.get("distance_um", 0.0))
+        sampling_z_extents.append(
+            ("Gaussian source %s" % str(source.get("name", "unnamed")), source_z_um, source_z_um)
+        )
+        z_extent_min_um = min(z_extent_min_um, source_z_um)
+        z_extent_max_um = max(z_extent_max_um, source_z_um)
     for monitor in MONITORS:
         sampling_name = "%s %s" % (
             str(monitor.get("monitor_kind", "monitor")),
@@ -3150,6 +3508,21 @@ def build_simulation():
         )
         z_extent_min_um = min(z_extent_min_um, sampling_z_min_um)
         z_extent_max_um = max(z_extent_max_um, sampling_z_max_um)
+    fixed_sampling_z_bounds = SETTINGS.get("fixed_sampling_z_bounds_um")
+    fixed_sampling_label = "optimization"
+    if fixed_sampling_z_bounds is None:
+        fixed_sampling_z_bounds = SETTINGS.get("sweep_sampling_z_bounds_um")
+        fixed_sampling_label = "sweep"
+    if isinstance(fixed_sampling_z_bounds, (list, tuple)) and len(fixed_sampling_z_bounds) == 2:
+        fixed_z_min_um, fixed_z_max_um = map(float, fixed_sampling_z_bounds)
+        if not np.all(np.isfinite([fixed_z_min_um, fixed_z_max_um])) or fixed_z_max_um < fixed_z_min_um:
+            raise ValueError("fixed sampling Z bounds must contain finite ordered values")
+        z_extent_min_um = min(z_extent_min_um, fixed_z_min_um)
+        z_extent_max_um = max(z_extent_max_um, fixed_z_max_um)
+        print(
+            "Reserved fixed %s Z envelope [%.6g, %.6g] um for movable source/monitor planes."
+            % (fixed_sampling_label, fixed_z_min_um, fixed_z_max_um)
+        )
     legacy_z_padding = float(SETTINGS.get("z_padding_um", 1.0))
     requested_z_min_padding = float(domain_padding.get("z_min", legacy_z_padding))
     requested_z_max_padding = float(domain_padding.get("z_max", legacy_z_padding))
@@ -3247,6 +3620,12 @@ def build_simulation():
         print("Committed geometry in memory before embedded mode calculations.")
     build_timings["fiber geometry and one setup pass"] = time.perf_counter() - stage_started
     stage_started = time.perf_counter()
+    _add_gaussian_sources(
+        fdtd, device_top_um, stack_top_um,
+        silica_cladding_top_um, silica_cladding_center_um,
+    )
+    build_timings["Gaussian sources"] = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
     if SETTINGS.get("include_ports", True):
         _add_ports(
             fdtd, device_z_um, device_top_um, stack_top_um,
@@ -3286,7 +3665,7 @@ print("Built directly in memory; exact-model caching is disabled.")
 ACTUAL_FDTD_DIMENSION = str(fdtd.getnamed("FDTD", "dimension"))
 if ACTUAL_FDTD_DIMENSION.upper() != "3D":
     raise RuntimeError("Max Layout requires a 3D FDTD region, but Lumerical reported " + ACTUAL_FDTD_DIMENSION)
-print(f"Built a verified 3D model with {len(GEOMETRY)} polygons, {len(PORTS)} standard FDTD ports, {len(FIBER_GEOMETRIES)} fiber geometry groups, {len(MONITORS)} monitors, and {len(_active_stack(MATERIAL_STACK))} active stack layers.")
+print(f"Built a verified 3D model with {len(GEOMETRY)} polygons, {len(PORTS)} standard FDTD ports, {len(FIBER_GEOMETRIES)} fiber geometry groups, {len(GAUSSIAN_SOURCES)} Gaussian sources, {len(MONITORS)} monitors, and {len(_active_stack(MATERIAL_STACK))} active stack layers.")
 '''
 
 
@@ -3431,6 +3810,30 @@ def _draw_process_projection(axis, coordinate_index, coordinate_label):
             [start_z - 0.5 * length, start_z + 0.5 * length],
             color="#0e7490", linewidth=4.0, alpha=0.35, solid_capstyle="round",
         )
+    for source in GAUSSIAN_SOURCES:
+        source_x_um, source_y_um = map(float, source.get("center", (0.0, 0.0)))
+        source_horizontal_um = source_x_um if coordinate_index == 0 else source_y_um
+        source_z_um = _vertical_reference_um(
+            source, device_top, stack_top,
+            silica_cladding_top, silica_cladding_center,
+        ) + float(source.get("distance_um", 0.0))
+        theta = np.deg2rad(float(source.get("angle theta", 0.0)))
+        phi = np.deg2rad(float(source.get("angle phi", 0.0)))
+        ray_length_um = min(8.0, max(2.0, float(source.get("span_um", 20.0)) / 3.0))
+        horizontal_delta = -ray_length_um * np.sin(theta) * (
+            np.cos(phi) if coordinate_index == 0 else np.sin(phi)
+        )
+        vertical_delta = -ray_length_um * np.cos(theta)
+        axis.annotate(
+            "",
+            xy=(source_horizontal_um + horizontal_delta, source_z_um + vertical_delta),
+            xytext=(source_horizontal_um, source_z_um),
+            arrowprops=dict(arrowstyle="->", color="#c026d3", linewidth=2.0),
+        )
+        axis.scatter(
+            [source_horizontal_um], [source_z_um], marker="o", s=36,
+            facecolors="none", edgecolors="#c026d3", linewidths=1.3,
+        )
 
     axis.add_patch(Rectangle(
         (coordinate_min, float(MODEL_BOUNDS_UM[2])),
@@ -3484,6 +3887,21 @@ for fiber in FIBER_GEOMETRIES:
     xy_axis.add_patch(plt.Circle((x_um, y_um), core_radius, facecolor="#0e7490", edgecolor="#155e75", linewidth=1.4, alpha=0.35))
     xy_axis.annotate(str(fiber.get("name", "fiber geometry")), (x_um, y_um), xytext=(4, 5), textcoords="offset points", fontsize=7, color="#0e7490")
 
+for source in GAUSSIAN_SOURCES:
+    x_um, y_um = map(float, source.get("center", (0.0, 0.0)))
+    waist_um = float(source.get("waist radius_um", 4.5))
+    phi = np.deg2rad(float(source.get("angle phi", 0.0)))
+    xy_axis.add_patch(plt.Circle(
+        (x_um, y_um), waist_um, facecolor="#e879f9", edgecolor="#a21caf",
+        linewidth=1.4, alpha=0.20,
+    ))
+    xy_axis.arrow(
+        x_um, y_um, -waist_um * np.cos(phi), -waist_um * np.sin(phi),
+        color="#c026d3", width=0.03, head_width=max(0.2, 0.15 * waist_um),
+        length_includes_head=True,
+    )
+    xy_axis.annotate(str(source.get("name", "Gaussian source")), (x_um, y_um), xytext=(4, 5), textcoords="offset points", fontsize=7, color="#86198f")
+
 for port in PORTS:
     normal = str(port.get("plane normal", "X")).upper()
     x_um, y_um = (
@@ -3530,6 +3948,7 @@ _xy_handles, _xy_labels = xy_axis.get_legend_handles_labels()
 _xy_handles.extend([
     Line2D([0], [0], color="#dc2626", linewidth=2.0, label="ports"),
     Line2D([0], [0], color="#059669", linewidth=1.6, linestyle="-.", label="monitors"),
+    Line2D([0], [0], color="#c026d3", linewidth=2.0, label="Gaussian source"),
 ])
 xy_axis.legend(handles=_xy_handles, loc="upper right", fontsize=7, framealpha=0.92)
 
@@ -3660,7 +4079,16 @@ def _plot_coordinates(mode_profile, plane_normal, shape):
     return coordinate_keys, coordinates
 
 
-if GRATING_ANALYSIS:
+if GRATING_ANALYSIS and str(GRATING_ANALYSIS.get("excitation_type", "fiber_mode")) == "gaussian_beam":
+    profile_specs = [
+        (
+            "Waveguide receiver fundamental mode",
+            str(GRATING_ANALYSIS["waveguide_port_name"]),
+            "local TE",
+            "port",
+        ),
+    ]
+elif GRATING_ANALYSIS:
     profile_specs = [
         ("Fiber source", str(GRATING_ANALYSIS["fiber_port_name"]), "local TE", "port"),
         (
@@ -3914,7 +4342,44 @@ elif resource_mode == "CPU":
 else:
     raise ValueError("resource_mode must be GPU or CPU")
 
-if GRATING_ANALYSIS:
+if GRATING_ANALYSIS and str(GRATING_ANALYSIS.get("excitation_type", "fiber_mode")) == "gaussian_beam":
+    fdtd.switchtolayout()
+    if PORTS:
+        fdtd.select("FDTD::ports")
+        # Keep the waveguide port passive.  The independent analytic Gaussian
+        # object is the only source in this excitation mode.
+        fdtd.set("source port", "")
+    gaussian_source_name = str(GRATING_ANALYSIS["source_name"])
+    for gaussian_source in GAUSSIAN_SOURCES:
+        candidate_name = str(gaussian_source.get("name", ""))
+        if candidate_name:
+            fdtd.setnamed(
+                candidate_name, "enabled",
+                candidate_name == gaussian_source_name,
+            )
+    print("Grating excitation source: Gaussian beam " + gaussian_source_name)
+    print("Grating excitation direction: Backward along tilted Z injection")
+    print(
+        "Grating excitation polarization: S/local TE at 90 degrees, normal to grating axis %.6g deg"
+        % float(GRATING_ANALYSIS.get("gaussian_axis_orientation_deg", 0.0))
+    )
+    print(
+        "Gaussian waist radius %.6g um; distance from waist %.6g um."
+        % (
+            float(GRATING_ANALYSIS.get("gaussian_waist_radius_um", 4.5)),
+            float(GRATING_ANALYSIS.get("gaussian_distance_from_waist_um", 0.0)),
+        )
+    )
+    print(
+        "Incident-power monitor: %s (ordinary Z-normal power monitor, expected signed T factor %.0f)."
+        % (
+            GRATING_ANALYSIS["fiber_input_power_monitor_name"],
+            float(GRATING_ANALYSIS.get("fiber_input_power_sign", -1.0)),
+        )
+    )
+    print("Waveguide total-power monitor: " + str(GRATING_ANALYSIS["waveguide_power_monitor_name"]))
+    print("Passive waveguide receiver: FDTD::ports::" + str(GRATING_ANALYSIS["waveguide_port_name"]))
+elif GRATING_ANALYSIS:
     fdtd.switchtolayout()
     if str(GRATING_ANALYSIS["waveguide_port_name"]) == str(GRATING_ANALYSIS["fiber_port_name"]):
         raise RuntimeError("The passive waveguide receiver must be distinct from the fiber source port")
@@ -4196,6 +4661,11 @@ _SUMMARY_MAJOR_PARAMETERS = (
     ("fdtd_port_clearance_um", "MMI access-port clearance from waveguide end", "um"),
     ("fiber_offset", "Fiber offset", "um"),
     ("angle_theta", "Fiber angle theta", "deg"),
+    ("excitation_type", "Grating excitation", ""),
+    ("gaussian_waist_radius_um", "Gaussian waist radius (1/e field)", "um"),
+    ("gaussian_distance_from_waist_um", "Gaussian distance from waist", "um"),
+    ("gaussian_source_span_um", "Gaussian source span", "um"),
+    ("gaussian_multifrequency_points", "Gaussian multifrequency profile points", ""),
     ("fiber_tox_offset_um", "Fiber bottom offset above SiO2 cladding", "um"),
     ("fiber_core_diameter_um", "Fiber core diameter", "um"),
     ("fiber_core_index", "Fiber core refractive index", ""),
@@ -4372,7 +4842,11 @@ if waveguide_index_estimate:
 
 _summary_section(summary_lines, "SOURCES / PORTS / MONITORS")
 if GRATING_ANALYSIS:
-    source_name = str(GRATING_ANALYSIS.get("fiber_port_name", ""))
+    source_name = str(
+        GRATING_ANALYSIS.get(
+            "source_name", GRATING_ANALYSIS.get("fiber_port_name", "")
+        )
+    )
 elif MMI_ANALYSIS:
     source_name = str(MMI_ANALYSIS.get("input_port_name", ""))
 else:
@@ -4456,7 +4930,7 @@ elif GRATING_ANALYSIS and isinstance(globals().get("GRATING_RESULT_ARRAYS"), dic
         )
     )
     summary_lines.append(
-        "- Target power accounting: measured fiber input=%s | waveguide selected-TE=%s | "
+        "- Target power accounting: measured incident input=%s | waveguide selected-TE=%s | "
         "waveguide total=%s | TE/input=%s | total/input=%s"
         % (
             _summary_number(_grating_value_at("fiber_input_power", target_index)),
@@ -4532,6 +5006,7 @@ with open(REMOTE_RESULTS_JSON, "w", encoding="utf-8") as stream:
             "result_notes": RESULT_ERRORS,
             "ports_json": PORTS_JSON,
             "fiber_geometries": FIBER_GEOMETRIES,
+            "gaussian_sources": GAUSSIAN_SOURCES,
             "export_scope": EXPORT_SCOPE_LABEL,
             "exported_components": EXPORTED_COMPONENTS,
             "source_components_json": source_components,
@@ -4577,6 +5052,13 @@ if not GRATING_ANALYSIS:
 elif not SETTINGS.get("run_after_build", False):
     print("Grating analysis is ready but unsolved. Set SETTINGS['run_after_build'] = True and rerun from section 6.")
 else:
+    excitation_type = str(
+        GRATING_ANALYSIS.get("excitation_type", "fiber_mode")
+    ).strip().lower()
+    input_source_label = (
+        "Gaussian-beam input" if excitation_type == "gaussian_beam"
+        else "fiber-mode input"
+    )
     fiber_input_monitor_name = str(GRATING_ANALYSIS["fiber_input_power_monitor_name"])
     fiber_input_sign = float(GRATING_ANALYSIS.get("fiber_input_power_sign", -1.0))
     waveguide_port_name = str(GRATING_ANALYSIS["waveguide_port_name"])
@@ -4745,8 +5227,8 @@ else:
         )
     except Exception as exc:
         raise RuntimeError(
-            "The fiber input-power monitor %r has no readable signed T result: %s"
-            % (fiber_input_monitor_name, exc)
+            "The %s power monitor %r has no readable signed T result: %s"
+            % (input_source_label, fiber_input_monitor_name, exc)
         ) from None
 
     waveguide_expansion, waveguide_result_path, resolved_waveguide_result = _port_expansion(
@@ -4799,9 +5281,10 @@ else:
     normalization_floor = 1e-15
     if not np.all(np.isfinite(fiber_input_power)) or float(np.min(fiber_input_power)) <= normalization_floor:
         raise RuntimeError(
-            "The fiber input monitor has wrong/near-zero signed power after applying sign %.0f: range [%.6g, %.6g]. "
+            "The %s monitor has wrong/near-zero signed power after applying sign %.0f: range [%.6g, %.6g]. "
             "The source must propagate downward (-Z) through this Z-normal monitor."
             % (
+                input_source_label,
                 fiber_input_sign,
                 float(np.nanmin(fiber_input_power)),
                 float(np.nanmax(fiber_input_power)),
@@ -4859,6 +5342,8 @@ else:
     ) * 1e-6
     analysis_arrays = {
         "wavelength_m": wavelengths_m,
+        "input_power_signed_raw": fiber_input_signed_raw,
+        "input_power": fiber_input_power,
         "fiber_input_power_signed_raw": fiber_input_signed_raw,
         "fiber_input_power": fiber_input_power,
         "waveguide_mode_power_source_normalized": waveguide_mode_power,
@@ -5314,6 +5799,11 @@ SWEEP_BASE_MONITORS_BY_NAME = {
     str(monitor.get("name", "")): dict(monitor) for monitor in MONITORS
 }
 SWEEP_BASE_MONITOR_Z_M = {}
+SWEEP_BASE_GAUSSIAN_SOURCES_BY_NAME = {
+    str(source.get("name", "")): dict(source)
+    for source in globals().get("GAUSSIAN_SOURCES", [])
+}
+SWEEP_BASE_GAUSSIAN_SOURCE_Z_M = {}
 _SWEEP_SEED_MODE_SELECTIONS = dict(globals().get(
     "SWEEP_PORT_MODE_SELECTIONS",
     globals().get(
@@ -5335,6 +5825,23 @@ SWEEP_FIBER_MODE_SELECTIONS = {
 def _restore_sweep_fiber_mode_contract():
     """Restore resolved local-TE identities and the active source mode."""
     if not GRATING_ANALYSIS:
+        return
+    if str(GRATING_ANALYSIS.get("excitation_type", "fiber_mode")) == "gaussian_beam":
+        if PORTS:
+            fdtd.select("FDTD::ports")
+            fdtd.set("source port", "")
+        source_name = str(GRATING_ANALYSIS.get("source_name", ""))
+        for source in GAUSSIAN_SOURCES:
+            candidate_name = str(source.get("name", ""))
+            if candidate_name:
+                try:
+                    fdtd.setnamed(
+                        "::model::" + candidate_name, "enabled",
+                        candidate_name == source_name,
+                    )
+                except Exception:
+                    fdtd.select("::model::" + candidate_name)
+                    fdtd.set("enabled", candidate_name == source_name)
         return
     ports_by_name = {str(port.get("name", "")): port for port in PORTS}
     source_name = str(GRATING_ANALYSIS.get("fiber_port_name", ""))
@@ -5777,12 +6284,13 @@ def _sweep_xy(item):
 
 def _apply_sweep_case(case_index):
     """Hot-swap polygons and move linked companions without rebuilding materials or FDTD."""
-    global GEOMETRY, PORTS, FIBER_GEOMETRIES, MONITORS, GRATING_ANALYSIS, MMI_ANALYSIS
+    global GEOMETRY, PORTS, FIBER_GEOMETRIES, GAUSSIAN_SOURCES, MONITORS, GRATING_ANALYSIS, MMI_ANALYSIS
     case = SWEEP_CASES[int(case_index)]
     fdtd.switchtolayout()
     GEOMETRY = list(SWEEP_STATIC_GEOMETRY) + list(case["target_geometry"])
     PORTS = list(case["ports"])
     FIBER_GEOMETRIES = list(case["fiber_geometries"])
+    GAUSSIAN_SOURCES = list(case.get("gaussian_sources", []))
     MONITORS = list(case["monitors"])
     GRATING_ANALYSIS = case.get("grating_analysis")
     MMI_ANALYSIS = case.get("mmi_analysis")
@@ -5849,6 +6357,47 @@ def _apply_sweep_case(case_index):
         # Rebuild the scripted core/cladding cylinders before recalculating
         # the single tilted source-port mode.
         fdtd.runsetup()
+
+    for source in GAUSSIAN_SOURCES:
+        source_name = str(source["name"])
+        path = "::model::" + source_name
+        x_um, y_um = map(float, source.get("center", (0.0, 0.0)))
+        _sweep_set_named(path, "x", x_um * UM)
+        _sweep_set_named(path, "y", y_um * UM)
+        if source_name not in SWEEP_BASE_GAUSSIAN_SOURCE_Z_M:
+            SWEEP_BASE_GAUSSIAN_SOURCE_Z_M[source_name] = float(
+                np.asarray(fdtd.getnamed(path, "z")).squeeze()
+            )
+        base_source = SWEEP_BASE_GAUSSIAN_SOURCES_BY_NAME.get(
+            source_name, source
+        )
+        source_distance_delta_um = (
+            float(source.get("distance_um", 0.0))
+            - float(base_source.get("distance_um", 0.0))
+        )
+        _sweep_set_named(
+            path, "z",
+            SWEEP_BASE_GAUSSIAN_SOURCE_Z_M[source_name]
+            + source_distance_delta_um * UM,
+        )
+        span_um = max(1e-6, float(source.get("span_um", 20.0)))
+        _sweep_set_named(path, "x span", span_um * UM)
+        _sweep_set_named(path, "y span", span_um * UM)
+        _sweep_set_named(
+            path, "angle theta", float(source.get("angle theta", 0.0))
+        )
+        _sweep_set_named(
+            path, "angle phi", float(source.get("angle phi", 0.0))
+        )
+        _sweep_set_named(path, "polarization angle", 90.0)
+        _sweep_set_named(
+            path, "waist radius w0",
+            max(1e-9, float(source.get("waist radius_um", 4.5))) * UM,
+        )
+        _sweep_set_named(
+            path, "distance from waist",
+            float(source.get("distance from waist_um", 0.0)) * UM,
+        )
 
     for port in PORTS:
         name = str(port["name"])
@@ -7443,9 +7992,61 @@ run_remote_checked(
     timeout=120,
 )
 
-MULTIGPU_LICENSE_CHECKOUT_REMOTE = r"""import os
+MULTIGPU_LICENSE_CHECKOUT_REMOTE = r"""import json
+import os
 import subprocess
 _lic = "/opt/lumerical/v261/licensingclient/linx64"
+_hpc_name = "Ansys HPC Pack - Shared Web"
+
+def _license_json(raw, label, require_usage=False):
+    text = str(raw or "")
+    decoder = json.JSONDecoder()
+    objects = []
+    for offset, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[offset:])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict) and "status" in value:
+            objects.append(value)
+    if not objects:
+        raise RuntimeError(label + " returned no readable LicensingSettings JSON: " + text[-700:])
+    value = objects[-1]
+    if str(value.get("status", "")).upper() != "SUCCESS":
+        raise RuntimeError(label + " failed: " + repr(value))
+    if require_usage and (
+        not isinstance(value.get("usage"), list)
+        or any(not isinstance(item, dict) for item in value["usage"])
+    ):
+        raise RuntimeError(label + " returned an invalid usage list: " + repr(value))
+    return value
+
+def _pack_count(value, label):
+    total = 0
+    for item in value["usage"]:
+        if str(item.get("name", "")) != _hpc_name:
+            continue
+        if item.get("roaming") is not True:
+            raise RuntimeError(label + " reported a non-roaming HPC Pack: " + repr(item))
+        count = item.get("count")
+        if isinstance(count, bool) or not isinstance(count, (int, float)) or int(count) != count or count < 0:
+            raise RuntimeError(label + " reported an invalid HPC Pack count: " + repr(item))
+        total += int(count)
+    return total
+
+def _in_use(label):
+    result = subprocess.run(
+        [os.path.join(_lic, "LicensingSettings"), "web", "shared", "products", "in-use",
+         "--type", "roaming", "--licenseModel", "Shared Web", "--mode", "user"],
+        capture_output=True, text=True, timeout=180,
+    )
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        raise RuntimeError(label + " command failed: " + output[-700:])
+    return _license_json(output, label, require_usage=True)
+
 _token = os.path.expanduser("~/remote-token.json")
 if not os.path.isfile(_token) or os.path.getsize(_token) <= 0:
     raise RuntimeError("~/remote-token.json is missing on this worker; update/relaunch Piris Requirements")
@@ -7457,32 +8058,91 @@ if not os.path.isfile(_seeded_token) or os.path.getsize(_seeded_token) <= 0:
     )
     if _seed.returncode != 0:
         raise RuntimeError("Ansys web sign-in failed: " + (_seed.stdout + _seed.stderr)[-500:])
-subprocess.run(
+_enable = subprocess.run(
     [os.path.join(_lic, "LicensingSettings"), "web", "shared", "enable", "--mode", "user"],
     capture_output=True, text=True, timeout=60,
 )
-_checkout = subprocess.run(
-    [os.path.join(_lic, "LicensingSettings"), "web", "shared", "products", "checkout",
-     "--name", "Ansys HPC Pack - Shared Web", "--count", "3", "--expires", "PT4H", "--mode", "user"],
-    capture_output=True, text=True, timeout=180,
-)
-_checkout_text = (_checkout.stdout + _checkout.stderr).strip()
-if _checkout.returncode != 0 or "SUCCESS" not in _checkout_text.upper():
-    raise RuntimeError("Could not reserve 3 HPC Packs for this A100 worker: " + _checkout_text[-700:])
+if _enable.returncode != 0:
+    raise RuntimeError("Could not enable Ansys Shared Web licensing: " + (_enable.stdout + _enable.stderr)[-700:])
+_existing = _pack_count(_in_use("HPC Pack pre-check"), "HPC Pack pre-check")
+_needed = max(0, 3 - _existing)
+if _needed:
+    _checkout = subprocess.run(
+        [os.path.join(_lic, "LicensingSettings"), "web", "shared", "products", "checkout",
+         "--name", _hpc_name, "--count", str(_needed), "--expires", "PT4H",
+         "--type", "roaming", "--licenseModel", "Shared Web", "--mode", "user"],
+        capture_output=True, text=True, timeout=180,
+    )
+    _checkout_text = (_checkout.stdout + _checkout.stderr).strip()
+    if _checkout.returncode != 0:
+        raise RuntimeError("Could not reserve HPC Packs for this A100 worker: " + _checkout_text[-700:])
+    _license_json(_checkout_text, "HPC Pack checkout")
+_verified = _pack_count(_in_use("HPC Pack post-check"), "HPC Pack post-check")
+if _verified < 3:
+    raise RuntimeError("Could not verify 3 HPC Packs for this A100 worker; found %d" % _verified)
 print("__MULTIGPU_LICENSE_ACQUIRED__")
 """
 
-MULTIGPU_LICENSE_RELEASE_REMOTE = r"""import os
+MULTIGPU_LICENSE_RELEASE_REMOTE = r"""import json
+import os
 import subprocess
 _lic = "/opt/lumerical/v261/licensingclient/linx64"
-_release = subprocess.run(
-    [os.path.join(_lic, "LicensingSettings"), "web", "shared", "products", "checkin",
-     "--name", "Ansys HPC Pack - Shared Web", "--count", "3", "--mode", "user"],
-    capture_output=True, text=True, timeout=180,
-)
-_release_text = (_release.stdout + _release.stderr).strip()
-if _release.returncode != 0 or "SUCCESS" not in _release_text.upper():
-    raise RuntimeError("Could not return this worker's 3 HPC Packs: " + _release_text[-700:])
+_hpc_name = "Ansys HPC Pack - Shared Web"
+
+def _license_json(raw, label, require_usage=False):
+    text = str(raw or "")
+    decoder = json.JSONDecoder()
+    objects = []
+    for offset, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[offset:])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict) and "status" in value:
+            objects.append(value)
+    if not objects:
+        raise RuntimeError(label + " returned no readable LicensingSettings JSON: " + text[-700:])
+    value = objects[-1]
+    if str(value.get("status", "")).upper() != "SUCCESS":
+        raise RuntimeError(label + " failed: " + repr(value))
+    if require_usage and (
+        not isinstance(value.get("usage"), list)
+        or any(not isinstance(item, dict) for item in value["usage"])
+    ):
+        raise RuntimeError(label + " returned an invalid usage list: " + repr(value))
+    return value
+
+def _in_use(label):
+    result = subprocess.run(
+        [os.path.join(_lic, "LicensingSettings"), "web", "shared", "products", "in-use",
+         "--type", "roaming", "--licenseModel", "Shared Web", "--mode", "user"],
+        capture_output=True, text=True, timeout=180,
+    )
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        raise RuntimeError(label + " command failed: " + output[-700:])
+    return _license_json(output, label, require_usage=True)
+
+_before = _in_use("HPC Pack pre-release check")
+_present = [item for item in _before["usage"] if str(item.get("name", "")) == _hpc_name]
+if any(item.get("roaming") is not True for item in _present):
+    raise RuntimeError("Pre-release query reported a non-roaming HPC Pack: " + repr(_present))
+if _present:
+    _release = subprocess.run(
+        [os.path.join(_lic, "LicensingSettings"), "web", "shared", "products", "checkin",
+         "--name", _hpc_name, "--type", "roaming", "--licenseModel", "Shared Web",
+         "--mode", "user"],
+        capture_output=True, text=True, timeout=180,
+    )
+    _release_text = (_release.stdout + _release.stderr).strip()
+    if _release.returncode != 0:
+        raise RuntimeError("Could not return this worker's HPC Packs: " + _release_text[-700:])
+    _license_json(_release_text, "HPC Pack checkin")
+_after = _in_use("HPC Pack post-release check")
+if any(str(item.get("name", "")) == _hpc_name for item in _after["usage"]):
+    raise RuntimeError("HPC Pack still appears in structured post-check usage: " + repr(_after["usage"]))
 print("__MULTIGPU_LICENSE_RELEASED__")
 """
 
@@ -7691,7 +8351,7 @@ with np.load(_local_sweep_npz) as _data:
 _is_ce = _primary_name == "coupling_efficiency"
 if _is_ce and _gc_total_over_input is None:
     raise RuntimeError(
-        "The grating sweep bundle is missing total waveguide power / measured fiber input"
+        "The grating sweep bundle is missing total waveguide power / measured input"
     )
 _is_mmi = (
     _primary_name == "output_1_over_input"
@@ -7764,11 +8424,11 @@ for _index, (_label, _stem) in enumerate(zip(_case_labels, _result_stems)):
         )
         _axis.plot(
             _wavelength_nm, _responses[_index], lw=2.4, color="#7c3aed",
-            label="selected TE / measured fiber input",
+            label="selected TE / measured input",
         )
         _axis.plot(
             _wavelength_nm, _gc_total_over_input[_index], lw=2.0,
-            color="#f59e0b", label="total waveguide / measured fiber input",
+            color="#f59e0b", label="total waveguide / measured input",
         )
         _db_axis.plot(
             _wavelength_nm, _responses_db[_index], lw=2.4,
@@ -7998,25 +8658,125 @@ if FAILED_TRANSFERS:
 '''
 
 
-_RELEASE_LICENSES_CELL = r'''# Release in the reverse order of acquisition: FDTD, roamed HPC Packs, SSH.
+_RELEASE_LICENSES_CELL = r'''# Stop this notebook's FDTD work, then return and verify its roaming HPC Packs.
+# This cell never terminates a Lambda node.  It uses the documented named
+# roaming-product check-in; check-in does not accept the checkout --count flag.
+import json
+
+_hpc_pack_name = "Ansys HPC Pack - Shared Web"
+
+
+def _release_license_json(raw_output, label, require_usage=False):
+    text = str(raw_output or "")
+    decoder = json.JSONDecoder()
+    objects = []
+    for offset, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[offset:])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict) and "status" in value:
+            objects.append(value)
+    if not objects:
+        raise RuntimeError(label + " returned no readable LicensingSettings JSON: " + text[-700:])
+    value = objects[-1]
+    if str(value.get("status", "")).upper() != "SUCCESS":
+        raise RuntimeError(label + " failed: " + repr(value))
+    if require_usage and (
+        not isinstance(value.get("usage"), list)
+        or any(not isinstance(item, dict) for item in value["usage"])
+    ):
+        raise RuntimeError(label + " returned an invalid usage list: " + repr(value))
+    return value
+
+
+def _release_in_use(label):
+    command = (
+        f'{LIC}/LicensingSettings web shared products in-use '
+        '--type roaming --licenseModel "Shared Web" --mode user'
+    )
+    result = subprocess.run(
+        _SSH + [HOST, command], capture_output=True, text=True, timeout=180
+    )
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        raise RuntimeError(label + " command failed: " + output[-700:])
+    return _release_license_json(output, label, require_usage=True)
+
+_stop_error = None
+_release_error = None
 try:
-    lam.run(
+    _stop_output = lam.run(
         "import os\n"
-        "try:\n    fdtd.close()\nexcept Exception:\n    pass\n"
+        "_fdtd_owner = globals().pop('fdtd', None)\n"
+        "if _fdtd_owner is not None:\n    _fdtd_owner.close()\n"
         "_runtime_fsp = globals().get('REMOTE_RUNTIME_PROJECT_FILE', '')\n"
         "if _runtime_fsp and os.path.isfile(_runtime_fsp):\n"
         "    try:\n        os.remove(_runtime_fsp)\n        print('Removed transient runtime FSP during release.')\n"
-        "    except Exception as _cleanup_exc:\n        print('Runtime-FSP cleanup warning:', str(_cleanup_exc)[:180])",
-        timeout=90,
+        "    except Exception as _cleanup_exc:\n        print('Runtime-FSP cleanup warning:', str(_cleanup_exc)[:180])\n"
+        "print('__MAX_LAYOUT_FDTD_CLOSED__')",
+        quiet=True,
+        timeout=120,
     )
+    if "__MAX_LAYOUT_FDTD_CLOSED__" not in str(_stop_output):
+        raise RuntimeError("the remote FDTD close marker was not returned")
+except Exception as _normal_close_exc:
+    _stop_error = "Normal FDTD close failed: " + str(_normal_close_exc)[-500:]
+
+# Verify/stop only processes owned by this exact Lambda work session when the
+# updated launcher helper is available.  Never check a roaming licence in
+# while its solver may still be alive and able to reacquire it.
+if callable(getattr(lam, "stop_work_processes", None)):
+    try:
+        _stop_report = lam.stop_work_processes(timeout=25)
+        _stop_confirmed = bool(
+            isinstance(_stop_report, dict)
+            and _stop_report.get("confirmed") is True
+            and not _stop_report.get("remaining_pids", [])
+        )
+        if not _stop_confirmed:
+            raise RuntimeError("unconfirmed process-stop report: " + repr(_stop_report))
+        _stop_error = None
+    except Exception as _forced_stop_exc:
+        _stop_error = "FDTD/process stop remains unconfirmed: " + str(_forced_stop_exc)[-500:]
+
+try:
+    if _stop_error is not None:
+        raise RuntimeError(_stop_error + ". HPC Packs were NOT checked in.")
+    _before = _release_in_use("HPC Pack pre-release check")
+    _present = [
+        item for item in _before["usage"]
+        if str(item.get("name", "")) == _hpc_pack_name
+    ]
+    if any(item.get("roaming") is not True for item in _present):
+        raise RuntimeError("Pre-release query reported a non-roaming HPC Pack: " + repr(_present))
+    if _present:
+        _release = subprocess.run(
+            _SSH + [HOST,
+                f'{LIC}/LicensingSettings web shared products checkin '
+                f'--name "{_hpc_pack_name}" --type roaming '
+                '--licenseModel "Shared Web" --mode user'],
+            capture_output=True, text=True, timeout=180,
+        )
+        _release_out = (_release.stdout + _release.stderr).strip()
+        if _release.returncode != 0:
+            raise RuntimeError("HPC Pack checkin command failed: " + _release_out[-700:])
+        _release_license_json(_release_out, "HPC Pack checkin")
+    _after = _release_in_use("HPC Pack post-release check")
+    if any(str(item.get("name", "")) == _hpc_pack_name for item in _after["usage"]):
+        raise RuntimeError(
+            "Ansys did not confirm that the roaming HPC Pack reservation disappeared: "
+            + repr(_after["usage"])
+        )
+    print("HPC Packs: named roaming reservation returned and absent from post-check in-use output")
+except Exception as _release_exc:
+    _release_error = str(_release_exc)
 finally:
-    _release = subprocess.run(_SSH + [HOST,
-        f'{LIC}/LicensingSettings web shared products checkin '
-        '--name "Ansys HPC Pack - Shared Web" --count 3 --mode user'],
-        capture_output=True, text=True, timeout=180)
-    _release_out = (_release.stdout + _release.stderr).strip()
-    print("HPC Packs:", "3 returned to Shared Web" if "SUCCESS" in _release_out else _release_out[:400])
     lam.close()
+if _release_error is not None:
+    raise RuntimeError(_release_error)
 '''
 
 
@@ -8031,7 +8791,10 @@ def generate_lumerical_notebook(
         else available_geometry_layers(components)
     )
     included = {(int(value[0]), int(value[1])) for value in included_raw}
-    geometry, ports, fiber_geometries, monitors, bbox, warnings = _collect_export_data(
+    (
+        geometry, ports, fiber_geometries, gaussian_sources, monitors, bbox,
+        warnings,
+    ) = _collect_export_data(
         components,
         included,
         origin_um=configuration.get("_fixed_origin_um"),
@@ -8053,10 +8816,13 @@ def generate_lumerical_notebook(
         ports = []
     alignment_stack = deepcopy(configuration.get("material_stack") or default_stack())
     _apply_authoritative_grating_angles(
-        components, ports, fiber_geometries, monitors, warnings
+        components, ports, fiber_geometries, gaussian_sources, monitors, warnings
     )
     _synchronize_fiber_port_parameters(
         ports, fiber_geometries, monitors, warnings, alignment_stack
+    )
+    _synchronize_gaussian_source_parameters(
+        gaussian_sources, monitors, warnings, alignment_stack
     )
 
     grating_analysis: dict[str, Any] | None = None
@@ -8064,6 +8830,13 @@ def generate_lumerical_notebook(
     if grating_components:
         grating = grating_components[0]
         grating_uid = int(grating.get("uid", 0))
+        excitation_type = str(
+            grating.get("params", {}).get("excitation_type", "fiber_mode")
+        ).strip().lower()
+        if excitation_type not in {"fiber_mode", "gaussian_beam"}:
+            raise ValueError(
+                "Grating excitation_type must be fiber_mode or gaussian_beam"
+            )
         if len(grating_components) > 1:
             warnings.append("Multiple grating couplers were exported; natural-radiation analysis uses the first one only.")
         grating_polygons = [item for item in geometry if int(item.get("component_uid", -1)) == grating_uid]
@@ -8108,18 +8881,38 @@ def generate_lumerical_notebook(
         ]
         if matching_fiber_ports:
             fiber_ports = matching_fiber_ports
+        matching_gaussian_sources = [
+            source for source in gaussian_sources
+            if int(source.get("parent_component_uid", -1)) == grating_uid
+        ]
+        duplicate_roles = []
+        for role_name, role_items in (
+            ("waveguide receiver ports", waveguide_ports),
+            ("waveguide total-power monitors", waveguide_power_monitors),
+            ("incident input-power monitors", fiber_input_monitors),
+            ("Gaussian sources", matching_gaussian_sources),
+        ):
+            if len(role_items) > 1:
+                duplicate_roles.append("%d %s" % (len(role_items), role_name))
+        if duplicate_roles:
+            raise ValueError(
+                "Grating component UID %s has an ambiguous simulation topology: %s. "
+                "Refresh its automatic simulation setup before exporting."
+                % (grating_uid, ", ".join(duplicate_roles))
+            )
         # Fiber HE11 is a near-degenerate polarization pair, but the pair is
         # not guaranteed to be returned as eigensolver modes 1 and 2.  Solve
         # the first three modes, identify the pair nearest the fiber index,
         # then select its Gaussian/circular member polarized perpendicular to
         # the grating axis.  The exported global phi includes rotation.
-        for fiber_mode_port in fiber_ports:
-            fiber_mode_port["mode"] = "user select"
-            fiber_mode_port["mode number"] = 0
-            fiber_mode_port["polarization"] = "local TE"
-            fiber_mode_port["candidate mode numbers"] = [1, 2, 3]
-            fiber_mode_port.setdefault("mode degeneracy tolerance", 0.01)
-            fiber_mode_port.setdefault("minimum local TE fraction", 0.8)
+        if excitation_type == "fiber_mode":
+            for fiber_mode_port in fiber_ports:
+                fiber_mode_port["mode"] = "user select"
+                fiber_mode_port["mode number"] = 0
+                fiber_mode_port["polarization"] = "local TE"
+                fiber_mode_port["candidate mode numbers"] = [1, 2, 3]
+                fiber_mode_port.setdefault("mode degeneracy tolerance", 0.01)
+                fiber_mode_port.setdefault("minimum local TE fraction", 0.8)
         if not grating_polygons:
             warnings.append("Grating analysis was not added because no polygons from the grating coupler were selected.")
         elif not waveguide_power_monitors:
@@ -8132,7 +8925,7 @@ def generate_lumerical_notebook(
                 "Grating analysis was not added because the passive waveguide receiver FDTD port is missing. "
                 "Refresh the grating simulation setup to select its confined mode by effective index."
             )
-        elif not fiber_ports:
+        elif excitation_type == "fiber_mode" and not fiber_ports:
             warnings.append(
                 "Grating analysis was not added because no manually placed Ansys-style fiber port was exported. "
                 "Add one from Ports & monitors above the grating exit."
@@ -8142,10 +8935,15 @@ def generate_lumerical_notebook(
                 "Grating analysis was not added because the power monitor below the fiber source is missing. "
                 "Refresh the grating simulation setup so incident power can be measured independently of the source port."
             )
-        elif not fiber_geometries:
+        elif excitation_type == "fiber_mode" and not fiber_geometries:
             warnings.append(
                 "Grating analysis was not added because no separate fiber geometry group was exported. "
                 "Place the Ansys fiber geometry group and put the Fiber-axis FDTD port through its core/cladding."
+            )
+        elif excitation_type == "gaussian_beam" and not matching_gaussian_sources:
+            warnings.append(
+                "Grating analysis was not added because the Gaussian excitation source is missing. "
+                "Refresh the grating simulation setup after selecting gaussian_beam."
             )
         else:
             points = np.vstack([np.asarray(item["vertices_um"], dtype=float) for item in grating_polygons])
@@ -8157,48 +8955,71 @@ def generate_lumerical_notebook(
             )
             waveguide_port = deepcopy(waveguide_ports[0])
             grating_center = 0.5 * (minimum + maximum)
-            fiber_port = min(
-                fiber_ports,
-                key=lambda port: float(
-                    np.linalg.norm(np.asarray(port.get("center", (0.0, 0.0)), dtype=float) - grating_center)
+            source_object = min(
+                matching_gaussian_sources if excitation_type == "gaussian_beam" else fiber_ports,
+                key=lambda source: float(
+                    np.linalg.norm(
+                        np.asarray(source.get("center", (0.0, 0.0)), dtype=float)
+                        - grating_center
+                    )
                 ),
             )
-            fiber_port_name = str(fiber_port.get("name", "fiber"))
             fiber_input_monitor = min(
                 fiber_input_monitors,
                 key=lambda monitor: float(
                     np.linalg.norm(
                         np.asarray(monitor.get("center", (0.0, 0.0)), dtype=float)
-                        - np.asarray(fiber_port.get("center", (0.0, 0.0)), dtype=float)
+                        - np.asarray(source_object.get("center", (0.0, 0.0)), dtype=float)
                     )
                 ),
             )
-            fiber_geometry = min(
-                fiber_geometries,
-                key=lambda fiber: float(
+            source_is_valid = True
+            fiber_geometry = None
+            if excitation_type == "fiber_mode":
+                fiber_geometry = min(
+                    fiber_geometries,
+                    key=lambda fiber: float(
+                        np.linalg.norm(
+                            np.asarray(fiber.get("center", (0.0, 0.0)), dtype=float)
+                            - np.asarray(source_object.get("center", (0.0, 0.0)), dtype=float)
+                        )
+                    ),
+                )
+                fiber_alignment_error_um = float(
                     np.linalg.norm(
-                        np.asarray(fiber.get("center", (0.0, 0.0)), dtype=float)
-                        - np.asarray(fiber_port.get("center", (0.0, 0.0)), dtype=float)
-                    )
-                ),
-            )
-            fiber_alignment_error_um = float(
-                np.linalg.norm(
-                    np.asarray(fiber_geometry.get("center", (0.0, 0.0)), dtype=float)
-                    - np.asarray(
-                        fiber_port.get("fiber bottom center_um", fiber_port.get("center", (0.0, 0.0))),
-                        dtype=float,
+                        np.asarray(fiber_geometry.get("center", (0.0, 0.0)), dtype=float)
+                        - np.asarray(
+                            source_object.get(
+                                "fiber bottom center_um",
+                                source_object.get("center", (0.0, 0.0)),
+                            ),
+                            dtype=float,
+                        )
                     )
                 )
-            )
-            if fiber_alignment_error_um > 0.5 * float(fiber_geometry.get("core diameter_um", 9.0)):
-                warnings.append(
-                    "Grating analysis was not added because the Fiber-axis FDTD port does not pass through "
-                    f"the selected fiber core (top-view separation {fiber_alignment_error_um:.6g} µm)."
-                )
-            else:
+                if fiber_alignment_error_um > 0.5 * float(
+                    fiber_geometry.get("core diameter_um", 9.0)
+                ):
+                    source_is_valid = False
+                    warnings.append(
+                        "Grating analysis was not added because the Fiber-axis FDTD port does not pass through "
+                        f"the selected fiber core (top-view separation {fiber_alignment_error_um:.6g} µm)."
+                    )
+            if source_is_valid:
                 grating_analysis = {
                     "component_uid": grating_uid,
+                    "excitation_type": excitation_type,
+                    "source_kind": (
+                        "gaussian" if excitation_type == "gaussian_beam" else "fdtd_port"
+                    ),
+                    "source_name": str(
+                        source_object.get(
+                            "name",
+                            f"uid_{grating_uid}_gaussian_source"
+                            if excitation_type == "gaussian_beam"
+                            else f"uid_{grating_uid}_fiber_axis",
+                        )
+                    ),
                     "waveguide_power_monitor_name": str(
                         waveguide_power_monitor.get("name", f"uid_{grating_uid}_waveguide_total_power")
                     ),
@@ -8226,18 +9047,46 @@ def generate_lumerical_notebook(
                         "automatic midpoint of actual core and adjacent dielectric indices"
                     ),
                     "waveguide_neff_tolerance": float(waveguide_port.get("neff tolerance", 0.3)),
-                    "fiber_port_name": fiber_port_name,
-                    "fiber_source_mode": "auto local TE",
-                    "fiber_polarization": "local TE",
-                    "fiber_axis_orientation_deg": float(fiber_port.get("angle phi", 0.0)),
-                    "fiber_mode_candidates": [1, 2, 3],
-                    "fiber_geometry_name": str(fiber_geometry.get("name", "fiber")),
                     "fiber_input_power_monitor_name": str(fiber_input_monitor.get("name", "")),
                     "fiber_input_power_sign": float(
                         fiber_input_monitor.get("expected propagation sign", -1.0)
                     ),
                     "frequency_points": int(configuration.get("frequency_points", 31)),
                 }
+                if excitation_type == "fiber_mode":
+                    grating_analysis.update(
+                        {
+                            "fiber_port_name": str(source_object.get("name", "fiber")),
+                            "fiber_source_mode": "auto local TE",
+                            "fiber_polarization": "local TE",
+                            "fiber_axis_orientation_deg": float(
+                                source_object.get("angle phi", 0.0)
+                            ),
+                            "fiber_mode_candidates": [1, 2, 3],
+                            "fiber_geometry_name": str(
+                                (fiber_geometry or {}).get("name", "fiber")
+                            ),
+                        }
+                    )
+                else:
+                    grating_analysis.update(
+                        {
+                            "gaussian_polarization": "local TE / S",
+                            "gaussian_polarization_angle_deg": 90.0,
+                            "gaussian_axis_orientation_deg": float(
+                                source_object.get("angle phi", 0.0)
+                            ),
+                            "gaussian_angle_theta_deg": float(
+                                source_object.get("angle theta", 0.0)
+                            ),
+                            "gaussian_waist_radius_um": float(
+                                source_object.get("waist radius_um", 4.5)
+                            ),
+                            "gaussian_distance_from_waist_um": float(
+                                source_object.get("distance from waist_um", 0.0)
+                            ),
+                        }
+                    )
 
     mmi_analysis: dict[str, Any] | None = None
     mmi_components = [
@@ -8499,6 +9348,7 @@ def generate_lumerical_notebook(
         f"GEOMETRY = {pprint.pformat(geometry, width=160, compact=True, sort_dicts=False)}\n"
         f"PORTS = {pprint.pformat(ports, width=120, sort_dicts=False)}\n"
         f"FIBER_GEOMETRIES = {pprint.pformat(fiber_geometries, width=120, sort_dicts=False)}\n"
+        f"GAUSSIAN_SOURCES = {pprint.pformat(gaussian_sources, width=120, sort_dicts=False)}\n"
         f"PORTS_JSON = {pprint.pformat(ports_json, width=120, sort_dicts=False)}\n"
         f"MONITORS = {pprint.pformat(monitors, width=120, sort_dicts=False)}\n"
         f"GRATING_ANALYSIS = {pprint.pformat(grating_analysis, width=120, sort_dicts=False)}\n"
@@ -8523,6 +9373,7 @@ def generate_lumerical_notebook(
         "    + 'GEOMETRY = ' + repr(GEOMETRY) + '\\n'\n"
         "    + 'PORTS = ' + repr(PORTS) + '\\n'\n"
         "    + 'FIBER_GEOMETRIES = ' + repr(FIBER_GEOMETRIES) + '\\n'\n"
+        "    + 'GAUSSIAN_SOURCES = ' + repr(GAUSSIAN_SOURCES) + '\\n'\n"
         "    + 'PORTS_JSON = ' + repr(PORTS_JSON) + '\\n'\n"
         "    + 'MONITORS = ' + repr(MONITORS) + '\\n'\n"
         "    + 'GRATING_ANALYSIS = ' + repr(GRATING_ANALYSIS) + '\\n'\n"
@@ -8654,16 +9505,17 @@ def generate_lumerical_notebook(
         "        _target_nm = float(np.asarray(_grating_data['target_wavelength_m']).ravel()[0]) * 1e9\n"
         "    _local_response_png = PIRIS_RESULTS_DIR / 'grating_response.png'\n"
         "    _target_index = int(np.argmin(np.abs(_wavelength_nm - _target_nm)))\n"
+        "    _input_label = ('Gaussian-beam input' if str(GRATING_ANALYSIS.get('excitation_type', 'fiber_mode')) == 'gaussian_beam' else 'fiber-mode input')\n"
         "    print('Target wavelength: %.3f nm' % _wavelength_nm[_target_index])\n"
-        "    print('Measured fiber input power: %.8g' % _fiber_input_power[_target_index])\n"
+        "    print('Measured %s power: %.8g' % (_input_label, _fiber_input_power[_target_index]))\n"
         "    print('Waveguide total power: %.8g' % _waveguide_total_power[_target_index])\n"
         "    print('Selected waveguide mode: %d, neff %.8g' % (_selected_mode_number, _selected_neff))\n"
         "    print('Source-normalized selected waveguide-mode power: %.8g' % _waveguide_mode_power[_target_index])\n"
         "    print('Selected-TE / measured input (linear): %.8g' % _coupling_linear[_target_index])\n"
         "    print('Total waveguide / measured input (linear): %.8g' % _waveguide_total_transmission[_target_index])\n"
         "    _figure, (_waveguide_axis, _waveguide_db_axis) = plt.subplots(1, 2, figsize=(13.0, 4.9), sharex=True)\n"
-        "    _waveguide_axis.plot(_wavelength_nm, _coupling_linear, lw=2.6, color='#7c3aed', label='selected TE / measured fiber input')\n"
-        "    _waveguide_axis.plot(_wavelength_nm, _waveguide_total_transmission, lw=2.2, color='#f59e0b', label='total waveguide power / measured fiber input')\n"
+        "    _waveguide_axis.plot(_wavelength_nm, _coupling_linear, lw=2.6, color='#7c3aed', label='selected TE / measured input')\n"
+        "    _waveguide_axis.plot(_wavelength_nm, _waveguide_total_transmission, lw=2.2, color='#f59e0b', label='total waveguide power / measured input')\n"
         "    _waveguide_axis.set(xlabel='wavelength [nm]', ylabel='normalized linear power', title='Waveguide transmission — linear')\n"
         "    _waveguide_db_axis.plot(_wavelength_nm, _coupling_db, lw=2.6, color='#7c3aed', label='selected TE / input')\n"
         "    _waveguide_db_axis.plot(_wavelength_nm, _waveguide_total_transmission_db, lw=2.2, color='#f59e0b', label='total / input')\n"
@@ -8697,9 +9549,36 @@ def generate_lumerical_notebook(
         "Re-export with a device-containing scope.\n"
         if not geometry else ""
     )
+    if grating_analysis and str(
+        grating_analysis.get("excitation_type", "fiber_mode")
+    ) == "gaussian_beam":
+        grating_excitation_note = (
+            "- This grating uses one analytic Gaussian beam source (not an FDTD port) with "
+            "S/local-TE polarization. The access-waveguide FDTD port remains passive. A separate "
+            "Z-normal power monitor measures incident input power, and selected-TE plus total "
+            "waveguide spectra are normalized to that measured input."
+        )
+        grating_section_description = (
+            "The analytic Gaussian beam is the only source. A non-modal Z-normal power monitor "
+            "below it measures actual incident power. The passive waveguide FDTD port reports "
+            "fundamental-TE power, and a nearby power monitor reports total waveguide power. "
+            "Both outputs are divided by measured Gaussian-beam input power."
+        )
+    else:
+        grating_excitation_note = (
+            "- A fiber-mode grating export contains exactly two modal ports: the active tilted "
+            "fiber source and the passive access-waveguide receiver. The first three fiber modes "
+            "are solved and the rotation-aware local-TE member of the near-degenerate HE11 pair is excited."
+        )
+        grating_section_description = (
+            "The tilted fiber FDTD port is the only source. A non-modal Z-normal power monitor "
+            "below it measures actual incident power. The passive waveguide FDTD port reports "
+            "fundamental-TE power, and a nearby power monitor reports total waveguide power. "
+            "Both outputs are divided by measured fiber-mode input power."
+        )
     intro = f"""# Max Layout → Lumerical FDTD notebook
 
-This notebook contains **{len(geometry)} embedded polygons**, **{len(ports)} standard FDTD ports**, **{len(fiber_geometries)} fiber geometry groups**, **{len(monitors)} monitors**, and **{active_count} active material layers**. It is self-contained: no GDS sidecar is required.
+This notebook contains **{len(geometry)} embedded polygons**, **{len(ports)} standard FDTD ports**, **{len(fiber_geometries)} fiber geometry groups**, **{len(gaussian_sources)} Gaussian sources**, **{len(monitors)} monitors**, and **{active_count} active material layers**. It is self-contained: no GDS sidecar is required.
 
 **Export scope:** {export_scope_label}  
 **Included objects:** {exported_component_text}
@@ -8724,7 +9603,7 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
 - A conformal cladding row is a continuous full-domain gap-fill volume: it fills every etched opening and covers every waveguide/grating polygon, flare, terminal arc, and extension. Lower mesh-order device material wins wherever the volumes overlap.
 - The FDTD boundary keeps at least λ/4 clearance from ordinary device features. Background films may extend through their PMLs, but ports never create additional waveguide-to-PML geometry; only the polygons exported from the layout are simulated.
 - `LiNbO3` is created as a frequency- and temperature-dependent anisotropic sampled material using the Zelmon/Moretti model and the selected X/Y/Z crystal cut.
-- Grating-coupler exports contain exactly two modal ports: the active tilted fiber source and the passive access-waveguide receiver. The first three fiber modes are solved and the rotation-aware local-TE member of the near-degenerate HE11 pair is excited. A separate Z-normal power monitor below the source measures incident power with explicit signed-flux correction; it is not a port. The waveguide receiver selects the fundamental TE mode using the stack-derived effective-index check, while a nearby power monitor measures total waveguide flux. Both selected-TE and total-waveguide spectra are normalized to the measured fiber input and plotted in linear and dB units.
+{grating_excitation_note} In either excitation mode, the waveguide receiver selects the fundamental TE mode using the stack-derived effective-index check, while a nearby power monitor measures total waveguide flux. Both selected-TE and total-waveguide spectra are normalized to measured input and plotted in linear and dB units.
 - A 1×2 MMI export launches mode 1 from its input port, measures input power 2 µm before the input taper, plots both output powers relative to that measured input, and plots the normalized longitudinal |E|² distribution through the complete MMI.
 - GPU and CPU modes are selectable through `SETTINGS['resource_mode']`; GPU is the default for every 3D export.
 - The first cell exposes run, diagnostic-preview, and GPU-system-check switches. Project saving is mandatory: one inspection FSP is written before the solve and one solved/best FSP is written afterward.
@@ -8756,7 +9635,7 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
             _notebook_cell("code", final_fsp_cell),
             *(
                 [
-                    _notebook_cell("markdown", "## 10 · Grating coupling efficiency\n\nThe tilted fiber FDTD port is the only source. A non-modal Z-normal power monitor below it measures the actual incident power. The passive waveguide FDTD port reports fundamental-TE power, and a nearby power monitor reports total waveguide power. Both output spectra are divided by the measured fiber input and displayed in linear and dB units.\n"),
+                    _notebook_cell("markdown", "## 10 · Grating coupling efficiency\n\n" + grating_section_description + " The spectra are displayed in linear and dB units.\n"),
                     _notebook_cell("code", grating_analysis_cell),
                 ]
                 if grating_analysis
@@ -8799,7 +9678,8 @@ def _notebook_literal_assignments(notebook: dict[str, Any]) -> dict[str, Any]:
     wanted = {
         "EXPORT_SCOPE_LABEL", "EXPORTED_COMPONENTS", "SOURCE_COMPONENTS_JSON",
         "SETTINGS", "MATERIAL_STACK",
-        "BOUNDING_BOX_UM", "GEOMETRY", "PORTS", "FIBER_GEOMETRIES", "PORTS_JSON",
+        "BOUNDING_BOX_UM", "GEOMETRY", "PORTS", "FIBER_GEOMETRIES",
+        "GAUSSIAN_SOURCES", "PORTS_JSON",
         "MONITORS", "GRATING_ANALYSIS", "MMI_ANALYSIS", "EXPORT_WARNINGS",
     }
     result: dict[str, Any] = {}
@@ -8848,7 +9728,10 @@ def _payload_xy_extent(payload: dict[str, Any]) -> list[float]:
     """Union geometry and movable simulation-plane extents for a fixed sweep domain."""
     bbox = list(map(float, payload["BOUNDING_BOX_UM"]))
     x_min, y_min, x_max, y_max = bbox
-    for item in [*payload["PORTS"], *payload["MONITORS"]]:
+    for item in [
+        *payload["PORTS"], *payload["MONITORS"],
+        *payload.get("GAUSSIAN_SOURCES", []),
+    ]:
         x_um, y_um = map(float, item.get("center", (0.0, 0.0)))
         normal = str(item.get("plane normal", "X")).upper()
         if normal != "Z":
@@ -8864,6 +9747,27 @@ def _payload_xy_extent(payload: dict[str, Any]) -> list[float]:
         y_min = min(y_min, y_um - 0.5 * y_span)
         y_max = max(y_max, y_um + 0.5 * y_span)
     return [x_min, y_min, x_max, y_max]
+
+
+def _payload_z_plane_extent(payload: dict[str, Any]) -> list[float] | None:
+    """Return the exported Z-plane envelope for one hot-swap sweep case."""
+    levels = _stack_vertical_levels(list(payload.get("MATERIAL_STACK", [])))
+    positions: list[float] = []
+    for item in [
+        *payload.get("PORTS", []),
+        *payload.get("GAUSSIAN_SOURCES", []),
+        *payload.get("MONITORS", []),
+    ]:
+        if str(item.get("plane normal", item.get("injection axis", "X"))).upper() != "Z":
+            continue
+        z_um = _item_vertical_reference(item, levels) + float(
+            item.get("distance_um", 0.0)
+        )
+        if math.isfinite(z_um):
+            positions.append(float(z_um))
+    if not positions:
+        return None
+    return [min(positions), max(positions)]
 
 
 def _format_sweep_value(value: int | float) -> str:
@@ -8885,7 +9789,9 @@ def _sweep_case_label(spec: dict[str, Any], values: dict[str, int | float]) -> t
     return label, prefix + "-" + "-".join(part.replace(" ", "") for part in parts)
 
 
-def _sweep_requires_mode_refresh(spec: dict[str, Any]) -> bool:
+def _sweep_requires_mode_refresh(
+    spec: dict[str, Any], grating_analysis: dict[str, Any] | None = None
+) -> bool:
     if str(spec.get("component_kind", "")) == "1x2 MMI":
         # Body width, taper width/length, MMI length and output separation do
         # not change the cross-section at the three access-port planes.  Only
@@ -8899,10 +9805,18 @@ def _sweep_requires_mode_refresh(spec: dict[str, Any]) -> bool:
             )
             for axis in spec["axes"]
         )
+    excitation_type = str(
+        dict(grating_analysis or {}).get("excitation_type", "fiber_mode")
+    ).strip().lower()
     mode_sensitive = (
         "width", "gap", "height", "thickness", "index", "diameter",
-        "cross_section", "angle_theta",
+        "cross_section",
     )
+    if excitation_type != "gaussian_beam":
+        # A tilted fiber-mode source changes its embedded eigenmode.  An
+        # analytic Gaussian source and ordinary Pin monitor only move/rotate;
+        # the passive access-waveguide receiver cross-section is unchanged.
+        mode_sensitive += ("angle_theta",)
     return any(
         any(token in str(axis["parameter"]).lower() for token in mode_sensitive)
         for axis in spec["axes"]
@@ -8982,6 +9896,9 @@ def generate_lumerical_sweep_notebook(
     invariant_names = {
         "ports": [str(item.get("name", "")) for item in base["PORTS"]],
         "fibers": [str(item.get("name", "")) for item in base["FIBER_GEOMETRIES"]],
+        "gaussian_sources": [
+            str(item.get("name", "")) for item in base.get("GAUSSIAN_SOURCES", [])
+        ],
         "monitors": [str(item.get("name", "")) for item in base["MONITORS"]],
     }
     layer_keys = {(int(item["layer"]), int(item.get("datatype", 0))) for item in base["GEOMETRY"]}
@@ -8993,6 +9910,10 @@ def generate_lumerical_sweep_notebook(
         names = {
             "ports": [str(item.get("name", "")) for item in payload["PORTS"]],
             "fibers": [str(item.get("name", "")) for item in payload["FIBER_GEOMETRIES"]],
+            "gaussian_sources": [
+                str(item.get("name", ""))
+                for item in payload.get("GAUSSIAN_SOURCES", [])
+            ],
             "monitors": [str(item.get("name", "")) for item in payload["MONITORS"]],
         }
         if names != invariant_names:
@@ -9057,6 +9978,7 @@ def generate_lumerical_sweep_notebook(
             "target_geometry": target_geometry,
             "ports": payload["PORTS"],
             "fiber_geometries": payload["FIBER_GEOMETRIES"],
+            "gaussian_sources": payload.get("GAUSSIAN_SOURCES", []),
             "monitors": payload["MONITORS"],
             "grating_analysis": payload["GRATING_ANALYSIS"],
             "mmi_analysis": payload["MMI_ANALYSIS"],
@@ -9067,6 +9989,7 @@ def generate_lumerical_sweep_notebook(
                 "target_geometry": target_geometry,
                 "ports": payload["PORTS"],
                 "fiber_geometries": payload["FIBER_GEOMETRIES"],
+                "gaussian_sources": payload.get("GAUSSIAN_SOURCES", []),
                 "monitors": payload["MONITORS"],
                 "grating_analysis": payload["GRATING_ANALYSIS"],
                 "mmi_analysis": payload["MMI_ANALYSIS"],
@@ -9098,6 +10021,20 @@ def generate_lumerical_sweep_notebook(
     settings["run_after_build"] = True
     settings["sweep_mode"] = True
     settings["save_each_fsp"] = False
+    z_plane_extents = [
+        extent for extent in (
+            _payload_z_plane_extent(payload) for payload in extent_payloads
+        )
+        if extent is not None
+    ]
+    if z_plane_extents:
+        # The nominal model is built only once.  Reserve its fixed Z domain
+        # for every source/monitor height reached by an angle sweep before any
+        # in-memory hot swap moves those planes.
+        settings["sweep_sampling_z_bounds_um"] = [
+            min(extent[0] for extent in z_plane_extents),
+            max(extent[1] for extent in z_plane_extents),
+        ]
     project_name = Path(str(settings.get("project_file", "lumerical_sweep.fsp"))).stem
     if not project_name.endswith("_sweep"):
         project_name += "_sweep"
@@ -9142,7 +10079,7 @@ def generate_lumerical_sweep_notebook(
         f"_SWEEP_CASES_B64 = {compressed_cases!r}\n"
         "SWEEP_CASES = _sweep_json.loads(_sweep_zlib.decompress(_sweep_b64.b64decode(_SWEEP_CASES_B64)).decode('utf-8'))\n"
         f"SWEEP_STATIC_GEOMETRY = {pprint.pformat(static_geometry, width=160, compact=True, sort_dicts=False)}\n"
-        f"SWEEP_RECOMPUTE_MODES = {_sweep_requires_mode_refresh(sweep_spec)!r}\n"
+        f"SWEEP_RECOMPUTE_MODES = {_sweep_requires_mode_refresh(sweep_spec, base.get('GRATING_ANALYSIS'))!r}\n"
         f"SWEEP_NOMINAL_PARAMETERS = {pprint.pformat(nominal_parameters, width=120, sort_dicts=False)}\n"
         f"EXPORT_SCOPE_LABEL = {base['EXPORT_SCOPE_LABEL']!r}\n"
         f"EXPORTED_COMPONENTS = {pprint.pformat(base['EXPORTED_COMPONENTS'], width=120, sort_dicts=False)}\n"
@@ -9153,6 +10090,7 @@ def generate_lumerical_sweep_notebook(
         f"GEOMETRY = {pprint.pformat(base_geometry, width=160, compact=True, sort_dicts=False)}\n"
         f"PORTS = {pprint.pformat(base['PORTS'], width=120, sort_dicts=False)}\n"
         f"FIBER_GEOMETRIES = {pprint.pformat(base['FIBER_GEOMETRIES'], width=120, sort_dicts=False)}\n"
+        f"GAUSSIAN_SOURCES = {pprint.pformat(base.get('GAUSSIAN_SOURCES', []), width=120, sort_dicts=False)}\n"
         f"PORTS_JSON = {pprint.pformat(base['PORTS_JSON'], width=120, sort_dicts=False)}\n"
         f"MONITORS = {pprint.pformat(base['MONITORS'], width=120, sort_dicts=False)}\n"
         f"GRATING_ANALYSIS = {pprint.pformat(base['GRATING_ANALYSIS'], width=120, sort_dicts=False)}\n"
@@ -9178,6 +10116,7 @@ def generate_lumerical_sweep_notebook(
         "    + 'GEOMETRY = ' + repr(GEOMETRY) + '\\n'\n"
         "    + 'PORTS = ' + repr(PORTS) + '\\n'\n"
         "    + 'FIBER_GEOMETRIES = ' + repr(FIBER_GEOMETRIES) + '\\n'\n"
+        "    + 'GAUSSIAN_SOURCES = ' + repr(GAUSSIAN_SOURCES) + '\\n'\n"
         "    + 'PORTS_JSON = ' + repr(PORTS_JSON) + '\\n'\n"
         "    + 'MONITORS = ' + repr(MONITORS) + '\\n'\n"
         "    + 'GRATING_ANALYSIS = ' + repr(GRATING_ANALYSIS) + '\\n'\n"
@@ -9394,6 +10333,7 @@ def generate_lumerical_multigpu_sweep_notebook(
         "    + 'GEOMETRY = ' + repr(GEOMETRY) + '\\n'\n"
         "    + 'PORTS = ' + repr(PORTS) + '\\n'\n"
         "    + 'FIBER_GEOMETRIES = ' + repr(FIBER_GEOMETRIES) + '\\n'\n"
+        "    + 'GAUSSIAN_SOURCES = ' + repr(GAUSSIAN_SOURCES) + '\\n'\n"
         "    + 'PORTS_JSON = ' + repr(PORTS_JSON) + '\\n'\n"
         "    + 'MONITORS = ' + repr(MONITORS) + '\\n'\n"
         "    + 'GRATING_ANALYSIS = ' + repr(GRATING_ANALYSIS) + '\\n'\n"
@@ -9512,6 +10452,7 @@ def generate_lumerical_multigpu_sweep_notebook(
         "        + 'GEOMETRY = ' + repr(GEOMETRY) + '\\n'\n"
         "        + 'PORTS = ' + repr(PORTS) + '\\n'\n"
         "        + 'FIBER_GEOMETRIES = ' + repr(FIBER_GEOMETRIES) + '\\n'\n"
+        "        + 'GAUSSIAN_SOURCES = ' + repr(GAUSSIAN_SOURCES) + '\\n'\n"
         "        + 'MONITORS = ' + repr(MONITORS) + '\\n'\n"
         "        + 'GRATING_ANALYSIS = ' + repr(GRATING_ANALYSIS) + '\\n'\n"
         "        + 'MMI_ANALYSIS = ' + repr(MMI_ANALYSIS) + '\\n'\n"
@@ -9739,7 +10680,7 @@ def generate_lumerical_multigpu_sweep_notebook(
         "    'SWEEP_CASES': SWEEP_CASES, 'SWEEP_STATIC_GEOMETRY': SWEEP_STATIC_GEOMETRY,\n"
         "    'SWEEP_RECOMPUTE_MODES': SWEEP_RECOMPUTE_MODES, 'SWEEP_NOMINAL_PARAMETERS': SWEEP_NOMINAL_PARAMETERS,\n"
         "    'SETTINGS': SETTINGS, 'MATERIAL_STACK': MATERIAL_STACK, 'BOUNDING_BOX_UM': BOUNDING_BOX_UM,\n"
-        "    'SOURCE_COMPONENTS_JSON': SOURCE_COMPONENTS_JSON, 'GEOMETRY': GEOMETRY, 'PORTS': PORTS, 'FIBER_GEOMETRIES': FIBER_GEOMETRIES,\n"
+        "    'SOURCE_COMPONENTS_JSON': SOURCE_COMPONENTS_JSON, 'GEOMETRY': GEOMETRY, 'PORTS': PORTS, 'FIBER_GEOMETRIES': FIBER_GEOMETRIES, 'GAUSSIAN_SOURCES': GAUSSIAN_SOURCES,\n"
         "    'MONITORS': MONITORS, 'GRATING_ANALYSIS': GRATING_ANALYSIS, 'MMI_ANALYSIS': MMI_ANALYSIS,\n"
         "}\n"
         "try:\n"

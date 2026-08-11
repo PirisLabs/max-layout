@@ -57,7 +57,9 @@ def mmi_with_simulation_companions() -> tuple[dict, list[dict]]:
     return mmi, factory.components
 
 
-def grating_with_simulation_companions(kind: str) -> tuple[dict, list[dict]]:
+def grating_with_simulation_companions(
+    kind: str, *, excitation_type: str = "fiber_mode"
+) -> tuple[dict, list[dict]]:
     from max_layout.ui.window import NativeLayoutWindow
 
     class Factory:
@@ -72,6 +74,7 @@ def grating_with_simulation_companions(kind: str) -> tuple[dict, list[dict]]:
 
     factory = Factory()
     grating = factory.make_component(kind, 0.0, 0.0)
+    grating["params"]["excitation_type"] = excitation_type
     factory.components.append(grating)
     factory.components.extend(factory.automatic_simulation_companions(grating))
     return grating, factory.components
@@ -401,6 +404,70 @@ class LumericalOptimizationTests(unittest.TestCase):
                     self.assertIn(property_name, source)
                 self.assertIn('"x span"', source)
                 self.assertIn('"y span"', source)
+
+    def test_gaussian_alignment_bounds_reserve_fixed_xy_and_z_domain(self) -> None:
+        grating, components = grating_with_simulation_companions(
+            "GC-SOI", excitation_type="gaussian_beam"
+        )
+        theta = float(grating["params"]["angle_theta"])
+        offset = float(grating["params"]["fiber_offset"])
+        spec = normalize_lumerical_optimization_spec(
+            grating,
+            [
+                {
+                    "parameter": "angle_theta",
+                    "minimum": max(0.0, theta - 5.0),
+                    "maximum": theta + 12.0,
+                },
+                {
+                    "parameter": "fiber_offset",
+                    "minimum": offset - 3.0,
+                    "maximum": offset + 4.0,
+                },
+            ],
+            center_wavelength_um=1.55,
+            bandwidth_nm=0.0,
+            max_iterations=2,
+        )
+        notebook, warnings = generate_lumerical_adjoint_notebook(
+            components,
+            {
+                "material_stack": default_stack("SOI grating coupler (Ansys)"),
+                "included_layers": [(1, 0), (2, 0)],
+                "resource_mode": "GPU",
+                "run_after_build": True,
+                "project_file": "gaussian_alignment.fsp",
+            },
+            spec,
+        )
+        pose = notebook_assignment(notebook, "OPT_FIBER_POSE")
+        envelope = pose["fixed_domain_envelope_um"]
+        self.assertEqual(len(envelope), 6)
+        maximum_theta = theta + 12.0
+        projected_pin_span = (
+            float(pose["source"]["span_um"])
+            / math.cos(math.radians(maximum_theta))
+        )
+        self.assertGreaterEqual(envelope[4] - envelope[1], projected_pin_span)
+        bounds = notebook_assignment(notebook, "BOUNDING_BOX_UM")
+        settings = notebook_assignment(notebook, "SETTINGS")
+        self.assertLessEqual(bounds[0], envelope[0])
+        self.assertLessEqual(bounds[1], envelope[1])
+        self.assertGreaterEqual(bounds[2], envelope[3])
+        self.assertGreaterEqual(bounds[3], envelope[4])
+        self.assertEqual(
+            settings["fixed_sampling_z_bounds_um"],
+            [envelope[2], envelope[5]],
+        )
+        self.assertTrue(
+            any("reserves every Gaussian source" in warning for warning in warnings)
+        )
+        source = "\n".join(
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if cell["cell_type"] == "code"
+        )
+        self.assertIn("Reserved fixed %s Z envelope", source)
 
     def test_runtime_propagates_resolved_winner_first_fiber_mode_pair(self) -> None:
         helper_names = {

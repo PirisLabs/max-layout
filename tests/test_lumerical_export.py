@@ -2962,10 +2962,12 @@ class LumericalExportTests(unittest.TestCase):
         fiber_ports = [port for port in ports if port.get("plane normal") == "Z"]
         monitors = assignment_value(notebook, "MONITORS")
         fiber_geometries = assignment_value(notebook, "FIBER_GEOMETRIES")
+        gaussian_sources = assignment_value(notebook, "GAUSSIAN_SOURCES")
         self.assertEqual(len(ports), 2)
         self.assertFalse(any(port.get("auto_generated_for_grating") for port in ports))
         self.assertEqual(len(fiber_ports), 1)
         self.assertEqual(len(fiber_geometries), 1)
+        self.assertEqual(gaussian_sources, [])
         source_port = next(port for port in fiber_ports if port["name"] == "fiber_out")
         input_monitor = next(
             monitor for monitor in monitors
@@ -2998,7 +3000,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("addport", build_source)
         self.assertIn('serverArgs={"threads": str(build_cpu_threads)}', build_source)
         self.assertIn('SETTINGS.get("build_cpu_threads", 30)', build_source)
-        self.assertNotIn("addgaussian", build_source)
+        self.assertIn("addgaussian", build_source)
         self.assertIn("addstructuregroup", build_source)
         self.assertIn("addcircle", build_source)
         self.assertIn('"rotation offset"', build_source)
@@ -3007,7 +3009,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn('fdtd.set("frequency dependent profile", False)', build_source)
         self.assertNotIn('fdtd.set("number of field profile samples", 1)', build_source)
         self.assertNotIn('fdtd.set("auto update", True)', build_source)
-        self.assertNotIn('fdtd.set("angle theta"', build_source)
+        self.assertIn('fdtd.set("angle theta"', build_source)
         self.assertIn("addlayerbuilder", build_source)
         self.assertIn('fdtd.set("base mesh order", layer_builder_mesh_order)', build_source)
         self.assertIn('fdtd.set("background index", 1.0)', build_source)
@@ -3175,7 +3177,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("plt.subplots(1, 2", analysis_source)
         self.assertIn("Waveguide transmission — linear", analysis_source)
         self.assertIn("Waveguide transmission — dB", analysis_source)
-        self.assertIn("measured fiber input", analysis_source)
+        self.assertIn("measured input", analysis_source)
         self.assertIn("lam.fetch(_remote_grating_npz", analysis_source)
         self.assertIn("display(Image(filename=str(_local_response_png)", analysis_source)
         self.assertIn('fdtd.setexpansion(result_name, input_monitor_name)', build_source)
@@ -3389,7 +3391,8 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("addpower", build)
         self.assertIn("addmodeexpansion", build)
         self.assertIn("addprofile", build)
-        self.assertNotIn("addgaussian", build)
+        self.assertIn("addgaussian", build)
+        self.assertEqual(assignment_value(notebook, "GAUSSIAN_SOURCES"), [])
         self.assertIn("addstructuregroup", build)
         self.assertIn("addcircle", build)
 
@@ -3442,9 +3445,16 @@ class LumericalExportTests(unittest.TestCase):
 
         checkout_source = sources[checkout]
         release_source = sources[checkin]
-        self.assertIn('--count 3 --expires "PT4H" --mode user', checkout_source)
-        self.assertIn('--count 3 --mode user', release_source)
-        self.assertIn("fdtd.close()", release_source)
+        self.assertIn('max(0, 3 - _existing_count)', checkout_source)
+        self.assertIn('--expires "PT4H"', checkout_source)
+        self.assertIn('--type roaming --licenseModel "Shared Web" --mode user', checkout_source)
+        self.assertIn('--type roaming', release_source)
+        self.assertIn('--licenseModel "Shared Web" --mode user', release_source)
+        self.assertNotIn('--count 3 --mode user', release_source)
+        self.assertIn('json.JSONDecoder()', checkout_source)
+        self.assertIn('json.JSONDecoder()', release_source)
+        self.assertIn('require_usage=True', release_source)
+        self.assertIn("_fdtd_owner.close()", release_source)
         self.assertIn("max_layout_results.npz", cell_source_containing(notebook, "REMOTE_RESULTS_SAVER"))
         self.assertEqual(
             notebook["metadata"]["max_layout"]["license_lifecycle"],
