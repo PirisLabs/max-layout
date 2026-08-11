@@ -202,7 +202,11 @@ class GratingPowerMonitorContractTests(unittest.TestCase):
         namespace["_add_monitors"](fake, 0.0, 0.2, 1.2, 0.9, 0.55)
         self.assertEqual(fake.addpower_calls, 1)
         self.assertIn(("name", input_monitor["name"]), fake.settings)
-        self.assertIn(("use source limits", True), fake.settings)
+        # The frequency range is inherited from the global monitor settings, so
+        # setting it per-monitor would raise "requested property is inactive".
+        self.assertNotIn(
+            "use source limits", [setting_name for setting_name, _ in fake.settings]
+        )
         self.assertIn(("output power", True), fake.settings)
         self.assertFalse(
             any("apod" in setting_name.lower() for setting_name, _ in fake.settings)

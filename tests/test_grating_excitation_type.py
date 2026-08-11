@@ -462,6 +462,33 @@ class GratingExcitationTypeTests(unittest.TestCase):
         self.assertEqual(len(_assignment(notebook, "GAUSSIAN_SOURCES")), 1)
         self.assertTrue(any("removed stale parent-owned" in warning for warning in warnings))
 
+    def test_export_repairs_missing_automatic_gaussian_and_restores_ce_plots(self) -> None:
+        for kind in ("Grating coupler", "GC-SOI"):
+            with self.subTest(kind=kind):
+                factory, grating = _gaussian_setup(kind, orientation_deg=17.0)
+                factory.components = [
+                    item for item in factory.components
+                    if item["kind"] != "Gaussian source"
+                ]
+
+                notebook, warnings = generate_lumerical_notebook(
+                    factory.components, _configuration(kind)
+                )
+                sources = _assignment(notebook, "GAUSSIAN_SOURCES")
+                analysis = _assignment(notebook, "GRATING_ANALYSIS")
+                notebook_source = _all_source(notebook)
+
+                self.assertEqual(len(sources), 1)
+                self.assertEqual(
+                    sources[0]["name"], f"uid_{grating['uid']}_gaussian_source"
+                )
+                self.assertEqual(analysis["excitation_type"], "gaussian_beam")
+                self.assertTrue(any("Repaired the missing" in warning for warning in warnings))
+                self.assertIn("Grating coupling efficiency", notebook_source)
+                self.assertIn("Waveguide transmission — linear", notebook_source)
+                self.assertIn("Waveguide transmission — dB", notebook_source)
+                self.assertIn("display(Image(filename=str(_local_response_png)", notebook_source)
+
     def test_gaussian_angle_sweep_reserves_every_source_plane_in_fixed_z_domain(self) -> None:
         factory, grating = _gaussian_setup("GC-SOI")
         spec = normalize_lumerical_sweep_spec(

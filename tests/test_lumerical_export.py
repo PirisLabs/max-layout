@@ -1173,6 +1173,10 @@ class LumericalExportTests(unittest.TestCase):
         self.assertNotIn("mode number", input_monitors[0]["params"])
         self.assertNotIn("candidate mode numbers", input_monitors[0]["params"])
         self.assertIn('fdtd.set("output power", True)', lumerical._BUILD_CELL)
+        self.assertNotIn(
+            'fdtd.set("use source limits", True)\n            fdtd.set("output power", True)',
+            lumerical._BUILD_CELL,
+        )
 
     def test_sweep_fiber_fallback_reselects_pair_and_reaches_multigpu_worker(self) -> None:
         import ast
@@ -1703,7 +1707,9 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("Lambda.stop_work_processes", inventory_cell)
         self.assertIn('("run_once", "stop_work_processes")', inventory_cell)
         self.assertIn("MULTIGPU_LICENSE_CHECKOUT_REMOTE", orchestration_cell)
-        self.assertIn('"--expires", "PT2H"', inventory_cell)
+        self.assertIn('"--expires", "__PIRIS_HPC_EXPIRY__"', inventory_cell)
+        self.assertIn("HPC_PACK_DURATION_MINUTES", inventory_cell)
+        self.assertIn('"PT%dM" % _hpc_duration_minutes', inventory_cell)
         self.assertIn(
             "_multigpu_run_once_checked(client, MULTIGPU_LICENSE_RELEASE_REMOTE",
             orchestration_cell,
@@ -3446,8 +3452,10 @@ class LumericalExportTests(unittest.TestCase):
         checkout_source = sources[checkout]
         release_source = sources[checkin]
         self.assertIn('max(0, 3 - _existing_count)', checkout_source)
-        self.assertIn('--expires "PT2H"', checkout_source)
-        self.assertIn('--type roaming --licenseModel "Shared Web" --mode user', checkout_source)
+        self.assertIn('--expires "{HPC_PACK_EXPIRY}"', checkout_source)
+        self.assertIn('HPC_PACK_EXPIRY = "PT%dM" % HPC_PACK_DURATION_MINUTES', checkout_source)
+        self.assertIn('--licenseModel "Shared Web" --mode user', checkout_source)
+        self.assertNotIn('--expires "{HPC_PACK_EXPIRY}" --type roaming', checkout_source)
         self.assertIn('--type roaming', release_source)
         self.assertIn('--licenseModel "Shared Web" --mode user', release_source)
         self.assertNotIn('--count 3 --mode user', release_source)
@@ -3485,9 +3493,10 @@ class LumericalExportTests(unittest.TestCase):
             "Project-file saving is always enabled: inspection plus solved/best FSP.",
             first_source,
         )
-        self.assertIn("SHOW_GEOMETRY_PREVIEW = False", first_source)
-        self.assertIn("SHOW_PORT_MODE_PREVIEW = False", first_source)
+        self.assertIn("SHOW_GEOMETRY_PREVIEW = True", first_source)
+        self.assertIn("SHOW_PORT_MODE_PREVIEW = True", first_source)
         self.assertIn("RUN_GPU_SYSTEM_CHECK = False", first_source)
+        self.assertIn("HPC_PACK_DURATION_MINUTES = 30", first_source)
 
         all_source = "\n".join(
             "".join(cell.get("source", [])) for cell in notebook["cells"]
@@ -3522,9 +3531,10 @@ class LumericalExportTests(unittest.TestCase):
         first_source = "".join(notebook["cells"][0]["source"])
         self.assertNotIn("REUSE_EXACT_MODEL_CACHE", first_source)
         self.assertNotIn("SAVE_EXACT_MODEL_CACHE_ON_MISS", first_source)
-        self.assertIn("SHOW_GEOMETRY_PREVIEW = False", first_source)
-        self.assertIn("SHOW_PORT_MODE_PREVIEW = False", first_source)
+        self.assertIn("SHOW_GEOMETRY_PREVIEW = True", first_source)
+        self.assertIn("SHOW_PORT_MODE_PREVIEW = True", first_source)
         self.assertIn("RUN_GPU_SYSTEM_CHECK = False", first_source)
+        self.assertIn("HPC_PACK_DURATION_MINUTES = 30", first_source)
         build_source = cell_source_containing(notebook, "REMOTE_MODEL_BUILDER =")
         self.assertNotIn("_save_model_cache_on_miss", build_source)
         self.assertNotIn("MODEL_CACHE", build_source)

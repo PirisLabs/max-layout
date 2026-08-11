@@ -451,7 +451,8 @@ class LumericalRFExportTests(unittest.TestCase):
                 self.assertLessEqual(release, close)
 
                 self.assertIn('max(0, 3 - _existing_count)', sources[checkout])
-                self.assertIn('--expires "PT2H"', sources[checkout])
+                self.assertIn('--expires "{HPC_PACK_EXPIRY}"', sources[checkout])
+                self.assertIn("HPC_PACK_DURATION_MINUTES = 30", sources[0])
                 self.assertIn('--licenseModel "Shared Web" --mode user', sources[checkout])
                 self.assertIn("--type roaming", sources[release])
                 self.assertIn('--licenseModel "Shared Web" --mode user', sources[release])

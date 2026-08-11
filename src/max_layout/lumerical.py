@@ -645,6 +645,100 @@ def _collect_export_data(
     )
 
 
+def _repair_missing_grating_gaussian_sources(
+    components: list[dict[str, Any]],
+    gaussian_sources: list[dict[str, Any]],
+    monitors: list[dict[str, Any]],
+    warnings: list[str],
+) -> None:
+    """Recover the automatic Gaussian source omitted by an older project.
+
+    Early Gaussian-excitation projects could retain the input-power monitor
+    while losing their automatic source during the fiber-to-Gaussian switch.
+    The monitor still records the beam axis and stack-relative source plane,
+    so the missing source can be reconstructed without guessing its optical
+    placement.  This keeps old projects simulatable and restores their CE
+    analysis/plots on the next notebook export.
+    """
+    sources_by_parent = {
+        int(source.get("parent_component_uid", -1))
+        for source in gaussian_sources
+    }
+    for component in components:
+        if str(component.get("kind", "")) not in {"Grating coupler", "GC-SOI"}:
+            continue
+        params = component.get("params", {})
+        if str(params.get("excitation_type", "fiber_mode")).strip().lower() != "gaussian_beam":
+            continue
+        parent_uid = int(component.get("uid", 0))
+        if parent_uid in sources_by_parent:
+            continue
+        input_monitors = [
+            monitor for monitor in monitors
+            if int(monitor.get("parent_component_uid", -1)) == parent_uid
+            and str(monitor.get("monitor_kind", "")) == "Power monitor"
+            and str(monitor.get("plane normal", "Z")).upper() == "Z"
+            and (
+                str(monitor.get("parent_port_name", "")) == "fiber_input_power"
+                or str(monitor.get("fiber plane role", "")).strip().lower()
+                == "input power measurement"
+            )
+        ]
+        if len(input_monitors) != 1:
+            continue
+        input_monitor = input_monitors[0]
+        theta_deg = float(params.get("angle_theta", input_monitor.get("angle theta", 0.0)))
+        phi_deg = float(component.get("orientation_deg", input_monitor.get("orientation_deg", 0.0))) % 360.0
+        below_source_um = max(
+            0.001,
+            float(params.get("fiber_power_monitor_below_source_um", 0.1)),
+        )
+        lateral_um = below_source_um * math.tan(math.radians(theta_deg))
+        phi_rad = math.radians(phi_deg)
+        monitor_center = np.asarray(input_monitor.get("center", (0.0, 0.0)), dtype=float)
+        source_center = monitor_center + lateral_um * np.asarray(
+            [math.cos(phi_rad), math.sin(phi_rad)]
+        )
+        gaussian_sources.append(
+            {
+                "name": f"uid_{parent_uid}_gaussian_source",
+                "center": [float(source_center[0]), float(source_center[1])],
+                "component_uid": parent_uid,
+                "component_kind": "Gaussian source",
+                "parent_component_uid": parent_uid,
+                "parent_port_name": "gaussian_source",
+                "injection axis": "Z",
+                "direction": "Backward",
+                "angle theta": theta_deg,
+                "angle phi": phi_deg,
+                "polarization": "local TE",
+                "polarization angle": 90.0,
+                "waist radius_um": max(
+                    0.001, float(params.get("gaussian_waist_radius_um", 4.5))
+                ),
+                "distance from waist_um": float(
+                    params.get("gaussian_distance_from_waist_um", 0.0)
+                ),
+                "span_um": max(
+                    0.001, float(params.get("gaussian_source_span_um", 20.0))
+                ),
+                "amplitude": 1.0,
+                "multifrequency beam calculation": True,
+                "frequency points": max(
+                    1, int(params.get("gaussian_multifrequency_points", 5))
+                ),
+                "z reference": str(input_monitor.get("z reference", "top of stack")),
+                "distance_um": float(input_monitor.get("distance_um", 0.0))
+                + below_source_um,
+            }
+        )
+        sources_by_parent.add(parent_uid)
+        warnings.append(
+            "Repaired the missing automatic Gaussian source for grating UID %s during export; "
+            "refresh and save the project to persist it in the editor." % parent_uid
+        )
+
+
 def _apply_authoritative_grating_angles(
     components: list[dict[str, Any]],
     ports: list[dict[str, Any]],
@@ -1096,9 +1190,11 @@ def _quick_run_options_cell(configuration: dict[str, Any], *, workflow: str) -> 
         "# QUICK RUN OPTIONS — edit these before running any other cell.\n"
         "# ==============================================================================\n"
         f"RUN_SIMULATION = {bool(configuration.get('run_after_build', True))!r}\n"
-        f"SHOW_GEOMETRY_PREVIEW = {bool(configuration.get('show_geometry_preview', False))!r}\n"
-        f"SHOW_PORT_MODE_PREVIEW = {bool(configuration.get('show_port_mode_preview', False))!r}\n"
+        f"SHOW_GEOMETRY_PREVIEW = {bool(configuration.get('show_geometry_preview', True))!r}\n"
+        f"SHOW_PORT_MODE_PREVIEW = {bool(configuration.get('show_port_mode_preview', True))!r}\n"
         f"RUN_GPU_SYSTEM_CHECK = {bool(configuration.get('run_gpu_system_check', False))!r}\n"
+        f"HPC_PACK_DURATION_MINUTES = {int(configuration.get('hpc_pack_duration_minutes', 30))!r}\n"
+        "# HPC_PACK_DURATION_MINUTES controls the roaming checkout below; edit it before section 2.\n"
         "# One pre-solve inspection FSP and one solved/best FSP are always stored.\n"
         "# ==============================================================================\n"
         "print('Project-file saving is always enabled: inspection plus solved/best FSP.')\n\n"
@@ -1493,6 +1589,13 @@ from lambda_remote import _SSH, HOST
 
 LIC = "/opt/lumerical/v261/licensingclient/linx64"
 HPC_PACK_NAME = "Ansys HPC Pack - Shared Web"
+try:
+    HPC_PACK_DURATION_MINUTES = int(HPC_PACK_DURATION_MINUTES)
+except (NameError, TypeError, ValueError):
+    raise ValueError("Set HPC_PACK_DURATION_MINUTES in cell 1 to a positive whole number of minutes") from None
+if HPC_PACK_DURATION_MINUTES <= 0:
+    raise ValueError("HPC_PACK_DURATION_MINUTES must be greater than zero")
+HPC_PACK_EXPIRY = "PT%dM" % HPC_PACK_DURATION_MINUTES
 
 
 def _ansys_json_object(raw_output, label):
@@ -1565,13 +1668,13 @@ if _before.returncode != 0:
     raise RuntimeError("Pre-check of roaming HPC Packs failed: " + _before_out[-700:])
 _existing_count = _hpc_pack_count(_ansys_in_use(_before_out, "HPC Pack pre-check"), "HPC Pack pre-check")
 
-# 3. Bring the local roaming total to three, with a two-hour expiry.
+# 3. Bring the local roaming total to three, using the editable expiry from cell 1.
 _needed_count = max(0, 3 - _existing_count)
 if _needed_count:
     r = subprocess.run(_SSH + [HOST,
         f'{LIC}/LicensingSettings web shared products checkout '
-        f'--name "{HPC_PACK_NAME}" --count {_needed_count} --expires "PT2H" '
-        '--type roaming --licenseModel "Shared Web" --mode user'],
+        f'--name "{HPC_PACK_NAME}" --count {_needed_count} --expires "{HPC_PACK_EXPIRY}" '
+        '--licenseModel "Shared Web" --mode user'],
         capture_output=True, text=True, timeout=180)
     out = (r.stdout + r.stderr).strip()
     if r.returncode != 0:
@@ -1589,7 +1692,7 @@ if _after.returncode != 0:
 _verified_count = _hpc_pack_count(_ansys_in_use(_after_out, "HPC Pack post-check"), "HPC Pack post-check")
 if _verified_count < 3:
     raise RuntimeError("HPC Pack checkout was not verified: %d of 3 packs are visible" % _verified_count)
-print("HPC Packs: %d roaming packs verified on this host (requested expiry PT2H)" % _verified_count)
+print("HPC Packs: %d roaming packs verified on this host (requested expiry %s)" % (_verified_count, HPC_PACK_EXPIRY))
 '''
 
 
@@ -3206,10 +3309,10 @@ def _add_monitors(
             and str(monitor.get("fiber plane role", "")).strip().lower()
             == "input power measurement"
         ):
-            # Input normalization needs only the integrated Poynting flux.
-            # Leave apodization disabled/default and avoid recording field
-            # components on this large projected fiber plane.
-            fdtd.set("use source limits", True)
+            # This monitor inherits its frequency range from the global
+            # monitor settings configured after all monitors are created.
+            # Setting "use source limits" locally while inheritance is active
+            # raises "requested property is inactive" in Lumerical 2026 R1.
             fdtd.set("output power", True)
         if monitor_kind == "Field profile monitor":
             # The MMI single-run diagnostic plots |E|^2.  Make the recording
@@ -8073,8 +8176,8 @@ _needed = max(0, 3 - _existing)
 if _needed:
     _checkout = subprocess.run(
         [os.path.join(_lic, "LicensingSettings"), "web", "shared", "products", "checkout",
-         "--name", _hpc_name, "--count", str(_needed), "--expires", "PT2H",
-         "--type", "roaming", "--licenseModel", "Shared Web", "--mode", "user"],
+         "--name", _hpc_name, "--count", str(_needed), "--expires", "__PIRIS_HPC_EXPIRY__",
+         "--licenseModel", "Shared Web", "--mode", "user"],
         capture_output=True, text=True, timeout=180,
     )
     _checkout_text = (_checkout.stdout + _checkout.stderr).strip()
@@ -8086,6 +8189,16 @@ if _verified < 3:
     raise RuntimeError("Could not verify 3 HPC Packs for this A100 worker; found %d" % _verified)
 print("__MULTIGPU_LICENSE_ACQUIRED__")
 """
+
+try:
+    _hpc_duration_minutes = int(HPC_PACK_DURATION_MINUTES)
+except (NameError, TypeError, ValueError):
+    raise ValueError("Set HPC_PACK_DURATION_MINUTES in cell 1 to a positive whole number of minutes") from None
+if _hpc_duration_minutes <= 0:
+    raise ValueError("HPC_PACK_DURATION_MINUTES must be greater than zero")
+MULTIGPU_LICENSE_CHECKOUT_REMOTE = MULTIGPU_LICENSE_CHECKOUT_REMOTE.replace(
+    "__PIRIS_HPC_EXPIRY__", "PT%dM" % _hpc_duration_minutes
+)
 
 MULTIGPU_LICENSE_RELEASE_REMOTE = r"""import json
 import os
@@ -8820,6 +8933,9 @@ def generate_lumerical_notebook(
                 % (component.get("kind", "component"), component.get("uid", 0))
             )
     _normalize_grating_measurement_objects(ports, monitors, warnings)
+    _repair_missing_grating_gaussian_sources(
+        components, gaussian_sources, monitors, warnings
+    )
     if not bool(configuration.get("include_ports", True)):
         ports = []
     alignment_stack = deepcopy(configuration.get("material_stack") or default_stack())
@@ -9595,7 +9711,7 @@ This notebook contains **{len(geometry)} embedded polygons**, **{len(ports)} sta
 The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect to Lambda, seed Ansys Shared Web, roam exactly three HPC Packs, build/run in that licensed session, save and fetch results, close FDTD, return the three packs, and finally close SSH. Lumerical is not required on the local Mac.
 
 - Every exported simulation is a **3D FDTD simulation**. A saved 2D preference is ignored; GPU is the default compute resource and is selected explicitly at solve time.
-- Optional first-cell switches render **XY, XZ, and YZ geometry projections** and selected-port **|Ex|/|Ey| fields**. They default off for speed and do not change the model. Required rotation-aware local-TE selection and effective-index checks still run during construction.
+- First-cell switches render **XY, XZ, and YZ geometry projections** and selected-port **|Ex|/|Ey| fields**. They default on and remain editable; neither changes the simulated model. Required rotation-aware local-TE selection and effective-index checks still run during construction.
 - Stack rows are ordered bottom-to-top.
 - A material thickness of **0 µm means that material is absent**.
 - Etch depth **0 µm** keeps an unetched film; etch depth equal to film thickness creates a fully etched patterned layer.
@@ -9623,15 +9739,15 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
             _notebook_cell("markdown", intro),
             _notebook_cell("markdown", "## 1 · Connect to Lambda\n"),
             _notebook_cell("code", _LAMBDA_CONNECT_CELL),
-            _notebook_cell("markdown", "## 2 · Acquire Ansys Shared Web licences\n\nSeed the headless sign-in and roam exactly three Shared Web HPC Packs for this session.\n"),
+            _notebook_cell("markdown", "## 2 · Acquire Ansys Shared Web licences\n\nSeed the headless sign-in and roam exactly three Shared Web HPC Packs for the number of minutes selected by `HPC_PACK_DURATION_MINUTES` in cell 1.\n"),
             _notebook_cell("code", _LICENSE_CHECKOUT_CELL),
             _notebook_cell("markdown", "## 3 · Embedded layout, stack, ports, and monitors\n"),
             _notebook_cell("code", payload_cell),
             _notebook_cell("markdown", "## 4 · Build the model inside the licensed Lambda session\n"),
             _notebook_cell("code", remote_build_cell),
-            _notebook_cell("markdown", "## 5 · Optional XY, XZ, and YZ geometry preview\n\nEnable `SHOW_GEOMETRY_PREVIEW` in cell 1 only when you want the diagnostic image. The simulation geometry is already built when this switch is off.\n"),
+            _notebook_cell("markdown", "## 5 · XY, XZ, and YZ geometry preview\n\n`SHOW_GEOMETRY_PREVIEW` defaults to `True` in cell 1 and may be disabled when the diagnostic image is not needed.\n"),
             _notebook_cell("code", geometry_projection_cell),
-            _notebook_cell("markdown", "## 6 · Optional selected-port Ex and Ey images\n\nEnable `SHOW_PORT_MODE_PREVIEW` in cell 1 to render the diagnostic maps and boundary-confinement report. The required source-polarization selection and effective-index checks already run during model construction even when this image is skipped.\n"),
+            _notebook_cell("markdown", "## 6 · Selected-port Ex and Ey images\n\n`SHOW_PORT_MODE_PREVIEW` defaults to `True` in cell 1 and may be disabled to skip only these diagnostic maps. Required polarization and effective-index checks always run.\n"),
             _notebook_cell("code", port_mode_profiles_cell),
             _notebook_cell("markdown", "## 7 · Configure resources and save the inspection FSP\n\nThe GPU/CPU resources are configured, then the exact pre-solve FSP is always created and downloaded.\n"),
             _notebook_cell("code", resource_save_cell),
