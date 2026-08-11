@@ -92,14 +92,24 @@ class LumericalGratingRegressionTests(unittest.TestCase):
         notebook, warnings = _grating_notebook(theta_deg)
         fibers = _assignment_value(notebook, "FIBER_GEOMETRIES")
         ports = _assignment_value(notebook, "PORTS")
+        monitors = _assignment_value(notebook, "MONITORS")
 
         self.assertEqual(len(fibers), 1)
         fiber = fibers[0]
         fiber_ports = [port for port in ports if port["plane normal"] == "Z"]
-        self.assertEqual(len(fiber_ports), 2)
+        fiber_power_monitors = [
+            monitor
+            for monitor in monitors
+            if monitor.get("parent_port_name") == "fiber_input_power"
+        ]
+        self.assertEqual(len(fiber_ports), 1)
+        self.assertEqual(len(fiber_power_monitors), 1)
         self.assertAlmostEqual(fiber["angle theta"], theta_deg)
         self.assertEqual(
-            {round(float(port["angle theta"]), 12) for port in fiber_ports},
+            {
+                round(float(item["angle theta"]), 12)
+                for item in [*fiber_ports, *fiber_power_monitors]
+            },
             {theta_deg},
         )
         self.assertTrue(
@@ -109,11 +119,11 @@ class LumericalGratingRegressionTests(unittest.TestCase):
         # Each plane's exported center must lie on the same tilted fiber axis.
         # This also catches using the parent angle for the geometry while a
         # stale 7/10-degree value is still used for a port position.
-        for port in fiber_ports:
-            axis_height = float(port["fiber axis height_um"])
+        for plane in [*fiber_ports, *fiber_power_monitors]:
+            axis_height = float(plane["fiber axis height_um"])
             expected_axis_offset = axis_height * math.tan(math.radians(theta_deg))
-            delta_x = float(port["center"][0]) - float(fiber["center"][0])
-            delta_y = float(port["center"][1]) - float(fiber["center"][1])
+            delta_x = float(plane["center"][0]) - float(fiber["center"][0])
+            delta_y = float(plane["center"][1]) - float(fiber["center"][1])
             self.assertAlmostEqual(math.hypot(delta_x, delta_y), expected_axis_offset)
 
     def test_three_mode_fiber_search_selects_rotation_aware_gaussian_he11(self) -> None:
@@ -293,16 +303,16 @@ class LumericalGratingRegressionTests(unittest.TestCase):
     def test_waveguide_neff_is_derived_from_dispersive_stack_indices(self) -> None:
         notebook, _warnings = _grating_notebook()
         grating_analysis = _assignment_value(notebook, "GRATING_ANALYSIS")
-        waveguide_mode_monitor = next(
-            monitor
-            for monitor in _assignment_value(notebook, "MONITORS")
-            if monitor.get("grating_monitor_role") == "waveguide_mode_expansion"
+        waveguide_receiver = next(
+            port
+            for port in _assignment_value(notebook, "PORTS")
+            if port.get("parent_port_name") == "waveguide_point"
         )
         # Zero is an explicit unresolved sentinel in the serialized payload;
         # the live material database supplies the target after getindex().
         self.assertEqual(grating_analysis["waveguide_target_neff"], 0.0)
-        self.assertEqual(waveguide_mode_monitor["target neff"], 0.0)
-        self.assertIn("actual core", waveguide_mode_monitor["target neff strategy"])
+        self.assertEqual(waveguide_receiver["target neff"], 0.0)
+        self.assertIn("actual core", waveguide_receiver["target neff strategy"])
 
         helper_nodes = [
             node

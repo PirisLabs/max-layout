@@ -366,12 +366,16 @@ class LumericalOptimizationTests(unittest.TestCase):
                 self.assertEqual(pose["nominal_angle_theta"], theta)
                 self.assertEqual(pose["nominal_fiber_offset"], offset)
                 self.assertTrue(pose["fiber_name"])
-                self.assertEqual(len(pose["ports"]), 2)
+                self.assertEqual(len(pose["ports"]), 1)
                 self.assertEqual(
                     sum(bool(port["is_source"]) for port in pose["ports"]), 1
                 )
                 for port in pose["ports"]:
                     self.assertEqual(port["candidate_mode_numbers"], [1, 2, 3])
+                self.assertEqual(len(pose["monitors"]), 1)
+                self.assertEqual(
+                    pose["monitors"][0]["role"], "input power measurement"
+                )
 
                 source = "\n".join(
                     "".join(cell["source"])
@@ -395,6 +399,8 @@ class LumericalOptimizationTests(unittest.TestCase):
                     '"rotation offset"',
                 ):
                     self.assertIn(property_name, source)
+                self.assertIn('"x span"', source)
+                self.assertIn('"y span"', source)
 
     def test_runtime_propagates_resolved_winner_first_fiber_mode_pair(self) -> None:
         helper_names = {
@@ -777,7 +783,10 @@ class LumericalOptimizationTests(unittest.TestCase):
         self.assertIn('"mmi_width": ("MMI width", "um")', source)
         self.assertIn('"taper_power": ("MMI taper profile exponent", "")', source)
         self.assertIn('"input_reference_before_taper_um": ("Input power-reference distance before taper", "um")', source)
-        self.assertIn('"fiber_power_monitor_below_source_um": ("Fiber power-plane distance below source", "um")', source)
+        self.assertIn(
+            '"fiber_power_monitor_below_source_um": ("Horizontal fiber-input monitor distance below source", "um")',
+            source,
+        )
         optimization_headings = (
             "PROJECT",
             "PARAMETERS",

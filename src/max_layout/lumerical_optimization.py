@@ -671,28 +671,39 @@ def _objective_ports(
         if not analysis:
             raise ValueError(
                 "Grating adjoint optimization needs the complete grating simulation setup: "
-                "fiber source, passive fiber plane, waveguide total-power monitor, and waveguide mode monitor."
+                "fiber source, fiber input-power monitor, passive waveguide receiver, and waveguide total-power monitor."
             )
         source_name = str(analysis.get("fiber_port_name", ""))
-        receiver_candidates = [
-            port for port in ports
-            if str(port.get("name", "")) != source_name
-            and str(port.get("plane normal", "X")).upper() in {"X", "Y"}
-        ]
-        if not source_name or not receiver_candidates:
+        receiver_name = str(analysis.get("waveguide_port_name", ""))
+        receiver = next(
+            (port for port in ports if str(port.get("name", "")) == receiver_name),
+            None,
+        )
+        if not source_name or not receiver_name or receiver is None:
             raise ValueError(
                 "Grating adjoint optimization needs a fiber-axis source port and a waveguide receiver FDTD port."
             )
-        receiver = min(receiver_candidates, key=lambda port: float(port.get("order", 1)))
-        direction = str(analysis.get("waveguide_modal_direction", "Backward"))
+        angle = float(receiver.get("outward_orientation_deg", 0.0)) % 360.0
+        nearest = int(round(angle / 90.0) * 90) % 360
+        direction = "Forward" if nearest in {0, 90} else "Backward"
         return {
             "kind": "grating coupling efficiency",
             "source_port": source_name,
             "source_mode": str(analysis.get("fiber_source_mode", "mode 1")),
-            "monitor_port": str(receiver["name"]),
-            "direction": "Forward" if direction.lower() == "tforward" else "Backward",
+            "monitor_port": receiver_name,
+            "direction": direction,
             "mode_number": max(1, int(receiver.get("mode number", 1))),
-            "normalization": "waveguide fundamental-TE port power / launched fiber-port power",
+            "fiber_input_power_monitor": str(analysis["fiber_input_power_monitor_name"]),
+            "fiber_input_power_sign": float(analysis.get("fiber_input_power_sign", -1.0)),
+            "waveguide_total_power_monitor": str(analysis["waveguide_power_monitor_name"]),
+            "waveguide_total_power_sign": float(analysis.get("waveguide_total_power_sign", -1.0)),
+            "waveguide_port_expansion_result_name": str(
+                analysis.get("waveguide_port_expansion_result_name", "expansion for port monitor")
+            ),
+            "waveguide_port_modal_direction": str(
+                analysis.get("waveguide_port_modal_direction", "T_out")
+            ),
+            "normalization": "waveguide fundamental-TE port T_out / measured fiber input-monitor power",
         }
 
     analysis = payload.get("MMI_ANALYSIS")
@@ -730,12 +741,12 @@ def _fiber_pose_contract(
     component: dict[str, Any],
     specification: dict[str, Any],
 ) -> dict[str, Any]:
-    """Describe the one synchronized grating fiber/source alignment.
+    """Describe the synchronized grating fiber/source/input-monitor alignment.
 
     The contract stores absolute simulation coordinates after layout-origin
     translation.  The generated notebook can therefore update the scripted
-    fiber group and both tilted FDTD planes without rebuilding the device or
-    guessing stack heights at optimization time.
+    fiber group, tilted source port, and ordinary input-power monitor without
+    rebuilding the device or guessing stack heights at optimization time.
     """
 
     kind = str(specification.get("component_kind", ""))
@@ -762,15 +773,23 @@ def _fiber_pose_contract(
         port for port in payload.get("PORTS", [])
         if int(port.get("parent_component_uid", -1)) == uid
         and str(port.get("plane normal", "X")).upper() == "Z"
-        and (
-            str(port.get("name", "")) == source_name
-            or str(port.get("fiber plane role", "")).strip().lower()
-            in {"input power measurement", "passive fiber measurement", "fiber power measurement"}
-        )
+        and str(port.get("name", "")) == source_name
     ]
-    if not source_name or len(tilted_ports) < 2:
+    input_monitor_name = str(
+        (payload.get("GRATING_ANALYSIS") or {}).get(
+            "fiber_input_power_monitor_name", ""
+        )
+    )
+    input_monitors = [
+        monitor for monitor in payload.get("MONITORS", [])
+        if int(monitor.get("parent_component_uid", -1)) == uid
+        and str(monitor.get("monitor_kind", "")) == "Power monitor"
+        and str(monitor.get("plane normal", "Z")).upper() == "Z"
+        and str(monitor.get("name", "")) == input_monitor_name
+    ]
+    if not source_name or len(tilted_ports) != 1 or len(input_monitors) != 1:
         raise ValueError(
-            "Grating alignment optimization needs the source and passive fiber-power FDTD planes."
+            "Grating alignment optimization needs exactly one tilted fiber source port and one ordinary fiber input-power monitor."
         )
     levels = _stack_vertical_levels(list(payload.get("MATERIAL_STACK", [])))
     fiber_reference_z_um = _item_vertical_reference(fiber, levels)
@@ -790,6 +809,7 @@ def _fiber_pose_contract(
                 "base_z_um": float(z_um),
                 "base_axis_height_um": float(z_um - fiber_z_um),
                 "center_um": list(map(float, port.get("center", (0.0, 0.0)))),
+                "span_um": max(1e-6, float(port.get("span_um", 20.0))),
                 "mode_number": max(0, int(port.get("mode number", 0))),
                 "selected_mode_order": [
                     int(mode_number)
@@ -810,6 +830,25 @@ def _fiber_pose_contract(
                 ),
             }
         )
+    monitor_contracts = []
+    for monitor in input_monitors:
+        reference_z_um = _item_vertical_reference(monitor, levels)
+        distance_um = float(monitor.get("distance_um", 0.0))
+        z_um = reference_z_um + distance_um
+        monitor_contracts.append(
+            {
+                "name": str(monitor["name"]),
+                "role": str(monitor.get("fiber plane role", "input power measurement")),
+                "reference_z_um": float(reference_z_um),
+                "base_distance_um": distance_um,
+                "base_z_um": float(z_um),
+                "base_axis_height_um": float(z_um - fiber_z_um),
+                "center_um": list(map(float, monitor.get("center", (0.0, 0.0)))),
+                "expected_propagation_sign": float(
+                    monitor.get("expected propagation sign", -1.0)
+                ),
+            }
+        )
     params = component.get("params", {})
     return {
         "active_parameters": active,
@@ -826,91 +865,35 @@ def _fiber_pose_contract(
             0.001, float(params.get("fiber_power_monitor_below_source_um", 0.1))
         ),
         "ports": port_contracts,
+        "monitors": monitor_contracts,
     }
 
 
 def _ensure_porttransmission_receiver(
     payload: dict[str, Any], specification: dict[str, Any], warnings: list[str]
 ) -> None:
-    """Add the passive waveguide FDTD port required by PortTransmission.
-
-    Normal grating analysis deliberately uses a mode-expansion monitor at the
-    waveguide end.  Bundled LumOpt's PortTransmission FOM instead requires an
-    actual FDTD receiver port.  Reuse that verified monitor plane exactly; the
-    fiber-axis port remains the only selected source.
-    """
+    """Verify that adjoint optimization reuses the exported waveguide port."""
 
     if str(specification.get("component_kind", "")) not in {
         "Grating coupler",
         "GC-SOI",
     }:
         return
-    uid = int(specification["component_uid"])
-    existing = [
-        port for port in payload.get("PORTS", [])
-        if int(port.get("parent_component_uid", -1)) == uid
-        and str(port.get("plane normal", "X")).upper() in {"X", "Y"}
-    ]
-    if existing:
-        return
-    mode_monitor = next(
+    analysis = dict(payload.get("GRATING_ANALYSIS") or {})
+    receiver_name = str(analysis.get("waveguide_port_name", ""))
+    receiver = next(
         (
-            monitor for monitor in payload.get("MONITORS", [])
-            if int(monitor.get("parent_component_uid", -1)) == uid
-            and str(monitor.get("monitor_kind", "")) == "Mode expansion monitor"
-            and str(monitor.get("grating_monitor_role", ""))
-            == "waveguide_mode_expansion"
+            port for port in payload.get("PORTS", [])
+            if str(port.get("name", "")) == receiver_name
+            and str(port.get("plane normal", "X")).upper() in {"X", "Y"}
         ),
         None,
     )
-    if mode_monitor is None:
-        return
-    plane_normal = str(mode_monitor.get("plane normal", "X")).upper()
-    transverse_span = (
-        float(mode_monitor.get("y span", mode_monitor.get("span_um", 3.0)))
-        if plane_normal == "X"
-        else float(mode_monitor.get("x span", mode_monitor.get("span_um", 3.0)))
-    )
-    port_name = f"uid_{uid}_adjoint_waveguide_receiver"
-    receiver = {
-        "name": port_name,
-        "component_uid": -10_000_000 - uid,
-        "component_kind": "FDTD port",
-        "parent_component_uid": uid,
-        "parent_port_name": "adjoint_waveguide_receiver",
-        "domain": "optical",
-        "enabled": True,
-        "center": list(mode_monitor.get("center", (0.0, 0.0))),
-        "port geometry": "surface",
-        "plane normal": plane_normal,
-        "outward_orientation_deg": float(
-            mode_monitor.get("orientation_deg", 180.0)
-        ),
-        "distance_um": float(mode_monitor.get("distance_um", 0.0)),
-        "span_um": max(1e-6, transverse_span),
-        "z_span_um": max(1e-6, float(mode_monitor.get("z span", 2.0))),
-        "dir": "Bidirectional",
-        "mode": "user select",
-        "mode number": max(1, int(mode_monitor.get("mode number", 1))),
-        "polarization": "local TE",
-        "target neff": float(mode_monitor.get("target neff", 0.0)),
-        "neff tolerance": float(mode_monitor.get("neff tolerance", 0.3)),
-        "mode search count": max(1, int(mode_monitor.get("mode search count", 20))),
-        "loc": 0.5,
-        "pos": "Left",
-        "order": 999.0,
-    }
-    payload.setdefault("PORTS", []).append(receiver)
-    payload.setdefault("PORTS_JSON", {})[port_name] = {
-        "dir": "Bidirectional",
-        "loc": 0.5,
-        "name": port_name,
-        "order": 999.0,
-        "pos": "Left",
-    }
-    warnings.append(
-        "Added a passive waveguide FDTD receiver on the existing grating mode-expansion plane because LumOpt PortTransmission requires an FDTD port."
-    )
+    if not receiver_name or receiver is None:
+        raise ValueError(
+            "Grating adjoint optimization requires the exported passive waveguide receiver; "
+            "it will not synthesize a different optimization-only port."
+        )
 
 
 _OPT_FIELDS_SETUP_REMOTE = r'''# Add the static, uniform 3D adjoint volume before LumOpt owns the FDTD session.
@@ -1093,14 +1076,11 @@ def _resolved_runtime_port_mode(port_contract):
 
     if selected_mode <= 0:
         analysis = globals().get("GRATING_ANALYSIS") or {}
-        analysis_key = (
-            "fiber_source_mode"
-            if bool(port_contract.get("is_source", False))
-            else "fiber_measurement_mode"
-        )
         try:
             selected_mode = int(
-                _numeric_source_mode_label(analysis.get(analysis_key, "")).split()[1]
+                _numeric_source_mode_label(
+                    analysis.get("fiber_source_mode", "")
+                ).split()[1]
             )
         except Exception:
             selected_mode = 0
@@ -1358,6 +1338,7 @@ def _fiber_pose_updates(alignment_parameters, shape_parameters=None):
             "theta_deg": theta_deg,
         },
         "ports": [],
+        "monitors": [],
     }
     for port in OPT_FIBER_POSE["ports"]:
         distance_um = float(port["base_distance_um"])
@@ -1368,10 +1349,6 @@ def _fiber_pose_updates(alignment_parameters, shape_parameters=None):
                 - 0.35
             )
             distance_um = source_distance_um
-            if not bool(port.get("is_source", False)):
-                distance_um -= float(
-                    OPT_FIBER_POSE["fiber_power_monitor_below_source_um"]
-                )
         z_um = float(port["reference_z_um"]) + distance_um
         axis_height_um = z_um - float(OPT_FIBER_POSE["fiber_z_um"])
         center_um = bottom_center_um + (
@@ -1395,12 +1372,48 @@ def _fiber_pose_updates(alignment_parameters, shape_parameters=None):
             "mode_degeneracy_tolerance": float(
                 port.get("mode_degeneracy_tolerance", 0.01)
             ),
+            "fiber_target_neff": float(port.get("fiber_target_neff", 1.44)),
             "minimum_local_te_fraction": float(
                 port.get("minimum_local_te_fraction", 0.8)
             ),
             "is_source": bool(port.get("is_source", False)),
             "role": str(port.get("role", "")),
         })
+    for monitor in OPT_FIBER_POSE.get("monitors", []):
+        distance_um = float(monitor["base_distance_um"])
+        if (
+            str(OPT_FIBER_POSE["component_kind"]) == "GC-SOI"
+            and "angle_theta" in alignment_parameter_names
+        ):
+            source_distance_um = (
+                float(OPT_FIBER_POSE["fiber_tox_offset_um"])
+                * np.cos(np.deg2rad(theta_deg))
+                - 0.35
+            )
+            distance_um = source_distance_um - float(
+                OPT_FIBER_POSE["fiber_power_monitor_below_source_um"]
+            )
+        z_um = float(monitor["reference_z_um"]) + distance_um
+        axis_height_um = z_um - float(OPT_FIBER_POSE["fiber_z_um"])
+        center_um = bottom_center_um + (
+            axis_height_um * np.tan(np.deg2rad(theta_deg)) * axis_unit
+        )
+        updates["monitors"].append(
+            {
+                "name": str(monitor["name"]),
+                "center_um": center_um,
+                "z_um": z_um,
+                "expected_propagation_sign": float(
+                    monitor.get("expected_propagation_sign", -1.0)
+                ),
+                "projected_span_um": max(
+                    float(OPT_FIBER_POSE["ports"][0].get("span_um", 20.0)),
+                    float(OPT_FIBER_POSE["ports"][0].get("span_um", 20.0))
+                    / max(np.cos(np.deg2rad(theta_deg)), 1e-3),
+                ),
+                "role": str(monitor.get("role", "input power measurement")),
+            }
+        )
     return updates
 
 
@@ -1415,7 +1428,7 @@ def _set_named(session, path, property_name, value):
 def _apply_fiber_pose_to_session(
     alignment_parameters, fdtd_session, shape_parameters=None, update_modes=True
 ):
-    """Apply angle/offset to the fiber and both FDTD planes atomically."""
+    """Apply angle/offset to fiber, source port, and input monitor atomically."""
     updates = _fiber_pose_updates(alignment_parameters, shape_parameters)
     if not updates:
         return
@@ -1523,18 +1536,30 @@ def _apply_fiber_pose_to_session(
             if isinstance(selections, dict):
                 selections[str(port["name"])] = dict(selection)
             if globals().get("GRATING_ANALYSIS"):
-                if bool(port.get("is_source", False)):
-                    GRATING_ANALYSIS["fiber_source_mode"] = "mode %d" % mode_number
-                    GRATING_ANALYSIS["fiber_source_mode_number"] = mode_number
-                    GRATING_ANALYSIS["fiber_selected_mode_order"] = list(mode_order)
-                else:
-                    GRATING_ANALYSIS["fiber_measurement_mode"] = "mode %d" % mode_number
-                    GRATING_ANALYSIS["fiber_measurement_mode_number"] = mode_number
-                    GRATING_ANALYSIS["fiber_measurement_selected_mode_order"] = list(
-                        mode_order
-                    )
+                GRATING_ANALYSIS["fiber_source_mode"] = "mode %d" % mode_number
+                GRATING_ANALYSIS["fiber_source_mode_number"] = mode_number
+                GRATING_ANALYSIS["fiber_selected_mode_order"] = list(mode_order)
             if bool(port.get("is_source", False)):
                 OPT_OBJECTIVE_PORTS["source_mode"] = "mode %d" % mode_number
+    # The input plane is an ordinary DFT power monitor.  Move it with the
+    # fiber-axis intersection, but never call a port eigensolver for it.
+    for monitor in updates.get("monitors", []):
+        monitor_path = "::model::" + str(monitor["name"])
+        _set_named(fdtd_session, monitor_path, "x", float(monitor["center_um"][0]) * UM)
+        _set_named(fdtd_session, monitor_path, "y", float(monitor["center_um"][1]) * UM)
+        _set_named(fdtd_session, monitor_path, "z", float(monitor["z_um"]) * UM)
+        _set_named(
+            fdtd_session,
+            monitor_path,
+            "x span",
+            float(monitor["projected_span_um"]) * UM,
+        )
+        _set_named(
+            fdtd_session,
+            monitor_path,
+            "y span",
+            float(monitor["projected_span_um"]) * UM,
+        )
     fdtd_session.select("FDTD::ports")
     fdtd_session.set("source port", str(OPT_OBJECTIVE_PORTS["source_port"]))
     fdtd_session.set("source mode", _require_numeric_source_mode())
@@ -1626,13 +1651,61 @@ ALIGNMENT_ITERATION_FOM = []
 
 
 def _alignment_port_score(fdtd_session):
-    dataset = fdtd_session.getresult(
-        "FDTD::ports::" + str(OPT_OBJECTIVE_PORTS["monitor_port"]), "T"
+    def spectrum(dataset, key):
+        if "lambda" in dataset:
+            wavelength_m = np.asarray(dataset["lambda"], dtype=float).squeeze().ravel()
+        elif "f" in dataset:
+            wavelength_m = 299792458.0 / np.asarray(
+                dataset["f"], dtype=float
+            ).squeeze().ravel()
+        else:
+            raise RuntimeError("Power result has neither lambda nor frequency")
+        available = {str(name).lower().replace("_", ""): name for name in dataset.keys()}
+        resolved = available.get(str(key).lower().replace("_", ""), key)
+        values = np.real(np.asarray(dataset[resolved]).squeeze())
+        if values.ndim == 0:
+            values = np.full(wavelength_m.size, values)
+        elif values.ndim > 1:
+            axes = [
+                axis for axis, size in enumerate(values.shape)
+                if size == wavelength_m.size
+            ]
+            if not axes:
+                raise RuntimeError(
+                    "Could not align %s shape %s with wavelength" % (resolved, values.shape)
+                )
+            values = np.moveaxis(values, axes[0], 0).reshape(wavelength_m.size, -1)[:, 0]
+        order = np.argsort(wavelength_m)
+        return wavelength_m[order], np.asarray(values, dtype=float).ravel()[order]
+
+    input_dataset = fdtd_session.getresult(
+        str(OPT_OBJECTIVE_PORTS["fiber_input_power_monitor"]), "T"
     )
-    transmission = np.abs(np.asarray(dataset["T"]).squeeze()).astype(float).ravel()
+    input_wavelength_m, input_signed = spectrum(input_dataset, "T")
+    input_power = float(OPT_OBJECTIVE_PORTS["fiber_input_power_sign"]) * input_signed
+    expansion_path = "FDTD::ports::" + str(OPT_OBJECTIVE_PORTS["monitor_port"])
+    expansion_dataset = fdtd_session.getresult(
+        expansion_path,
+        str(OPT_OBJECTIVE_PORTS["waveguide_port_expansion_result_name"]),
+    )
+    wavelength_m, modal_power = spectrum(
+        expansion_dataset,
+        str(OPT_OBJECTIVE_PORTS["waveguide_port_modal_direction"]),
+    )
+    input_power = np.interp(wavelength_m, input_wavelength_m, input_power)
+    if np.any(input_power <= 1e-15):
+        raise RuntimeError(
+            "Alignment input-power monitor has wrong/near-zero signed flux"
+        )
+    transmission = modal_power / input_power
     finite = transmission[np.isfinite(transmission)]
     if finite.size < 1:
         raise RuntimeError("Alignment solve returned no finite grating coupling spectrum")
+    if float(np.min(finite)) < -1e-9 or float(np.max(finite)) > 1.05:
+        raise RuntimeError(
+            "Alignment solve returned unphysical measured-input-normalized CE: %r"
+            % finite.tolist()
+        )
     return float(np.mean(finite))
 
 
@@ -2143,11 +2216,11 @@ try:
 
     validation_arrays = {}
     validation_summary = {}
-    validation_wavelength_m, primary_ratio = _port_transmission(
-        OPT_OBJECTIVE_PORTS["monitor_port"]
-    )
-    validation_arrays["validation_wavelength_m"] = validation_wavelength_m
     if OPTIMIZATION_SPEC["component_kind"] == "1x2 MMI":
+        validation_wavelength_m, primary_ratio = _port_transmission(
+            OPT_OBJECTIVE_PORTS["monitor_port"]
+        )
+        validation_arrays["validation_wavelength_m"] = validation_wavelength_m
         lower_wavelength_m, lower_ratio = _port_transmission(
             OPT_OBJECTIVE_PORTS["lower_output_port"]
         )
@@ -2172,11 +2245,89 @@ try:
             "upper_lower_imbalance": imbalance.tolist(),
         }
     else:
-        validation_arrays["grating_waveguide_over_fiber"] = primary_ratio
+        def _power_spectrum(dataset, value_key):
+            if "lambda" in dataset:
+                wavelength_m = np.asarray(dataset["lambda"], dtype=float).squeeze().ravel()
+            elif "f" in dataset:
+                wavelength_m = 299792458.0 / np.asarray(
+                    dataset["f"], dtype=float
+                ).squeeze().ravel()
+            else:
+                raise RuntimeError("Power result has neither lambda nor frequency")
+            normalized = {
+                str(key).lower().replace("_", "").replace(" ", ""): key
+                for key in dataset.keys()
+            }
+            resolved_key = normalized.get(
+                str(value_key).lower().replace("_", "").replace(" ", ""),
+                value_key,
+            )
+            values = np.real(np.asarray(dataset[resolved_key]).squeeze())
+            if values.ndim == 0:
+                values = np.full(wavelength_m.size, values)
+            elif values.ndim > 1:
+                axes = [
+                    axis for axis, size in enumerate(values.shape)
+                    if size == wavelength_m.size
+                ]
+                if not axes:
+                    raise RuntimeError(
+                        "Could not align %s shape %s with wavelength"
+                        % (resolved_key, values.shape)
+                    )
+                values = np.moveaxis(values, axes[0], 0).reshape(
+                    wavelength_m.size, -1
+                )[:, 0]
+            order = np.argsort(wavelength_m)
+            return wavelength_m[order], np.asarray(values, dtype=float).ravel()[order]
+
+        input_dataset = ADJOINT_FDTD_OWNER.getresult(
+            str(OPT_OBJECTIVE_PORTS["fiber_input_power_monitor"]), "T"
+        )
+        input_wavelength_m, input_signed = _power_spectrum(input_dataset, "T")
+        input_power = (
+            float(OPT_OBJECTIVE_PORTS["fiber_input_power_sign"]) * input_signed
+        )
+        modal_dataset = ADJOINT_FDTD_OWNER.getresult(
+            "FDTD::ports::" + str(OPT_OBJECTIVE_PORTS["monitor_port"]),
+            str(OPT_OBJECTIVE_PORTS["waveguide_port_expansion_result_name"]),
+        )
+        validation_wavelength_m, modal_power = _power_spectrum(
+            modal_dataset,
+            str(OPT_OBJECTIVE_PORTS["waveguide_port_modal_direction"]),
+        )
+        input_power = np.interp(
+            validation_wavelength_m, input_wavelength_m, input_power
+        )
+        total_dataset = ADJOINT_FDTD_OWNER.getresult(
+            str(OPT_OBJECTIVE_PORTS["waveguide_total_power_monitor"]), "T"
+        )
+        total_wavelength_m, total_signed = _power_spectrum(total_dataset, "T")
+        total_power = float(
+            OPT_OBJECTIVE_PORTS["waveguide_total_power_sign"]
+        ) * np.interp(validation_wavelength_m, total_wavelength_m, total_signed)
+        if np.any(input_power <= 1e-15):
+            raise RuntimeError(
+                "Best-design fiber input monitor has wrong/near-zero signed flux"
+            )
+        primary_ratio = modal_power / input_power
+        total_ratio = total_power / input_power
+        validation_arrays.update(
+            {
+                "validation_wavelength_m": validation_wavelength_m,
+                "grating_fiber_input_power": input_power,
+                "grating_waveguide_te_power": modal_power,
+                "grating_waveguide_total_power": total_power,
+                "grating_waveguide_te_over_input": primary_ratio,
+                "grating_waveguide_total_over_input": total_ratio,
+            }
+        )
         validation_summary = {
-            "definition": "Fiber-source to waveguide-receiver linear coupling efficiency.",
+            "definition": "Selected-TE waveguide receiver and nearby total-waveguide power, each divided by measured fiber input-monitor power.",
             "wavelength_m": validation_wavelength_m.tolist(),
-            "waveguide_over_fiber": primary_ratio.tolist(),
+            "fiber_input_power": input_power.tolist(),
+            "waveguide_te_over_input": primary_ratio.tolist(),
+            "waveguide_total_over_input": total_ratio.tolist(),
         }
 
     # Forward/adjoint and best-design validation GPU work is complete.  Use
@@ -2382,10 +2533,10 @@ try:
         "fiber_cladding_diameter_um": ("Fiber cladding diameter", "um"),
         "fiber_cladding_index": ("Fiber cladding refractive index", ""),
         "fiber_length_um": ("Fiber length", "um"),
-        "fiber_power_monitor_below_source_um": ("Fiber power-plane distance below source", "um"),
+        "fiber_power_monitor_below_source_um": ("Horizontal fiber-input monitor distance below source", "um"),
         "fdtd_port_offset_from_waveguide_end_um": ("Waveguide FDTD-port offset from waveguide end", "um"),
-        "waveguide_monitor_span_um": ("Waveguide mode-monitor transverse span", "um"),
-        "waveguide_total_power_before_mode_um": ("Total-power plane distance before waveguide mode plane", "um"),
+        "waveguide_monitor_span_um": ("Waveguide receiver-port transverse span", "um"),
+        "waveguide_total_power_before_mode_um": ("Total-power plane distance before receiver port", "um"),
         "waveguide_neff_tolerance": ("Waveguide effective-index tolerance", ""),
         "waveguide_mode_search_count": ("Waveguide eigensolver modes searched", ""),
         "tolerance": ("Geometry build tolerance", "um"),
@@ -2639,6 +2790,15 @@ try:
                 _text_number(100.0 * imbalance[center_index]),
             )
         )
+    else:
+        text_lines.append(
+            "Grating validation at center: selected-TE/Pin=%s | total-waveguide/Pin=%s | measured Pin=%s"
+            % (
+                _text_number(primary_ratio[center_index]),
+                _text_number(total_ratio[center_index]),
+                _text_number(input_power[center_index]),
+            )
+        )
 
     _text_section(text_lines, "OUTPUT FILES")
     text_lines.extend([
@@ -2666,7 +2826,15 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    figure, (axis, response_axis) = plt.subplots(2, 1, figsize=(9.0, 8.0))
+    if OPTIMIZATION_SPEC["component_kind"] == "1x2 MMI":
+        figure, (axis, response_axis) = plt.subplots(2, 1, figsize=(9.0, 8.0))
+        response_db_axis = None
+    else:
+        figure = plt.figure(figsize=(13.0, 8.0))
+        grid = figure.add_gridspec(2, 2)
+        axis = figure.add_subplot(grid[0, :])
+        response_axis = figure.add_subplot(grid[1, 0])
+        response_db_axis = figure.add_subplot(grid[1, 1], sharex=response_axis)
     if fom_history.size:
         axis.plot(
             np.arange(1, fom_history.size + 1), fom_history,
@@ -2693,8 +2861,34 @@ try:
         response_axis.plot(wavelength_nm, total_ratio, lw=1.8, ls=":", label="total output / input (validation)")
         response_axis.set_ylabel("linear branch/input power")
     else:
-        response_axis.plot(wavelength_nm, primary_ratio, lw=2.4, color="#7c3aed", label="waveguide / launched fiber")
-        response_axis.set_ylabel("linear coupling efficiency")
+        response_axis.plot(
+            wavelength_nm, primary_ratio, lw=2.4, color="#7c3aed",
+            label="selected TE / measured fiber input",
+        )
+        response_axis.plot(
+            wavelength_nm, total_ratio, lw=2.0, color="#f59e0b",
+            label="total waveguide / measured fiber input",
+        )
+        response_axis.set_ylabel("normalized linear power")
+        response_db_axis.plot(
+            wavelength_nm,
+            10.0 * np.log10(np.maximum(primary_ratio, 1e-15)),
+            lw=2.4,
+            color="#7c3aed",
+            label="selected TE / measured fiber input",
+        )
+        response_db_axis.plot(
+            wavelength_nm,
+            10.0 * np.log10(np.maximum(total_ratio, 1e-15)),
+            lw=2.0,
+            color="#f59e0b",
+            label="total waveguide / measured fiber input",
+        )
+        response_db_axis.set_xlabel("wavelength [nm]")
+        response_db_axis.set_ylabel("normalized power [dB]")
+        response_db_axis.set_title("Best-design validation — dB")
+        response_db_axis.grid(alpha=0.3)
+        response_db_axis.legend(loc="best")
     response_axis.set_xlabel("wavelength [nm]")
     response_axis.set_title("Best-design forward GPU validation")
     response_axis.grid(alpha=0.3)
@@ -2945,7 +3139,7 @@ else:
         f"`{name}`" for name in specification.get("adjoint_geometry_parameters", [])
     ) or "none"
     objective_text = (
-        "fiber-source to waveguide-receiver coupling efficiency"
+        "selected-TE waveguide power divided by the measured fiber input-monitor power"
         if specification["component_kind"] in {"Grating coupler", "GC-SOI"}
         else "upper-output fundamental-TE power divided by launched input-port power"
     )
@@ -2962,7 +3156,7 @@ This notebook optimizes **{specification['component_kind']} (UID {specification[
 - During the blocking solve, the cell redraws a live table after every completed fiber-alignment or shape-adjoint iteration. Each row reports the current linear objective and the complete selected JSON parameter vector; no extra FDTD solve is performed for reporting.
 - Exactly one FDTD owner exists at a time: the seed builder is closed before LumOpt opens its persistent owner. One Shared Web checkout surrounds the entire build/optimization/save workflow.
 - `store_all_simulations=False`: no per-iteration FSP is retained or fetched. Compact history, summary, editor-patch, graph artifacts, the inspection FSP, and the best-geometry FSP are always saved.
-- `angle_theta` drives the fiber core/cladding, source port, and passive fiber-power plane together. `fiber_offset` moves that entire concentric assembly along the grating local X axis. Both are frozen at their best forward-solve values during the shape-adjoint stage.
+- `angle_theta` drives the fiber core/cladding, tilted source port, and ordinary Z-normal input-power monitor together. The monitor follows the tilted-axis intersection and is never treated as a modal port. `fiber_offset` moves that assembly along the grating local X axis. Both are frozen at their best forward-solve values during the shape-adjoint stage.
 - Integer tooth counts, device topology, waveguide receivers, material stack, and process thicknesses remain fixed. GC-SOI keeps exactly **{specification.get('fixed_period_count', 'N/A')}** periods.
 - The geometry callback uses exact nominal/minimum/maximum editor-built polygons and fixed-topology, nominal-centered piecewise-linear interpolation. This is genuine adjoint optimization, but it is not a symbolic reimplementation of every editor geometry formula. Keep bounds moderate; inspection and best-design FSP files are stored automatically.
 - Always run the final release cell after success, failure, or interruption.

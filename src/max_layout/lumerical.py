@@ -769,20 +769,38 @@ def _synchronize_fiber_port_parameters(
         fiber = matching_fiber(monitor)
         if fiber is not None:
             align_plane(monitor, fiber)
+            if str(monitor.get("fiber plane role", "")).strip().lower() == "input power measurement":
+                parent_uid = int(monitor.get("parent_component_uid", -1))
+                source_ports = [
+                    port for port in ports
+                    if int(port.get("parent_component_uid", -2)) == parent_uid
+                    and str(port.get("plane normal", "X")).upper() == "Z"
+                    and str(port.get("fiber plane role", "source")).strip().lower() == "source"
+                ]
+                source_span_um = max(
+                    [float(port.get("span_um", 20.0)) for port in source_ports]
+                    or [float(monitor.get("x span", monitor.get("y span", 20.0)))]
+                )
+                projected_span_um = source_span_um / max(
+                    math.cos(math.radians(float(fiber["angle theta"]))), 1e-3
+                )
+                monitor["x span"] = projected_span_um
+                monitor["y span"] = projected_span_um
+                monitor["expected propagation sign"] = -1.0
 
 
-def _promote_fiber_measurement_ports(
+def _normalize_grating_measurement_objects(
     ports: list[dict[str, Any]],
     monitors: list[dict[str, Any]],
     warnings: list[str],
 ) -> None:
-    """Replace the legacy horizontal fiber power plane with a passive port.
+    """Normalize legacy grating companions to the two-port measurement model.
 
-    A native 2D power monitor cannot represent the tilted fiber-mode plane.
-    An FDTD port can use the same ``theta``, ``phi`` and rotation-offset
-    convention as the source while remaining passive when another port is
-    selected as the port-group source.  Promoting old layouts here keeps
-    notebooks exported before/after the editor migration equivalent.
+    A grating simulation has exactly two modal FDTD ports: the tilted fiber
+    source and the access-waveguide receiver.  Incident power is deliberately
+    measured with a separate Z-normal power monitor below the source.  Older
+    projects briefly represented that plane as a second fiber port; demote it
+    here so an old JSON file cannot silently add a third modal port.
     """
 
     def is_fiber_measurement(item: dict[str, Any]) -> bool:
@@ -794,59 +812,125 @@ def _promote_fiber_measurement_ports(
             "fiber power measurement",
         }
 
-    existing_measurements = [port for port in ports if is_fiber_measurement(port)]
-    legacy_monitors = [monitor for monitor in monitors if is_fiber_measurement(monitor)]
-    for monitor in legacy_monitors:
-        parent_uid = int(monitor.get("parent_component_uid", -1))
-        matching_existing = [
-            port for port in existing_measurements
-            if int(port.get("parent_component_uid", -2)) == parent_uid
-        ]
-        if not matching_existing:
-            promoted = deepcopy(monitor)
-            promoted.pop("monitor_kind", None)
-            promoted.pop("monitor geometry", None)
-            promoted.pop("grating_monitor_role", None)
-            span_um = max(
-                1e-6,
-                float(monitor.get("span_um", 0.0)),
-                float(monitor.get("x span", 0.0)),
-                float(monitor.get("y span", 0.0)),
-            )
-            promoted.update(
+    existing_monitor_parents = {
+        int(monitor.get("parent_component_uid", -1))
+        for monitor in monitors if is_fiber_measurement(monitor)
+    }
+    for legacy_port in list(ports):
+        if not is_fiber_measurement(legacy_port):
+            continue
+        parent_uid = int(legacy_port.get("parent_component_uid", -1))
+        if parent_uid not in existing_monitor_parents:
+            source_span_um = max(1e-6, float(legacy_port.get("span_um", 20.0)))
+            theta_deg = float(legacy_port.get("angle theta", 0.0))
+            span_um = source_span_um / max(math.cos(math.radians(theta_deg)), 1e-3)
+            monitor = deepcopy(legacy_port)
+            for key in (
+                "component_kind", "domain", "enabled", "port geometry",
+                "outward_orientation_deg", "z_span_um", "dir", "mode",
+                "mode number", "polarization", "candidate mode numbers",
+                "mode degeneracy tolerance", "minimum local TE fraction",
+                "rotation offset_um", "order", "loc", "pos",
+            ):
+                monitor.pop(key, None)
+            monitor.update(
                 {
-                    "component_kind": "Fiber-axis FDTD port",
-                    "domain": "optical",
-                    "enabled": True,
-                    "port geometry": "surface",
+                    "monitor_kind": "Power monitor",
+                    "monitor geometry": "surface",
                     "plane normal": "Z",
-                    "outward_orientation_deg": float(monitor.get("orientation_deg", 0.0)),
-                    "span_um": span_um,
-                    "z_span_um": 0.0,
-                    "dir": str(monitor.get("dir", "Backward")),
-                    "mode": "user select",
-                    "mode number": 0,
-                    "polarization": "local TE",
-                    "candidate mode numbers": [1, 2, 3],
-                    "mode degeneracy tolerance": float(
-                        monitor.get("mode degeneracy tolerance", 0.01)
+                    "orientation_deg": float(
+                        legacy_port.get("outward_orientation_deg", 0.0)
                     ),
-                    "minimum local TE fraction": float(
-                        monitor.get("minimum local TE fraction", 0.8)
-                    ),
-                    "fiber plane role": "passive fiber measurement",
+                    "x span": span_um,
+                    "y span": span_um,
+                    "z span": 0.0,
+                    "fiber plane role": "input power measurement",
                     "parent_port_name": "fiber_input_power",
                     "align to fiber axis": True,
+                    # A Backward Z-axis fiber source propagates toward -Z, so
+                    # a Z-normal monitor reports negative signed flux.
+                    "expected propagation sign": -1.0,
                 }
             )
-            ports.append(promoted)
-            existing_measurements.append(promoted)
+            monitors.append(monitor)
+            existing_monitor_parents.add(parent_uid)
             warnings.append(
-                "The legacy horizontal fiber power monitor %s was exported as a passive tilted "
-                "FDTD measurement port so its modal power is evaluated on the fiber axis."
-                % promoted.get("name", "fiber_input_power")
+                "Converted legacy passive fiber port %s to the non-modal input-power monitor."
+                % monitor.get("name", "fiber_input_power")
             )
-        monitors.remove(monitor)
+        ports.remove(legacy_port)
+
+    # Restore the access-waveguide receiver when loading projects exported
+    # during the short-lived mode-expansion-only implementation.
+    receiver_parents = {
+        int(port.get("parent_component_uid", -1))
+        for port in ports
+        if str(port.get("plane normal", "X")).upper() in {"X", "Y"}
+        and str(port.get("parent_port_name", "")) == "waveguide_point"
+    }
+    for legacy_monitor in list(monitors):
+        if (
+            str(legacy_monitor.get("monitor_kind", "")) != "Mode expansion monitor"
+            or str(legacy_monitor.get("grating_monitor_role", ""))
+            != "waveguide_mode_expansion"
+        ):
+            continue
+        parent_uid = int(legacy_monitor.get("parent_component_uid", -1))
+        if parent_uid not in receiver_parents:
+            normal = str(legacy_monitor.get("plane normal", "X")).upper()
+            transverse_span = (
+                float(legacy_monitor.get("y span", legacy_monitor.get("span_um", 3.0)))
+                if normal == "X"
+                else float(legacy_monitor.get("x span", legacy_monitor.get("span_um", 3.0)))
+            )
+            receiver_name = f"uid_{parent_uid}_waveguide_point"
+            receiver = {
+                "name": receiver_name,
+                "component_uid": int(legacy_monitor.get("component_uid", 0)),
+                "component_kind": "FDTD port",
+                "parent_component_uid": parent_uid,
+                "parent_port_name": "waveguide_point",
+                "domain": "optical",
+                "enabled": True,
+                "center": list(legacy_monitor.get("center", (0.0, 0.0))),
+                "port geometry": "surface",
+                "plane normal": normal,
+                "outward_orientation_deg": float(
+                    legacy_monitor.get("orientation_deg", 180.0)
+                ),
+                "distance_um": float(legacy_monitor.get("distance_um", 0.0)),
+                "span_um": max(1e-6, transverse_span),
+                "z_span_um": max(
+                    1e-6, float(legacy_monitor.get("z span", 2.25))
+                ),
+                "dir": "Bidirectional",
+                "mode": "fundamental TE mode",
+                "mode number": 0,
+                "polarization": "local TE",
+                "target neff": float(legacy_monitor.get("target neff", 0.0)),
+                "target neff strategy": str(
+                    legacy_monitor.get(
+                        "target neff strategy",
+                        "automatic material-index midpoint",
+                    )
+                ),
+                "neff tolerance": float(
+                    legacy_monitor.get("neff tolerance", 0.3)
+                ),
+                "mode search count": max(
+                    1, int(legacy_monitor.get("mode search count", 20))
+                ),
+                "order": 2,
+                "loc": 0.5,
+                "pos": "Left",
+            }
+            ports.append(receiver)
+            receiver_parents.add(parent_uid)
+            warnings.append(
+                "Converted legacy grating mode-expansion monitor %s to passive waveguide receiver %s."
+                % (legacy_monitor.get("name", "waveguide_mode"), receiver_name)
+            )
+        monitors.remove(legacy_monitor)
 
 
 def _notebook_cell(cell_type: str, source: str) -> dict[str, Any]:
@@ -2539,14 +2623,12 @@ def _add_ports(
         if GRATING_ANALYSIS:
             grating_fiber_names = {
                 str(GRATING_ANALYSIS.get("fiber_port_name", "")),
-                str(GRATING_ANALYSIS.get("fiber_input_measurement_port_name", "")),
             }
         is_fiber_mode_port = bool(
             axis == "z-axis"
             and (
                 name in grating_fiber_names
                 or bool(fiber_plane_role)
-                or str(port.get("parent_port_name", "")) == "fiber_input_power"
             )
         )
         requested_mode_number = max(0, int(port.get("mode number", 0)))
@@ -2556,7 +2638,7 @@ def _add_ports(
         )
         fdtd.set("mode selection", mode_selection)
         if GRATING_ANALYSIS:
-            # Match both ports in the official Ansys 3D grating example.
+            # Match the official Ansys 3D grating-port profile treatment.
             # A single central-frequency profile is reused across the sweep;
             # otherwise getresult(..., "T") can trigger expensive modal
             # post-processing at every sampled wavelength.
@@ -2567,21 +2649,7 @@ def _add_ports(
         port_path = "FDTD::ports::" + name
         fdtd.select(port_path)
         if is_fiber_mode_port:
-            source_fiber_name = str(
-                GRATING_ANALYSIS.get("fiber_port_name", "")
-                if GRATING_ANALYSIS else ""
-            )
-            measurement_fiber_name = str(
-                GRATING_ANALYSIS.get("fiber_input_measurement_port_name", "")
-                if GRATING_ANALYSIS else ""
-            )
-            source_selection = PORT_MODE_SELECTIONS.get(source_fiber_name)
-            if name == measurement_fiber_name and source_selection:
-                fiber_selection = _reuse_verified_fiber_local_te_mode(
-                    fdtd, port_path, port, source_selection
-                )
-            else:
-                fiber_selection = _select_fiber_local_te_mode(fdtd, port_path, port)
+            fiber_selection = _select_fiber_local_te_mode(fdtd, port_path, port)
             PORT_MODE_SELECTIONS[name] = fiber_selection
             requested_mode_number = int(fiber_selection["mode number"])
             port["mode number"] = requested_mode_number
@@ -2594,16 +2662,6 @@ def _add_ports(
                 GRATING_ANALYSIS["fiber_source_mode_number"] = requested_mode_number
                 GRATING_ANALYSIS["fiber_polarization"] = "local TE"
                 GRATING_ANALYSIS["fiber_selected_mode_order"] = list(
-                    fiber_selection["selected mode order"]
-                )
-            if GRATING_ANALYSIS and name == str(
-                GRATING_ANALYSIS.get("fiber_input_measurement_port_name", "")
-            ):
-                GRATING_ANALYSIS["fiber_measurement_mode"] = (
-                    "mode %d" % requested_mode_number
-                )
-                GRATING_ANALYSIS["fiber_measurement_mode_number"] = requested_mode_number
-                GRATING_ANALYSIS["fiber_measurement_selected_mode_order"] = list(
                     fiber_selection["selected mode order"]
                 )
         else:
@@ -2701,20 +2759,6 @@ def _add_ports(
             )
         else:
             print("Updated selected modal data for FDTD port " + name)
-        if str(port.get("fiber plane role", "")).strip().lower() in {
-            "input power measurement", "passive fiber measurement", "fiber power measurement"
-        }:
-            print(
-                "Configured passive tilted fiber measurement port %s: theta %.6g deg, phi %.6g deg, "
-                "rotation offset %.6g um, %s."
-                % (
-                    name,
-                    float(port.get("angle theta", 0.0)),
-                    float(port.get("angle phi", 0.0)),
-                    float(port.get("rotation offset_um", 0.0)),
-                    str(port.get("mode", "user select")),
-                )
-            )
 
     if MMI_ANALYSIS:
         mmi_port_names = [
@@ -2814,6 +2858,16 @@ def _add_monitors(
         fdtd.set("x", x_um * UM)
         fdtd.set("y", y_um * UM)
         fdtd.set("z", z_um * UM)
+        if (
+            monitor_kind == "Power monitor"
+            and str(monitor.get("fiber plane role", "")).strip().lower()
+            == "input power measurement"
+        ):
+            # Input normalization needs only the integrated Poynting flux.
+            # Leave apodization disabled/default and avoid recording field
+            # components on this large projected fiber plane.
+            fdtd.set("use source limits", True)
+            fdtd.set("output power", True)
         if monitor_kind == "Field profile monitor":
             # The MMI single-run diagnostic plots |E|^2.  Make the recording
             # contract explicit because saved projects and Lumerical releases
@@ -3610,10 +3664,10 @@ if GRATING_ANALYSIS:
     profile_specs = [
         ("Fiber source", str(GRATING_ANALYSIS["fiber_port_name"]), "local TE", "port"),
         (
-            "Waveguide fundamental mode",
-            str(GRATING_ANALYSIS["waveguide_mode_monitor_name"]),
+            "Waveguide receiver fundamental mode",
+            str(GRATING_ANALYSIS["waveguide_port_name"]),
             "local TE",
-            "monitor",
+            "port",
         ),
     ]
 elif MMI_ANALYSIS:
@@ -3862,8 +3916,8 @@ else:
 
 if GRATING_ANALYSIS:
     fdtd.switchtolayout()
-    if str(GRATING_ANALYSIS["fiber_input_measurement_port_name"]) == str(GRATING_ANALYSIS["fiber_port_name"]):
-        raise RuntimeError("The passive fiber measurement port must be distinct from the upper fiber source port")
+    if str(GRATING_ANALYSIS["waveguide_port_name"]) == str(GRATING_ANALYSIS["fiber_port_name"]):
+        raise RuntimeError("The passive waveguide receiver must be distinct from the fiber source port")
     fdtd.select("FDTD::ports")
     fdtd.set("source port", str(GRATING_ANALYSIS["fiber_port_name"]))
     fiber_source_mode = str(GRATING_ANALYSIS.get("fiber_source_mode", "auto local TE"))
@@ -3871,14 +3925,6 @@ if GRATING_ANALYSIS:
         raise RuntimeError(
             "The fiber source mode was not resolved from its near-degenerate pair before resource setup: "
             + fiber_source_mode
-        )
-    fiber_measurement_mode = str(
-        GRATING_ANALYSIS.get("fiber_measurement_mode", "auto local TE")
-    )
-    if not re.match(r"^mode\s+[1-9][0-9]*$", fiber_measurement_mode.strip(), flags=re.IGNORECASE):
-        raise RuntimeError(
-            "The passive fiber measurement mode was not resolved from its near-degenerate pair: "
-            + fiber_measurement_mode
         )
     fdtd.set("source mode", fiber_source_mode)
     configured_fiber_source_mode = str(fdtd.get("source mode")).strip()
@@ -3928,18 +3974,20 @@ if GRATING_ANALYSIS:
         % (configured_fiber_source_mode, source_te_score)
     )
     print(
-        "Passive fiber measurement: FDTD::ports::%s (%s); it is not selected as a source."
+        "Fiber incident-power monitor: %s (non-modal Z-normal power monitor, expected signed T factor %.0f)."
         % (
-            GRATING_ANALYSIS["fiber_input_measurement_port_name"],
-            fiber_measurement_mode,
+            GRATING_ANALYSIS["fiber_input_power_monitor_name"],
+            float(GRATING_ANALYSIS.get("fiber_input_power_sign", -1.0)),
         )
     )
     print("Waveguide total-power monitor: " + str(GRATING_ANALYSIS["waveguide_power_monitor_name"]))
     print(
-        "Waveguide mode-expansion monitor: %s, target neff %.6g"
+        "Passive waveguide receiver: FDTD::ports::%s, target neff %.6g; modal result %s/%s"
         % (
-            GRATING_ANALYSIS["waveguide_mode_monitor_name"],
+            GRATING_ANALYSIS["waveguide_port_name"],
             float(GRATING_ANALYSIS["waveguide_target_neff"]),
+            GRATING_ANALYSIS.get("waveguide_port_expansion_result_name", "expansion for port monitor"),
+            GRATING_ANALYSIS.get("waveguide_port_modal_direction", "T_out"),
         )
     )
 elif MMI_ANALYSIS:
@@ -4154,10 +4202,10 @@ _SUMMARY_MAJOR_PARAMETERS = (
     ("fiber_cladding_diameter_um", "Fiber cladding diameter", "um"),
     ("fiber_cladding_index", "Fiber cladding refractive index", ""),
     ("fiber_length_um", "Fiber length", "um"),
-    ("fiber_power_monitor_below_source_um", "Fiber power-plane distance below source", "um"),
+    ("fiber_power_monitor_below_source_um", "Horizontal fiber-input monitor distance below source", "um"),
     ("fdtd_port_offset_from_waveguide_end_um", "Waveguide FDTD-port offset from waveguide end", "um"),
-    ("waveguide_monitor_span_um", "Waveguide mode-monitor transverse span", "um"),
-    ("waveguide_total_power_before_mode_um", "Total-power plane distance before waveguide mode plane", "um"),
+    ("waveguide_monitor_span_um", "Waveguide receiver-port transverse span", "um"),
+    ("waveguide_total_power_before_mode_um", "Total-power plane distance before receiver port", "um"),
     ("waveguide_neff_tolerance", "Waveguide effective-index tolerance", ""),
     ("waveguide_mode_search_count", "Waveguide eigensolver modes searched", ""),
     ("tolerance", "Geometry build tolerance", "um"),
@@ -4408,13 +4456,14 @@ elif GRATING_ANALYSIS and isinstance(globals().get("GRATING_RESULT_ARRAYS"), dic
         )
     )
     summary_lines.append(
-        "- Target power accounting: fiber forward=%s | fiber reflected=%s | fiber net=%s | waveguide mode=%s | waveguide total=%s"
+        "- Target power accounting: measured fiber input=%s | waveguide selected-TE=%s | "
+        "waveguide total=%s | TE/input=%s | total/input=%s"
         % (
-            _summary_number(_grating_value_at("fiber_forward_power", target_index)),
-            _summary_number(_grating_value_at("fiber_reflected_power", target_index)),
-            _summary_number(_grating_value_at("fiber_net_power", target_index)),
-            _summary_number(_grating_value_at("waveguide_mode_power_source_normalized", target_index)),
+            _summary_number(_grating_value_at("fiber_input_power", target_index)),
+            _summary_number(_grating_value_at("waveguide_mode_power", target_index)),
             _summary_number(_grating_value_at("waveguide_total_power", target_index)),
+            _summary_number(_grating_value_at("coupling_efficiency", target_index)),
+            _summary_number(_grating_value_at("waveguide_total_transmission", target_index)),
         )
     )
     summary_lines.append(
@@ -4521,22 +4570,27 @@ print("Saved human-readable summary:", REMOTE_TEXT_SUMMARY)
 '''
 
 
-_GRATING_ANALYSIS_REMOTE = r'''# Extract linear fiber-to-waveguide power on Lambda.
+_GRATING_ANALYSIS_REMOTE = r'''# Extract measured-input-normalized grating power on Lambda.
 
 if not GRATING_ANALYSIS:
     print("No grating coupler was exported; grating analysis is not required.")
 elif not SETTINGS.get("run_after_build", False):
     print("Grating analysis is ready but unsolved. Set SETTINGS['run_after_build'] = True and rerun from section 6.")
 else:
-    waveguide_power_monitor_name = str(GRATING_ANALYSIS["waveguide_power_monitor_name"])
-    waveguide_mode_monitor_name = str(GRATING_ANALYSIS["waveguide_mode_monitor_name"])
-    expansion_result_name = "expansion for " + str(
-        GRATING_ANALYSIS.get("waveguide_expansion_result_name", "waveguide_power")
+    fiber_input_monitor_name = str(GRATING_ANALYSIS["fiber_input_power_monitor_name"])
+    fiber_input_sign = float(GRATING_ANALYSIS.get("fiber_input_power_sign", -1.0))
+    waveguide_port_name = str(GRATING_ANALYSIS["waveguide_port_name"])
+    waveguide_port_result_name = str(
+        GRATING_ANALYSIS.get(
+            "waveguide_port_expansion_result_name", "expansion for port monitor"
+        )
     )
-    modal_direction_key = str(GRATING_ANALYSIS.get("waveguide_modal_direction", "Tbackward"))
-    fiber_measurement_port_name = str(GRATING_ANALYSIS["fiber_input_measurement_port_name"])
-    fiber_expansion_result_name = str(
-        GRATING_ANALYSIS.get("fiber_measurement_expansion_result_name", "expansion for port monitor")
+    waveguide_modal_key = str(
+        GRATING_ANALYSIS.get("waveguide_port_modal_direction", "T_out")
+    )
+    waveguide_power_monitor_name = str(GRATING_ANALYSIS["waveguide_power_monitor_name"])
+    waveguide_total_sign = float(
+        GRATING_ANALYSIS.get("waveguide_total_power_sign", -1.0)
     )
 
     def _normalized_result_key(value):
@@ -4657,7 +4711,7 @@ else:
             ordered_values = np.real(ordered_values)
         return wavelength[order], np.asarray(ordered_values, dtype=float)
 
-    def _fiber_port_expansion(port_name, requested_result_name):
+    def _port_expansion(port_name, requested_result_name):
         attempts = []
         paths = (
             "FDTD::ports::" + port_name,
@@ -4679,127 +4733,125 @@ else:
             except Exception:
                 continue
         raise RuntimeError(
-            "The passive tilted fiber port %r has no readable 'expansion for port monitor' result. "
+            "The passive waveguide receiver %r has no readable 'expansion for port monitor' result. "
             "Available results: %s. Attempts: %s"
             % (port_name, available, " | ".join(attempts))
         )
 
     try:
-        waveguide_power_data = fdtd.getresult(waveguide_power_monitor_name, "T")
-        power_wavelength_m, waveguide_total_power_raw = _one_spectrum(waveguide_power_data, "T")
+        fiber_input_data = fdtd.getresult(fiber_input_monitor_name, "T")
+        fiber_wavelength_m, fiber_signed_flux = _one_spectrum(
+            fiber_input_data, "T", magnitude=False
+        )
     except Exception as exc:
         raise RuntimeError(
-            "The waveguide total-power monitor %r has no readable T result: %s"
-            % (waveguide_power_monitor_name, exc)
+            "The fiber input-power monitor %r has no readable signed T result: %s"
+            % (fiber_input_monitor_name, exc)
+        ) from None
+
+    waveguide_expansion, waveguide_result_path, resolved_waveguide_result = _port_expansion(
+        waveguide_port_name, waveguide_port_result_name
+    )
+    mode_selection = dict(PORT_MODE_SELECTIONS.get(waveguide_port_name, {}))
+    selected_mode_number = max(1, int(mode_selection.get("mode number", 1)))
+    selected_mode_order = list(
+        mode_selection.get("selected mode order", [selected_mode_number])
+    )
+    try:
+        wavelengths_m, waveguide_mode_power = _one_spectrum(
+            waveguide_expansion,
+            waveguide_modal_key,
+            magnitude=False,
+            selected_mode_number=selected_mode_number,
+            selected_mode_order=selected_mode_order,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "The waveguide receiver %r result %r has no readable %r spectrum: %s"
+            % (waveguide_port_name, resolved_waveguide_result, waveguide_modal_key, exc)
         ) from None
 
     try:
-        expansion_data = fdtd.getresult(waveguide_mode_monitor_name, expansion_result_name)
-        wavelengths_m, waveguide_mode_power = _one_spectrum(expansion_data, modal_direction_key)
+        waveguide_power_data = fdtd.getresult(waveguide_power_monitor_name, "T")
+        power_wavelength_m, waveguide_total_signed_flux = _one_spectrum(
+            waveguide_power_data, "T", magnitude=False
+        )
     except Exception as exc:
-        available = ""
-        try:
-            available = str(fdtd.getresult(waveguide_mode_monitor_name))
-        except Exception:
-            pass
         raise RuntimeError(
-            "The waveguide mode expansion %r has no readable %s in %r. Available results: %s. %s"
-            % (waveguide_mode_monitor_name, modal_direction_key, expansion_result_name, available, exc)
+            "The waveguide total-power monitor %r has no readable signed T result: %s"
+            % (waveguide_power_monitor_name, exc)
         ) from None
 
-    waveguide_total_power = np.interp(
-        wavelengths_m, power_wavelength_m, waveguide_total_power_raw
+    fiber_input_signed_raw = np.interp(
+        wavelengths_m, fiber_wavelength_m, fiber_signed_flux
     )
+    fiber_input_power = fiber_input_sign * fiber_input_signed_raw
+    waveguide_total_signed_raw = np.interp(
+        wavelengths_m, power_wavelength_m, waveguide_total_signed_flux
+    )
+    waveguide_total_power = waveguide_total_sign * waveguide_total_signed_raw
 
-    fiber_expansion, fiber_result_path, fiber_result_name = _fiber_port_expansion(
-        fiber_measurement_port_name, fiber_expansion_result_name
-    )
-    fiber_measurement_mode_number = int(
-        GRATING_ANALYSIS.get("fiber_measurement_mode_number", 0)
-    )
-    fiber_measurement_mode_order = list(
-        GRATING_ANALYSIS.get("fiber_measurement_selected_mode_order", [])
-    )
-    if fiber_measurement_mode_number <= 0:
-        raise RuntimeError(
-            "The passive fiber plane has no verified local-TE/Ey mode number; "
-            "refusing to normalize with an arbitrary modal column."
-        )
-    fiber_forward_key = _find_result_key(fiber_expansion, "T_in", "Tin", "T in")
-    fiber_reflected_key = _find_result_key(fiber_expansion, "T_out", "Tout", "T out")
-    fiber_net_key = _find_result_key(fiber_expansion, "Tnet", "T_net", "T net")
-    fiber_wavelength_m, fiber_forward_raw = _one_spectrum(
-        fiber_expansion, fiber_forward_key, magnitude=True,
-        selected_mode_number=fiber_measurement_mode_number,
-        selected_mode_order=fiber_measurement_mode_order,
-    )
-    reflected_wavelength_m, fiber_reflected_raw = _one_spectrum(
-        fiber_expansion, fiber_reflected_key, magnitude=True,
-        selected_mode_number=fiber_measurement_mode_number,
-        selected_mode_order=fiber_measurement_mode_order,
-    )
-    net_wavelength_m, fiber_net_raw = _one_spectrum(
-        fiber_expansion, fiber_net_key, magnitude=False,
-        selected_mode_number=fiber_measurement_mode_number,
-        selected_mode_order=fiber_measurement_mode_order,
-    )
-    fiber_forward_power = np.interp(wavelengths_m, fiber_wavelength_m, fiber_forward_raw)
-    fiber_reflected_power = np.interp(wavelengths_m, reflected_wavelength_m, fiber_reflected_raw)
-    # The mode-expansion dataset's raw Tnet follows the monitor-normal signed
-    # flux convention.  A receiver plane whose normal points opposite the
-    # forward fiber direction therefore reports approximately -1 even when
-    # nearly all physical power is traveling toward the grating.  Preserve
-    # that signed diagnostic, but present the direction-independent physical
-    # balance |T_in| - |T_out| to the user.
-    fiber_net_power_signed = np.interp(wavelengths_m, net_wavelength_m, fiber_net_raw)
-    fiber_net_power = fiber_forward_power - fiber_reflected_power
-
-    # Lumerical's monitor and mode-expansion powers are normalized to the
-    # selected source.  Divide the source-normalized waveguide-mode power by
-    # the forward power that actually crosses the passive fiber plane to obtain
-    # incident-normalized coupling efficiency at the grating.
+    # T_out is modal power leaving through the passive waveguide receiver.  It
+    # is a power quantity, not a field amplitude, so no square or absolute
+    # value is applied.  Monitor signs are corrected explicitly from their
+    # physical propagation directions rather than hidden with abs().
+    waveguide_mode_power = np.real(np.asarray(waveguide_mode_power, dtype=float))
     normalization_floor = 1e-15
-    waveguide_mode_power_source_normalized = waveguide_mode_power.copy()
-    fiber_coupling = waveguide_mode_power_source_normalized / np.maximum(
-        fiber_forward_power, normalization_floor
+    if not np.all(np.isfinite(fiber_input_power)) or float(np.min(fiber_input_power)) <= normalization_floor:
+        raise RuntimeError(
+            "The fiber input monitor has wrong/near-zero signed power after applying sign %.0f: range [%.6g, %.6g]. "
+            "The source must propagate downward (-Z) through this Z-normal monitor."
+            % (
+                fiber_input_sign,
+                float(np.nanmin(fiber_input_power)),
+                float(np.nanmax(fiber_input_power)),
+            )
+        )
+    if float(np.nanmin(waveguide_mode_power)) < -1e-9:
+        raise RuntimeError(
+            "Waveguide receiver %s/%s returned negative outgoing modal power (minimum %.6g). "
+            "Check the receiver direction and T_out convention."
+            % (waveguide_result_path, waveguide_modal_key, float(np.nanmin(waveguide_mode_power)))
+        )
+    if float(np.nanmin(waveguide_total_power)) < -1e-9:
+        raise RuntimeError(
+            "Waveguide total-power monitor has the wrong propagation sign after applying %.0f (minimum %.6g)."
+            % (waveguide_total_sign, float(np.nanmin(waveguide_total_power)))
+        )
+    fiber_coupling = waveguide_mode_power / np.maximum(fiber_input_power, normalization_floor)
+    waveguide_total_transmission = waveguide_total_power / np.maximum(
+        fiber_input_power, normalization_floor
     )
     fiber_coupling_db = 10.0 * np.log10(np.maximum(fiber_coupling, normalization_floor))
-    if not np.all(np.isfinite(fiber_forward_power)) or float(np.max(fiber_forward_power)) < 0.1:
-        raise RuntimeError(
-            "The verified local-TE/Ey fiber mode %d carries too little forward power at the passive plane "
-            "(maximum %.6g). Check source-mode readback, passive-mode identity, and plane alignment."
-            % (fiber_measurement_mode_number, float(np.nanmax(fiber_forward_power)))
-        )
+    waveguide_total_transmission_db = 10.0 * np.log10(
+        np.maximum(waveguide_total_transmission, normalization_floor)
+    )
     if not np.all(np.isfinite(fiber_coupling)) or float(np.max(fiber_coupling)) > 1.05:
         raise RuntimeError(
-            "Unphysical grating coupling efficiency after selecting local-TE/Ey fiber mode %d: "
-            "maximum %.6g. The result will not be plotted or saved."
-            % (fiber_measurement_mode_number, float(np.nanmax(fiber_coupling)))
+            "Unphysical grating modal coupling after measured-input normalization: maximum %.6g."
+            % float(np.nanmax(fiber_coupling))
         )
-    mode_selection = dict(WAVEGUIDE_MODE_SELECTIONS.get(waveguide_mode_monitor_name, {}))
     selected_neff = float(mode_selection.get("neff", GRATING_ANALYSIS["waveguide_target_neff"]))
-    selected_mode_number = int(mode_selection.get("mode number", 0))
     print(
-        "Passive fiber accounting uses %s / %s fields %s, %s and %s."
+        "Measured input Pin = %.0f * real(%s.T); no cos(theta) correction is applied because the full projected beam is captured."
         % (
-            fiber_result_path,
-            fiber_result_name,
-            fiber_forward_key,
-            fiber_reflected_key,
-            fiber_net_key,
+            fiber_input_sign,
+            fiber_input_monitor_name,
         )
     )
     print(
-        "Passive fiber accounting selects verified local-TE/Ey eigensolver mode %d "
-        "from retained order %r; no orthogonal-polarization power is included."
-        % (fiber_measurement_mode_number, fiber_measurement_mode_order)
+        "Selected-TE output uses %s / %s field %s, waveguide mode %d (neff %.6g)."
+        % (
+            waveguide_result_path,
+            resolved_waveguide_result,
+            waveguide_modal_key,
+            selected_mode_number,
+            selected_neff,
+        )
     )
     print(
-        "Incident-normalized grating CE = source-normalized %s power of waveguide mode %d "
-        "(neff %.6g) / passive-port forward fiber power."
-        % (modal_direction_key, selected_mode_number, selected_neff)
+        "Reported traces: selected-TE receiver power / measured Pin and nearby total waveguide power / measured Pin."
     )
-    print("Source-normalized waveguide mode and total powers are retained separately.")
 
     wavelength_target_m = 0.5 * (
         float(SETTINGS.get("wavelength_start_um", 1.25))
@@ -4807,22 +4859,20 @@ else:
     ) * 1e-6
     analysis_arrays = {
         "wavelength_m": wavelengths_m,
-        "fiber_forward_power": fiber_forward_power,
-        "fiber_reflected_power": fiber_reflected_power,
-        "fiber_net_power": fiber_net_power,
-        "fiber_net_power_signed": fiber_net_power_signed,
-        "fiber_input_power": fiber_forward_power,
-        "waveguide_mode_power_source_normalized": waveguide_mode_power_source_normalized,
-        "waveguide_mode_power": waveguide_mode_power_source_normalized,
+        "fiber_input_power_signed_raw": fiber_input_signed_raw,
+        "fiber_input_power": fiber_input_power,
+        "waveguide_mode_power_source_normalized": waveguide_mode_power,
+        "waveguide_mode_power": waveguide_mode_power,
+        "waveguide_total_power_signed_raw": waveguide_total_signed_raw,
         "waveguide_total_power": waveguide_total_power,
-        "waveguide_transmission": waveguide_mode_power_source_normalized,
+        "waveguide_transmission": fiber_coupling,
+        "waveguide_total_transmission": waveguide_total_transmission,
+        "waveguide_total_transmission_db": waveguide_total_transmission_db,
         "fiber_coupling": fiber_coupling,
+        "coupling_efficiency": fiber_coupling,
         "fiber_coupling_db": fiber_coupling_db,
         "fiber_source_mode_number": np.asarray([
             int(GRATING_ANALYSIS.get("fiber_source_mode_number", 0))
-        ]),
-        "fiber_measurement_mode_number": np.asarray([
-            fiber_measurement_mode_number
         ]),
         "waveguide_selected_neff": np.asarray([selected_neff]),
         "waveguide_selected_mode_number": np.asarray([selected_mode_number]),
@@ -5236,8 +5286,8 @@ import time
 import uuid
 import numpy as np
 
-SWEEP_CHECKPOINT_SCHEMA = 5
-SWEEP_RUNTIME_VERSION = "max-layout-sweep-runtime-v5"
+SWEEP_CHECKPOINT_SCHEMA = 6
+SWEEP_RUNTIME_VERSION = "max-layout-sweep-runtime-v6"
 SWEEP_CODE_FINGERPRINT = str(globals().get(
     "SWEEP_CODE_FINGERPRINT", SWEEP_RUNTIME_VERSION
 ))
@@ -5260,12 +5310,24 @@ SWEEP_BASE_PORTS_BY_NAME = {
     str(port.get("name", "")): dict(port) for port in PORTS
 }
 SWEEP_BASE_PORT_Z_M = {}
-SWEEP_FIBER_MODE_SELECTIONS = {
-    str(name): dict(selection)
-    for name, selection in dict(globals().get(
+SWEEP_BASE_MONITORS_BY_NAME = {
+    str(monitor.get("name", "")): dict(monitor) for monitor in MONITORS
+}
+SWEEP_BASE_MONITOR_Z_M = {}
+_SWEEP_SEED_MODE_SELECTIONS = dict(globals().get(
+    "SWEEP_PORT_MODE_SELECTIONS",
+    globals().get(
         "SWEEP_FIBER_MODE_SELECTIONS",
         globals().get("PORT_MODE_SELECTIONS", {}),
-    )).items()
+    ),
+))
+SWEEP_PORT_MODE_SELECTIONS = {
+    str(name): dict(selection)
+    for name, selection in _SWEEP_SEED_MODE_SELECTIONS.items()
+}
+SWEEP_FIBER_MODE_SELECTIONS = {
+    str(name): dict(selection)
+    for name, selection in SWEEP_PORT_MODE_SELECTIONS.items()
     if "candidate mode numbers" in dict(selection)
 }
 
@@ -5276,45 +5338,31 @@ def _restore_sweep_fiber_mode_contract():
         return
     ports_by_name = {str(port.get("name", "")): port for port in PORTS}
     source_name = str(GRATING_ANALYSIS.get("fiber_port_name", ""))
-    measurement_name = str(
-        GRATING_ANALYSIS.get("fiber_input_measurement_port_name", "")
-    )
-    source_mode_number = 0
-    for name, selection in SWEEP_FIBER_MODE_SELECTIONS.items():
-        selected_mode = max(1, int(selection.get("mode number", 1)))
-        selected_order = [
-            max(1, int(value))
-            for value in selection.get(
-                "selected mode order",
-                selection.get("candidate mode numbers", [selected_mode]),
-            )
-        ]
-        selected_order = list(dict.fromkeys(selected_order))
-        if not selected_order:
-            selected_order = [selected_mode]
-        port = ports_by_name.get(str(name))
-        if port is not None:
-            port["mode number"] = selected_mode
-            port["polarization"] = "local TE"
-            port["selected mode order"] = list(selected_order)
-        if str(name) == source_name:
-            GRATING_ANALYSIS["fiber_source_mode"] = "mode %d" % selected_mode
-            GRATING_ANALYSIS["fiber_source_mode_number"] = selected_mode
-            GRATING_ANALYSIS["fiber_polarization"] = "local TE"
-            GRATING_ANALYSIS["fiber_selected_mode_order"] = list(selected_order)
-            source_mode_number = selected_mode
-        if str(name) == measurement_name:
-            GRATING_ANALYSIS["fiber_measurement_mode"] = "mode %d" % selected_mode
-            GRATING_ANALYSIS["fiber_measurement_mode_number"] = selected_mode
-            GRATING_ANALYSIS["fiber_measurement_selected_mode_order"] = list(
-                selected_order
-            )
     if not source_name:
         return
-    if source_mode_number <= 0:
+    source_selection = dict(SWEEP_FIBER_MODE_SELECTIONS.get(source_name, {}))
+    if not source_selection:
         raise RuntimeError(
             "The sweep has no verified local-TE/Ey source mode for %s" % source_name
         )
+    source_mode_number = max(1, int(source_selection.get("mode number", 1)))
+    selected_order = [
+        max(1, int(value))
+        for value in source_selection.get(
+            "selected mode order",
+            source_selection.get("candidate mode numbers", [source_mode_number]),
+        )
+    ]
+    selected_order = list(dict.fromkeys(selected_order)) or [source_mode_number]
+    source_port = ports_by_name.get(source_name)
+    if source_port is not None:
+        source_port["mode number"] = source_mode_number
+        source_port["polarization"] = "local TE"
+        source_port["selected mode order"] = list(selected_order)
+    GRATING_ANALYSIS["fiber_source_mode"] = "mode %d" % source_mode_number
+    GRATING_ANALYSIS["fiber_source_mode_number"] = source_mode_number
+    GRATING_ANALYSIS["fiber_polarization"] = "local TE"
+    GRATING_ANALYSIS["fiber_selected_mode_order"] = list(selected_order)
     fdtd.select("FDTD::ports")
     fdtd.set("source port", source_name)
     fdtd.set("source mode", "mode %d" % source_mode_number)
@@ -5799,7 +5847,7 @@ def _apply_sweep_case(case_index):
             _sweep_set_named(path, "theta", float(fiber.get("angle theta", 0.0)))
     if angle_theta_is_swept and FIBER_GEOMETRIES:
         # Rebuild the scripted core/cladding cylinders before recalculating
-        # the two concentric tilted port modes.
+        # the single tilted source-port mode.
         fdtd.runsetup()
 
     for port in PORTS:
@@ -5843,11 +5891,30 @@ def _apply_sweep_case(case_index):
                 )
 
     for monitor in MONITORS:
-        path = "::model::" + str(monitor["name"])
+        monitor_name = str(monitor["name"])
+        path = "::model::" + monitor_name
         x_um, y_um = _sweep_xy(monitor)
         _sweep_set_named(path, "x", x_um * UM)
         _sweep_set_named(path, "y", y_um * UM)
         plane_normal = str(monitor.get("plane normal", "X")).upper()
+        if plane_normal == "Z":
+            if monitor_name not in SWEEP_BASE_MONITOR_Z_M:
+                SWEEP_BASE_MONITOR_Z_M[monitor_name] = float(
+                    np.asarray(fdtd.getnamed(path, "z")).squeeze()
+                )
+            base_monitor = SWEEP_BASE_MONITORS_BY_NAME.get(
+                monitor_name, monitor
+            )
+            distance_delta_um = (
+                float(monitor.get("distance_um", 0.0))
+                - float(base_monitor.get("distance_um", 0.0))
+            )
+            _sweep_set_named(
+                path,
+                "z",
+                float(SWEEP_BASE_MONITOR_Z_M[monitor_name])
+                + distance_delta_um * UM,
+            )
         for property_name, key, normal in (
             ("x span", "x span", "X"),
             ("y span", "y span", "Y"),
@@ -5868,18 +5935,13 @@ def _apply_sweep_case(case_index):
             GRATING_ANALYSIS.get("fiber_port_name", "")
             if GRATING_ANALYSIS else ""
         )
-        measurement_fiber_name = str(
-            GRATING_ANALYSIS.get("fiber_input_measurement_port_name", "")
-            if GRATING_ANALYSIS else ""
-        )
-        # Source first so the passive plane can reuse its verified physical
-        # polarization even if JSON/component order was changed by the user.
+        # Source first so its rotation-aware local-TE identity is restored
+        # before any ordinary access-waveguide port is refreshed.
         ports_for_mode_refresh = sorted(
             PORTS,
             key=lambda candidate: (
                 0 if str(candidate.get("name", "")) == source_fiber_name
-                else 1 if str(candidate.get("name", "")) == measurement_fiber_name
-                else 2
+                else 1
             ),
         )
         for port in ports_for_mode_refresh:
@@ -5887,6 +5949,7 @@ def _apply_sweep_case(case_index):
             path = "FDTD::ports::" + name
             fdtd.select(path)
             fiber_selection = SWEEP_FIBER_MODE_SELECTIONS.get(name)
+            port_selection = SWEEP_PORT_MODE_SELECTIONS.get(name)
             if fiber_only_mode_refresh and not fiber_selection:
                 # Fiber tilt does not change any waveguide access plane.
                 continue
@@ -5894,13 +5957,6 @@ def _apply_sweep_case(case_index):
                 if name == source_fiber_name and angle_theta_is_swept:
                     fiber_selection = _sweep_reselect_fiber_local_te(
                         path, port, fiber_selection
-                    )
-                elif name == measurement_fiber_name:
-                    source_selection = SWEEP_FIBER_MODE_SELECTIONS.get(
-                        source_fiber_name, fiber_selection
-                    )
-                    fiber_selection = _sweep_reuse_verified_fiber_local_te(
-                        path, port, source_selection
                     )
                 else:
                     # The fiber angle/polarization did not change. Recalculate
@@ -5912,6 +5968,7 @@ def _apply_sweep_case(case_index):
                     fiber_selection = dict(fiber_selection)
                     fiber_selection["selected mode order"] = [selected_mode]
                 SWEEP_FIBER_MODE_SELECTIONS[name] = dict(fiber_selection)
+                SWEEP_PORT_MODE_SELECTIONS[name] = dict(fiber_selection)
                 selected_mode = max(1, int(fiber_selection.get("mode number", 1)))
                 selected_order = list(
                     fiber_selection.get("selected mode order", [selected_mode])
@@ -5920,8 +5977,17 @@ def _apply_sweep_case(case_index):
                 port["selected mode order"] = list(selected_order)
                 port["polarization"] = "local TE"
             else:
-                mode_number = max(0, int(port.get("mode number", 0)))
+                mode_number = max(0, int(
+                    dict(port_selection or {}).get(
+                        "mode number", port.get("mode number", 0)
+                    )
+                ))
                 fdtd.updateportmodes(mode_number) if mode_number else fdtd.updateportmodes()
+                if port_selection is not None:
+                    refreshed_selection = dict(port_selection)
+                    refreshed_selection["mode number"] = mode_number or 1
+                    refreshed_selection["selected mode order"] = [mode_number or 1]
+                    SWEEP_PORT_MODE_SELECTIONS[name] = refreshed_selection
         _restore_sweep_fiber_mode_contract()
         for monitor in MONITORS:
             if (
@@ -5930,6 +5996,64 @@ def _apply_sweep_case(case_index):
             ):
                 fdtd.select(str(monitor["name"]))
                 fdtd.updatemodes()
+        if GRATING_ANALYSIS and not fiber_only_mode_refresh:
+            receiver_name = str(GRATING_ANALYSIS.get("waveguide_port_name", ""))
+            receiver_port = next(
+                (
+                    port for port in PORTS
+                    if str(port.get("name", "")) == receiver_name
+                ),
+                {},
+            )
+            target_neff = float(receiver_port.get(
+                "target neff", GRATING_ANALYSIS.get("waveguide_target_neff", 0.0)
+            ))
+            tolerance = max(0.0, float(receiver_port.get(
+                "neff tolerance",
+                GRATING_ANALYSIS.get("waveguide_neff_tolerance", 0.3),
+            )))
+            try:
+                neff_data = fdtd.getresult(
+                    "FDTD::ports::" + receiver_name, "neff"
+                )
+                neff_key = _sweep_result_key(neff_data, "neff")
+                neff_values = np.real(
+                    np.squeeze(np.asarray(neff_data[neff_key]))
+                ).ravel()
+                finite_neff = neff_values[np.isfinite(neff_values)]
+            except Exception as exc:
+                raise RuntimeError(
+                    "Could not validate refreshed grating receiver %s effective index: %s"
+                    % (receiver_name, exc)
+                ) from None
+            if finite_neff.size < 1:
+                raise RuntimeError(
+                    "Refreshed grating receiver %s returned no finite effective index"
+                    % receiver_name
+                )
+            selected_neff = float(np.median(finite_neff))
+            if target_neff > 0.0 and abs(selected_neff - target_neff) > tolerance:
+                raise RuntimeError(
+                    "Refreshed grating receiver %s selected neff %.6g outside "
+                    "material-derived target %.6g +/- %.6g"
+                    % (receiver_name, selected_neff, target_neff, tolerance)
+                )
+            receiver_selection = dict(
+                SWEEP_PORT_MODE_SELECTIONS.get(receiver_name, {})
+            )
+            receiver_selection.update({
+                "neff": selected_neff,
+                "target neff": target_neff,
+                "neff tolerance": tolerance,
+                "mode number": max(
+                    1, int(receiver_selection.get("mode number", 1))
+                ),
+            })
+            SWEEP_PORT_MODE_SELECTIONS[receiver_name] = receiver_selection
+            print(
+                "Validated refreshed grating receiver %s neff %.6g around target %.6g."
+                % (receiver_name, selected_neff, target_neff)
+            )
         if MMI_ANALYSIS:
             mmi_port_names = [
                 str(MMI_ANALYSIS["input_port_name"]),
@@ -6217,86 +6341,144 @@ def _sweep_port_expansion(port_name, result_name="expansion for port monitor"):
 def _extract_sweep_result():
     arrays = {}
     if GRATING_ANALYSIS:
+        fiber_input_name = str(GRATING_ANALYSIS["fiber_input_power_monitor_name"])
+        fiber_input_sign = float(GRATING_ANALYSIS.get("fiber_input_power_sign", -1.0))
+        waveguide_port_name = str(GRATING_ANALYSIS["waveguide_port_name"])
+        waveguide_port_result_name = str(GRATING_ANALYSIS.get(
+            "waveguide_port_expansion_result_name", "expansion for port monitor"
+        ))
+        waveguide_modal_key = str(GRATING_ANALYSIS.get(
+            "waveguide_port_modal_direction", "T_out"
+        ))
         waveguide_power_name = str(GRATING_ANALYSIS["waveguide_power_monitor_name"])
-        waveguide_mode_name = str(GRATING_ANALYSIS["waveguide_mode_monitor_name"])
-        expansion_name = str(GRATING_ANALYSIS["waveguide_expansion_result_name"])
-        direction_key = str(GRATING_ANALYSIS.get("waveguide_modal_direction", "Tbackward"))
+        waveguide_total_sign = float(
+            GRATING_ANALYSIS.get("waveguide_total_power_sign", -1.0)
+        )
+
+        def monitor_transmission(name):
+            attempts = []
+            for path in tuple(dict.fromkeys((name, "::model::" + name.lstrip(":")))):
+                try:
+                    return fdtd.getresult(path, "T")
+                except Exception as exc:
+                    attempts.append("%s: %s" % (path, str(exc)[:140]))
+            raise SweepResultSchemaError(
+                "Power monitor %r has no readable T result. %s"
+                % (name, " | ".join(attempts))
+            )
+
         try:
-            power_data = fdtd.getresult(waveguide_power_name, "T")
-            power_wavelength_m, total_power = _sweep_spectrum(power_data, "T")
+            fiber_input_data = monitor_transmission(fiber_input_name)
+            fiber_wavelength_m, fiber_input_signed = _sweep_spectrum(
+                fiber_input_data, "T", magnitude=False
+            )
         except Exception as exc:
             raise SweepResultSchemaError(
-                "The waveguide power monitor %r has no readable T spectrum: %s"
+                "The fiber input-power monitor %r has no readable signed T spectrum: %s"
+                % (fiber_input_name, exc)
+            ) from exc
+
+        expansion_data = _sweep_port_expansion(
+            waveguide_port_name, waveguide_port_result_name
+        )
+        receiver_selection = dict(
+            SWEEP_PORT_MODE_SELECTIONS.get(waveguide_port_name, {})
+        )
+        receiver_mode_number = max(
+            0, int(receiver_selection.get("mode number", 0))
+        )
+        receiver_mode_order = list(receiver_selection.get(
+            "selected mode order",
+            [receiver_mode_number] if receiver_mode_number else [],
+        ))
+        try:
+            wavelength_m, mode_power = _sweep_spectrum(
+                expansion_data,
+                waveguide_modal_key,
+                magnitude=False,
+                selected_mode_number=receiver_mode_number,
+                selected_mode_order=receiver_mode_order,
+            )
+        except Exception as exc:
+            raise SweepResultSchemaError(
+                "The passive waveguide receiver %r has no readable %r spectrum in %r: %s"
+                % (
+                    waveguide_port_name,
+                    waveguide_modal_key,
+                    waveguide_port_result_name,
+                    exc,
+                )
+            ) from exc
+
+        try:
+            waveguide_power_data = monitor_transmission(waveguide_power_name)
+            power_wavelength_m, waveguide_total_signed = _sweep_spectrum(
+                waveguide_power_data, "T", magnitude=False
+            )
+        except Exception as exc:
+            raise SweepResultSchemaError(
+                "The waveguide total-power monitor %r has no readable signed T spectrum: %s"
                 % (waveguide_power_name, exc)
             ) from exc
-        expansion_data, expansion_path, resolved_expansion_name = _sweep_mode_expansion_result(
-            waveguide_mode_name, expansion_name
-        )
-        try:
-            wavelength_m, mode_power = _sweep_spectrum(expansion_data, direction_key)
-        except Exception as exc:
-            raise SweepResultSchemaError(
-                "The mode-expansion result %r on %r has no readable %r spectrum: %s"
-                % (resolved_expansion_name, expansion_path, direction_key, exc)
-            ) from exc
-        total_power = np.interp(wavelength_m, power_wavelength_m, total_power)
 
-        fiber_name = str(GRATING_ANALYSIS["fiber_input_measurement_port_name"])
-        fiber_result_name = str(GRATING_ANALYSIS.get("fiber_measurement_expansion_result_name", "expansion for port monitor"))
-        fiber_data = _sweep_port_expansion(fiber_name, fiber_result_name)
-        measurement_selection = dict(SWEEP_FIBER_MODE_SELECTIONS.get(fiber_name, {}))
-        fiber_mode_number = int(GRATING_ANALYSIS.get(
-            "fiber_measurement_mode_number",
-            measurement_selection.get("mode number", 0),
-        ))
-        fiber_mode_order = list(GRATING_ANALYSIS.get(
-            "fiber_measurement_selected_mode_order",
-            measurement_selection.get("selected mode order", []),
-        ))
-        if fiber_mode_number <= 0:
+        fiber_input_signed = np.interp(
+            wavelength_m, fiber_wavelength_m, fiber_input_signed
+        )
+        fiber_input_power = fiber_input_sign * fiber_input_signed
+        waveguide_total_signed = np.interp(
+            wavelength_m, power_wavelength_m, waveguide_total_signed
+        )
+        waveguide_total_power = waveguide_total_sign * waveguide_total_signed
+        waveguide_mode_power = np.real(np.asarray(mode_power, dtype=float))
+        normalization_floor = 1e-15
+        if (
+            not np.all(np.isfinite(fiber_input_power))
+            or float(np.min(fiber_input_power)) <= normalization_floor
+        ):
             raise SweepResultSchemaError(
-                "The passive fiber plane %r has no verified local-TE/Ey mode number"
-                % fiber_name
+                "The fiber input monitor %r has wrong/near-zero signed power after "
+                "applying sign %.0f: range [%.6g, %.6g]"
+                % (
+                    fiber_input_name,
+                    fiber_input_sign,
+                    float(np.nanmin(fiber_input_power)),
+                    float(np.nanmax(fiber_input_power)),
+                )
             )
-        try:
-            input_key = _sweep_result_key(fiber_data, "T_in", "Tin", "T in")
-            output_key = _sweep_result_key(fiber_data, "T_out", "Tout", "T out")
-            fiber_wavelength_m, fiber_forward = _sweep_spectrum(
-                fiber_data, input_key,
-                selected_mode_number=fiber_mode_number,
-                selected_mode_order=fiber_mode_order,
-            )
-            reflected_wavelength_m, fiber_reflected = _sweep_spectrum(
-                fiber_data, output_key,
-                selected_mode_number=fiber_mode_number,
-                selected_mode_order=fiber_mode_order,
-            )
-        except Exception as exc:
+        if float(np.nanmin(waveguide_mode_power)) < -1e-9:
             raise SweepResultSchemaError(
-                "The passive fiber measurement port %r has an incompatible expansion schema: %s"
-                % (fiber_name, exc)
-            ) from exc
-        fiber_forward = np.interp(wavelength_m, fiber_wavelength_m, fiber_forward)
-        fiber_reflected = np.interp(wavelength_m, reflected_wavelength_m, fiber_reflected)
-        coupling_efficiency = mode_power / np.maximum(fiber_forward, 1e-15)
-        if not np.all(np.isfinite(fiber_forward)) or float(np.max(fiber_forward)) < 0.1:
-            raise SweepResultSchemaError(
-                "The verified local-TE/Ey fiber mode %d carries too little forward power "
-                "at the passive plane (maximum %.6g)"
-                % (fiber_mode_number, float(np.nanmax(fiber_forward)))
+                "The passive waveguide receiver %r returned negative %s power: %.6g"
+                % (
+                    waveguide_port_name,
+                    waveguide_modal_key,
+                    float(np.nanmin(waveguide_mode_power)),
+                )
             )
+        if float(np.nanmin(waveguide_total_power)) < -1e-9:
+            raise SweepResultSchemaError(
+                "The waveguide total-power monitor %r has the wrong propagation sign: %.6g"
+                % (waveguide_power_name, float(np.nanmin(waveguide_total_power)))
+            )
+        coupling_efficiency = waveguide_mode_power / np.maximum(
+            fiber_input_power, normalization_floor
+        )
+        waveguide_total_transmission = waveguide_total_power / np.maximum(
+            fiber_input_power, normalization_floor
+        )
         if not np.all(np.isfinite(coupling_efficiency)) or float(np.max(coupling_efficiency)) > 1.05:
             raise SweepResultSchemaError(
-                "Unphysical grating CE for verified local-TE/Ey fiber mode %d: maximum %.6g"
-                % (fiber_mode_number, float(np.nanmax(coupling_efficiency)))
+                "Unphysical grating selected-mode/input ratio: maximum %.6g"
+                % float(np.nanmax(coupling_efficiency))
             )
         arrays.update(
             {
                 "coupling_efficiency": coupling_efficiency,
-                "waveguide_mode_power": mode_power,
-                "waveguide_total_power": total_power,
-                "fiber_forward_power": fiber_forward,
-                "fiber_reflected_power": fiber_reflected,
+                "fiber_input_power_signed_raw": fiber_input_signed,
+                "fiber_input_power": fiber_input_power,
+                "waveguide_mode_power": waveguide_mode_power,
+                "waveguide_total_power_signed_raw": waveguide_total_signed,
+                "waveguide_total_power": waveguide_total_power,
+                "waveguide_total_transmission": waveguide_total_transmission,
             }
         )
         return "coupling_efficiency", wavelength_m, coupling_efficiency, arrays
@@ -6410,6 +6592,13 @@ def _sweep_case_is_complete(case_index):
                 "wavelength_m", "primary_response", "primary_name",
             }
             expected_primary = _sweep_expected_primary_name()
+            if expected_primary == "coupling_efficiency":
+                required.update({
+                    "fiber_input_power",
+                    "waveguide_mode_power",
+                    "waveguide_total_power",
+                    "waveguide_total_transmission",
+                })
             if expected_primary == "output_1_over_input":
                 required.update({
                     "output_1_power", "output_2_power", "input_power",
@@ -6486,6 +6675,14 @@ def _finalize_sweep_results(failures):
     response_rows = []
     success = []
     primary_name = "response"
+    grating_detail_names = (
+        "fiber_input_power_signed_raw",
+        "fiber_input_power",
+        "waveguide_mode_power",
+        "waveguide_total_power_signed_raw",
+        "waveguide_total_power",
+        "waveguide_total_transmission",
+    ) if any(case.get("grating_analysis") for case in SWEEP_CASES) else ()
     mmi_detail_names = (
         "output_1_power",
         "output_2_power",
@@ -6496,12 +6693,13 @@ def _finalize_sweep_results(failures):
         "output_2_over_input",
         "total_output_over_input",
     ) if any(case.get("mmi_analysis") for case in SWEEP_CASES) else ()
-    detail_rows = {name: [] for name in mmi_detail_names}
+    detail_names = (*grating_detail_names, *mmi_detail_names)
+    detail_rows = {name: [] for name in detail_names}
     for case_index in range(len(SWEEP_CASES)):
         case_path = _sweep_case_npz(case_index)
         if not _sweep_case_is_complete(case_index):
             response_rows.append(None)
-            for name in mmi_detail_names:
+            for name in detail_names:
                 detail_rows[name].append(None)
             success.append(False)
             continue
@@ -6512,12 +6710,12 @@ def _finalize_sweep_results(failures):
             detail_values = {
                 name: np.asarray(data[name], dtype=float)
                 if name in data.files else None
-                for name in mmi_detail_names
+                for name in detail_names
             }
         if reference_wavelength_m is None:
             reference_wavelength_m = wavelength_m
         response_rows.append(np.interp(reference_wavelength_m, wavelength_m, response))
-        for name in mmi_detail_names:
+        for name in detail_names:
             values = detail_values[name]
             detail_rows[name].append(
                 None if values is None
@@ -6531,7 +6729,7 @@ def _finalize_sweep_results(failures):
         if row is not None:
             response_matrix[index, :] = row
     detail_matrices = {}
-    for name in mmi_detail_names:
+    for name in detail_names:
         matrix = np.full(
             (len(SWEEP_CASES), reference_wavelength_m.size), np.nan, dtype=float
         )
@@ -6673,10 +6871,10 @@ def _finalize_sweep_results(failures):
         "fiber_cladding_diameter_um": ("Fiber cladding diameter", "um"),
         "fiber_cladding_index": ("Fiber cladding refractive index", ""),
         "fiber_length_um": ("Fiber length", "um"),
-        "fiber_power_monitor_below_source_um": ("Fiber power-plane distance below source", "um"),
+        "fiber_power_monitor_below_source_um": ("Horizontal fiber-input monitor distance below source", "um"),
         "fdtd_port_offset_from_waveguide_end_um": ("Waveguide FDTD-port offset from waveguide end", "um"),
-        "waveguide_monitor_span_um": ("Waveguide mode-monitor transverse span", "um"),
-        "waveguide_total_power_before_mode_um": ("Total-power plane distance before waveguide mode plane", "um"),
+        "waveguide_monitor_span_um": ("Waveguide receiver-port transverse span", "um"),
+        "waveguide_total_power_before_mode_um": ("Total-power plane distance before receiver port", "um"),
         "waveguide_neff_tolerance": ("Waveguide effective-index tolerance", ""),
         "waveguide_mode_search_count": ("Waveguide eigensolver modes searched", ""),
         "tolerance": ("Geometry build tolerance", "um"),
@@ -6940,6 +7138,33 @@ def _finalize_sweep_results(failures):
             SWEEP_CASES[target_best_index].get("source_parameters", {})
         )
     )
+
+    if primary_name == "coupling_efficiency" and detail_matrices.get(
+        "waveguide_total_transmission"
+    ) is not None:
+        _grating_pin_peak = detail_matrices["fiber_input_power"][
+            best_index, best_peak_index
+        ]
+        _grating_mode_peak = detail_matrices["waveguide_mode_power"][
+            best_index, best_peak_index
+        ]
+        _grating_total_peak = detail_matrices["waveguide_total_power"][
+            best_index, best_peak_index
+        ]
+        _grating_total_ratio_peak = detail_matrices[
+            "waveguide_total_transmission"
+        ][best_index, best_peak_index]
+        summary_lines.append(
+            "Grating peak-best measurement: measured Pin=%s | selected TE output=%s | "
+            "total waveguide output=%s | selected TE/Pin=%s | total/Pin=%s"
+            % (
+                _sweep_summary_number(_grating_pin_peak),
+                _sweep_summary_number(_grating_mode_peak),
+                _sweep_summary_number(_grating_total_peak),
+                _sweep_summary_number(maximum_response[best_index]),
+                _sweep_summary_number(_grating_total_ratio_peak),
+            )
+        )
 
     if primary_name == "output_1_over_input" and detail_matrices.get("output_2_over_input") is not None:
         _mmi_upper_over_input = detail_matrices["output_1_over_input"][best_index, target_index]
@@ -7438,6 +7663,10 @@ with np.load(_local_sweep_npz) as _data:
     _success = np.asarray(_data["success"], dtype=bool)
     _best_index = int(np.asarray(_data["best_index"]).ravel()[0])
     _primary_name = str(np.asarray(_data["primary_name"]).ravel()[0])
+    _gc_total_over_input = (
+        np.asarray(_data["waveguide_total_transmission"], dtype=float)
+        if "waveguide_total_transmission" in _data.files else None
+    )
     _mmi_output_1_over_input = (
         np.asarray(_data["output_1_over_input"], dtype=float)
         if "output_1_over_input" in _data.files else None
@@ -7460,6 +7689,10 @@ with np.load(_local_sweep_npz) as _data:
     )
 
 _is_ce = _primary_name == "coupling_efficiency"
+if _is_ce and _gc_total_over_input is None:
+    raise RuntimeError(
+        "The grating sweep bundle is missing total waveguide power / measured fiber input"
+    )
 _is_mmi = (
     _primary_name == "output_1_over_input"
     and _mmi_output_1_over_input is not None
@@ -7468,6 +7701,10 @@ _is_mmi = (
 _db_floor = 1e-15
 _responses_db = (
     10.0 * np.log10(np.maximum(_responses, _db_floor)) if _is_ce else None
+)
+_gc_total_over_input_db = (
+    10.0 * np.log10(np.maximum(_gc_total_over_input, _db_floor))
+    if _is_ce else None
 )
 _maximum_db = (
     10.0 * np.log10(np.maximum(_maximum, _db_floor)) if _is_ce else None
@@ -7525,14 +7762,30 @@ for _index, (_label, _stem) in enumerate(zip(_case_labels, _result_stems)):
         _figure, (_axis, _db_axis) = plt.subplots(
             1, 2, figsize=(13.0, 4.8), sharex=True,
         )
-        _axis.plot(_wavelength_nm, _responses[_index], lw=2.2, color="#2563eb")
-        _db_axis.plot(_wavelength_nm, _responses_db[_index], lw=2.2, color="#7c3aed")
+        _axis.plot(
+            _wavelength_nm, _responses[_index], lw=2.4, color="#7c3aed",
+            label="selected TE / measured fiber input",
+        )
+        _axis.plot(
+            _wavelength_nm, _gc_total_over_input[_index], lw=2.0,
+            color="#f59e0b", label="total waveguide / measured fiber input",
+        )
+        _db_axis.plot(
+            _wavelength_nm, _responses_db[_index], lw=2.4,
+            color="#7c3aed", label="selected TE / input",
+        )
+        _db_axis.plot(
+            _wavelength_nm, _gc_total_over_input_db[_index], lw=2.0,
+            color="#f59e0b", label="total / input",
+        )
         _db_axis.set(
             xlabel="wavelength [nm]",
-            ylabel="coupling efficiency [dB]",
-            title="Coupling efficiency — dB — " + _label,
+            ylabel="normalized power [dB]",
+            title="Waveguide transmission — dB — " + _label,
         )
         _db_axis.grid(alpha=0.3)
+        _axis.legend(loc="best")
+        _db_axis.legend(loc="best")
     else:
         _figure, _axis = plt.subplots(figsize=(8.5, 4.8))
         _axis.plot(_wavelength_nm, _responses[_index], lw=2.2, color="#2563eb")
@@ -7540,7 +7793,7 @@ for _index, (_label, _stem) in enumerate(zip(_case_labels, _result_stems)):
         xlabel="wavelength [nm]",
         ylabel=_ylabel,
         title=(
-            "Coupling efficiency — " if _is_ce
+            "Waveguide transmission — " if _is_ce
             else "MMI branch transmission — " if _is_mmi
             else "Lumerical sweep response — "
         ) + _label,
@@ -7795,7 +8048,7 @@ def generate_lumerical_notebook(
                 "the target from the actual dispersive core and adjacent stack materials."
                 % (component.get("kind", "component"), component.get("uid", 0))
             )
-    _promote_fiber_measurement_ports(ports, monitors, warnings)
+    _normalize_grating_measurement_objects(ports, monitors, warnings)
     if not bool(configuration.get("include_ports", True)):
         ports = []
     alignment_stack = deepcopy(configuration.get("material_stack") or default_stack())
@@ -7820,11 +8073,13 @@ def generate_lumerical_notebook(
             and str(monitor.get("monitor_kind", "")) == "Power monitor"
             and str(monitor.get("grating_monitor_role", "")) == "waveguide_total_power"
         ]
-        waveguide_mode_monitors = [
-            monitor for monitor in monitors
-            if int(monitor.get("parent_component_uid", -1)) == grating_uid
-            and str(monitor.get("monitor_kind", "")) == "Mode expansion monitor"
-            and str(monitor.get("grating_monitor_role", "")) == "waveguide_mode_expansion"
+        waveguide_ports = [
+            port for port in ports
+            if bool(port.get("enabled", True))
+            and int(port.get("parent_component_uid", -1)) == grating_uid
+            and str(port.get("domain", "optical")).lower() == "optical"
+            and str(port.get("plane normal", "X")).upper() in {"X", "Y"}
+            and str(port.get("parent_port_name", "")) == "waveguide_point"
         ]
         fiber_ports = [
             port for port in ports
@@ -7836,16 +8091,15 @@ def generate_lumerical_notebook(
                 "input power measurement", "passive fiber measurement", "fiber power measurement"
             }
         ]
-        fiber_measurement_ports = [
-            port for port in ports
-            if bool(port.get("enabled", True))
-            and str(port.get("domain", "optical")).lower() == "optical"
-            and str(port.get("plane normal", "X")).upper() == "Z"
+        fiber_input_monitors = [
+            monitor for monitor in monitors
+            if int(monitor.get("parent_component_uid", -1)) == grating_uid
+            and str(monitor.get("monitor_kind", "")) == "Power monitor"
+            and str(monitor.get("plane normal", "Z")).upper() == "Z"
             and (
-                str(port.get("parent_port_name", "")) == "fiber_input_power"
-                or str(port.get("fiber plane role", "")).strip().lower() in {
-                    "input power measurement", "passive fiber measurement", "fiber power measurement"
-                }
+                str(monitor.get("parent_port_name", "")) == "fiber_input_power"
+                or str(monitor.get("fiber plane role", "")).strip().lower()
+                == "input power measurement"
             )
         ]
         matching_fiber_ports = [
@@ -7854,18 +8108,12 @@ def generate_lumerical_notebook(
         ]
         if matching_fiber_ports:
             fiber_ports = matching_fiber_ports
-        matching_measurement_ports = [
-            port for port in fiber_measurement_ports
-            if int(port.get("parent_component_uid", -1)) == grating_uid
-        ]
-        if matching_measurement_ports:
-            fiber_measurement_ports = matching_measurement_ports
         # Fiber HE11 is a near-degenerate polarization pair, but the pair is
         # not guaranteed to be returned as eigensolver modes 1 and 2.  Solve
         # the first three modes, identify the pair nearest the fiber index,
         # then select its Gaussian/circular member polarized perpendicular to
         # the grating axis.  The exported global phi includes rotation.
-        for fiber_mode_port in [*fiber_ports, *fiber_measurement_ports]:
+        for fiber_mode_port in fiber_ports:
             fiber_mode_port["mode"] = "user select"
             fiber_mode_port["mode number"] = 0
             fiber_mode_port["polarization"] = "local TE"
@@ -7877,22 +8125,22 @@ def generate_lumerical_notebook(
         elif not waveguide_power_monitors:
             warnings.append(
                 "Grating analysis was not added because the waveguide total-power monitor is missing. "
-                "Refresh the grating simulation setup to place it before the mode-expansion plane."
+                "Refresh the grating simulation setup to place it beside the passive waveguide receiver port."
             )
-        elif not waveguide_mode_monitors:
+        elif not waveguide_ports:
             warnings.append(
-                "Grating analysis was not added because the waveguide mode-expansion monitor is missing. "
-                "Refresh the grating simulation setup to select the confined mode by effective index."
+                "Grating analysis was not added because the passive waveguide receiver FDTD port is missing. "
+                "Refresh the grating simulation setup to select its confined mode by effective index."
             )
         elif not fiber_ports:
             warnings.append(
                 "Grating analysis was not added because no manually placed Ansys-style fiber port was exported. "
                 "Add one from Ports & monitors above the grating exit."
             )
-        elif not fiber_measurement_ports:
+        elif not fiber_input_monitors:
             warnings.append(
-                "Grating analysis was not added because the passive tilted fiber measurement port is missing. "
-                "Refresh the grating simulation setup so incident and reflected fiber-mode power can be measured."
+                "Grating analysis was not added because the power monitor below the fiber source is missing. "
+                "Refresh the grating simulation setup so incident power can be measured independently of the source port."
             )
         elif not fiber_geometries:
             warnings.append(
@@ -7903,11 +8151,11 @@ def generate_lumerical_notebook(
             points = np.vstack([np.asarray(item["vertices_um"], dtype=float) for item in grating_polygons])
             minimum, maximum = points.min(axis=0), points.max(axis=0)
             waveguide_power_monitor = deepcopy(waveguide_power_monitors[0])
-            waveguide_mode_monitors[0]["target neff"] = 0.0
-            waveguide_mode_monitors[0]["target neff strategy"] = (
+            waveguide_ports[0]["target neff"] = 0.0
+            waveguide_ports[0]["target neff strategy"] = (
                 "automatic midpoint of actual core and adjacent dielectric indices"
             )
-            waveguide_mode_monitor = deepcopy(waveguide_mode_monitors[0])
+            waveguide_port = deepcopy(waveguide_ports[0])
             grating_center = 0.5 * (minimum + maximum)
             fiber_port = min(
                 fiber_ports,
@@ -7916,11 +8164,11 @@ def generate_lumerical_notebook(
                 ),
             )
             fiber_port_name = str(fiber_port.get("name", "fiber"))
-            fiber_measurement_port = min(
-                fiber_measurement_ports,
-                key=lambda port: float(
+            fiber_input_monitor = min(
+                fiber_input_monitors,
+                key=lambda monitor: float(
                     np.linalg.norm(
-                        np.asarray(port.get("center", (0.0, 0.0)), dtype=float)
+                        np.asarray(monitor.get("center", (0.0, 0.0)), dtype=float)
                         - np.asarray(fiber_port.get("center", (0.0, 0.0)), dtype=float)
                     )
                 ),
@@ -7954,38 +8202,40 @@ def generate_lumerical_notebook(
                     "waveguide_power_monitor_name": str(
                         waveguide_power_monitor.get("name", f"uid_{grating_uid}_waveguide_total_power")
                     ),
-                    "waveguide_mode_monitor_name": str(
-                        waveguide_mode_monitor.get("name", f"uid_{grating_uid}_waveguide_mode")
+                    "waveguide_port_name": str(
+                        waveguide_port.get("name", f"uid_{grating_uid}_waveguide_point")
                     ),
-                    "waveguide_expansion_result_name": str(
-                        waveguide_mode_monitor.get("expansion result name", "waveguide_power")
-                    ),
-                    "waveguide_modal_direction": (
-                        "Tforward"
+                    "waveguide_port_expansion_result_name": "expansion for port monitor",
+                    # Receiver power leaves the simulation through the
+                    # waveguide port and is exposed as T_out by the standard
+                    # FDTD-port expansion result.
+                    "waveguide_port_modal_direction": "T_out",
+                    "waveguide_total_power_sign": (
+                        1.0
                         if (
-                            str(waveguide_mode_monitor.get("plane normal", "X")).upper() == "X"
-                            and math.cos(math.radians(float(waveguide_mode_monitor.get("orientation_deg", 180.0)))) >= 0.0
+                            str(waveguide_power_monitor.get("plane normal", "X")).upper() == "X"
+                            and math.cos(math.radians(float(waveguide_power_monitor.get("orientation_deg", 180.0)))) >= 0.0
                         ) or (
-                            str(waveguide_mode_monitor.get("plane normal", "X")).upper() == "Y"
-                            and math.sin(math.radians(float(waveguide_mode_monitor.get("orientation_deg", 180.0)))) >= 0.0
+                            str(waveguide_power_monitor.get("plane normal", "X")).upper() == "Y"
+                            and math.sin(math.radians(float(waveguide_power_monitor.get("orientation_deg", 180.0)))) >= 0.0
                         )
-                        else "Tbackward"
+                        else -1.0
                     ),
                     "waveguide_target_neff": 0.0,
                     "waveguide_target_strategy": (
                         "automatic midpoint of actual core and adjacent dielectric indices"
                     ),
-                    "waveguide_neff_tolerance": float(waveguide_mode_monitor.get("neff tolerance", 0.3)),
+                    "waveguide_neff_tolerance": float(waveguide_port.get("neff tolerance", 0.3)),
                     "fiber_port_name": fiber_port_name,
                     "fiber_source_mode": "auto local TE",
                     "fiber_polarization": "local TE",
                     "fiber_axis_orientation_deg": float(fiber_port.get("angle phi", 0.0)),
                     "fiber_mode_candidates": [1, 2, 3],
                     "fiber_geometry_name": str(fiber_geometry.get("name", "fiber")),
-                    "fiber_input_measurement_port_name": str(fiber_measurement_port.get("name", "")),
-                    "fiber_measurement_expansion_result_name": "expansion for port monitor",
-                    "fiber_measurement_mode": "auto local TE",
-                    "fiber_input_monitor_name": None,
+                    "fiber_input_power_monitor_name": str(fiber_input_monitor.get("name", "")),
+                    "fiber_input_power_sign": float(
+                        fiber_input_monitor.get("expected propagation sign", -1.0)
+                    ),
                     "frequency_points": int(configuration.get("frequency_points", 31)),
                 }
 
@@ -8396,41 +8646,29 @@ def generate_lumerical_notebook(
         "        _coupling_db = np.asarray(_grating_data['fiber_coupling_db'])\n"
         "        _waveguide_mode_power = np.asarray(_grating_data['waveguide_mode_power_source_normalized'])\n"
         "        _waveguide_total_power = np.asarray(_grating_data['waveguide_total_power'])\n"
-        "        _fiber_forward = np.asarray(_grating_data['fiber_forward_power'])\n"
-        "        _fiber_reflected = np.asarray(_grating_data['fiber_reflected_power'])\n"
-        "        _fiber_net = np.asarray(_grating_data['fiber_net_power'])\n"
-        "        _fiber_net_signed = np.asarray(_grating_data['fiber_net_power_signed'])\n"
+        "        _fiber_input_power = np.asarray(_grating_data['fiber_input_power'])\n"
+        "        _waveguide_total_transmission = np.asarray(_grating_data['waveguide_total_transmission'])\n"
+        "        _waveguide_total_transmission_db = np.asarray(_grating_data['waveguide_total_transmission_db'])\n"
         "        _selected_neff = float(np.asarray(_grating_data['waveguide_selected_neff']).ravel()[0])\n"
         "        _selected_mode_number = int(np.asarray(_grating_data['waveguide_selected_mode_number']).ravel()[0])\n"
         "        _target_nm = float(np.asarray(_grating_data['target_wavelength_m']).ravel()[0]) * 1e9\n"
         "    _local_response_png = PIRIS_RESULTS_DIR / 'grating_response.png'\n"
         "    _target_index = int(np.argmin(np.abs(_wavelength_nm - _target_nm)))\n"
         "    print('Target wavelength: %.3f nm' % _wavelength_nm[_target_index])\n"
-        "    print('Passive tilted fiber port — power toward grating |T_in|: %.8g' % _fiber_forward[_target_index])\n"
-        "    print('Passive tilted fiber port — reflected power toward source |T_out|: %.8g' % _fiber_reflected[_target_index])\n"
-        "    print('Passive tilted fiber port — physical net |T_in| - |T_out|: %.8g' % _fiber_net[_target_index])\n"
-        "    print('Passive tilted fiber port — raw signed Tnet diagnostic: %.8g' % _fiber_net_signed[_target_index])\n"
-        "    print('Source-normalized waveguide total power: %.8g' % _waveguide_total_power[_target_index])\n"
+        "    print('Measured fiber input power: %.8g' % _fiber_input_power[_target_index])\n"
+        "    print('Waveguide total power: %.8g' % _waveguide_total_power[_target_index])\n"
         "    print('Selected waveguide mode: %d, neff %.8g' % (_selected_mode_number, _selected_neff))\n"
         "    print('Source-normalized selected waveguide-mode power: %.8g' % _waveguide_mode_power[_target_index])\n"
-        "    print('Incident-normalized waveguide coupling efficiency (linear): %.8g' % _coupling_linear[_target_index])\n"
-        "    print('Incident-normalized waveguide coupling efficiency (dB): %.6f dB' % _coupling_db[_target_index])\n"
-        "    _figure = plt.figure(figsize=(13.0, 8.2))\n"
-        "    _grid = _figure.add_gridspec(2, 2, height_ratios=(1.0, 1.05))\n"
-        "    _fiber_axis = _figure.add_subplot(_grid[0, :])\n"
-        "    _waveguide_axis = _figure.add_subplot(_grid[1, 0], sharex=_fiber_axis)\n"
-        "    _waveguide_db_axis = _figure.add_subplot(_grid[1, 1], sharex=_fiber_axis)\n"
-        "    _fiber_axis.plot(_wavelength_nm, _fiber_forward, lw=2.2, color='#059669', label='power toward grating, |T_in|')\n"
-        "    _fiber_axis.plot(_wavelength_nm, _fiber_reflected, lw=2.0, color='#dc2626', label='reflected power toward source, |T_out|')\n"
-        "    _fiber_axis.plot(_wavelength_nm, _fiber_net, lw=2.0, color='#0284c7', label='net power toward grating, |T_in| - |T_out|')\n"
-        "    _fiber_axis.set(ylabel='source-normalized linear power', title='Passive tilted fiber-port power accounting')\n"
-        "    _waveguide_axis.plot(_wavelength_nm, _coupling_linear, lw=2.6, color='#7c3aed', label='waveguide CE / measured forward fiber power')\n"
-        "    _waveguide_axis.plot(_wavelength_nm, _waveguide_mode_power, lw=1.8, ls='--', color='#4f46e5', label='waveguide mode power / selected source')\n"
-        "    _waveguide_axis.plot(_wavelength_nm, _waveguide_total_power, lw=1.8, ls=':', color='#f59e0b', label='waveguide total power / selected source')\n"
-        "    _waveguide_axis.set(xlabel='wavelength [nm]', ylabel='linear power or efficiency', title='Waveguide coupling — linear')\n"
-        "    _waveguide_db_axis.plot(_wavelength_nm, _coupling_db, lw=2.6, color='#7c3aed', label='waveguide CE [dB]')\n"
-        "    _waveguide_db_axis.set(xlabel='wavelength [nm]', ylabel='coupling efficiency [dB]', title='Waveguide coupling — dB')\n"
-        "    for _axis in (_fiber_axis, _waveguide_axis, _waveguide_db_axis):\n"
+        "    print('Selected-TE / measured input (linear): %.8g' % _coupling_linear[_target_index])\n"
+        "    print('Total waveguide / measured input (linear): %.8g' % _waveguide_total_transmission[_target_index])\n"
+        "    _figure, (_waveguide_axis, _waveguide_db_axis) = plt.subplots(1, 2, figsize=(13.0, 4.9), sharex=True)\n"
+        "    _waveguide_axis.plot(_wavelength_nm, _coupling_linear, lw=2.6, color='#7c3aed', label='selected TE / measured fiber input')\n"
+        "    _waveguide_axis.plot(_wavelength_nm, _waveguide_total_transmission, lw=2.2, color='#f59e0b', label='total waveguide power / measured fiber input')\n"
+        "    _waveguide_axis.set(xlabel='wavelength [nm]', ylabel='normalized linear power', title='Waveguide transmission — linear')\n"
+        "    _waveguide_db_axis.plot(_wavelength_nm, _coupling_db, lw=2.6, color='#7c3aed', label='selected TE / input')\n"
+        "    _waveguide_db_axis.plot(_wavelength_nm, _waveguide_total_transmission_db, lw=2.2, color='#f59e0b', label='total / input')\n"
+        "    _waveguide_db_axis.set(xlabel='wavelength [nm]', ylabel='normalized power [dB]', title='Waveguide transmission — dB')\n"
+        "    for _axis in (_waveguide_axis, _waveguide_db_axis):\n"
         "        _axis.axvline(_target_nm, color='#64748b', ls='--', lw=1.0)\n"
         "        _axis.grid(alpha=0.3)\n"
         "        _axis.legend(loc='best')\n"
@@ -8486,7 +8724,7 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
 - A conformal cladding row is a continuous full-domain gap-fill volume: it fills every etched opening and covers every waveguide/grating polygon, flare, terminal arc, and extension. Lower mesh-order device material wins wherever the volumes overlap.
 - The FDTD boundary keeps at least λ/4 clearance from ordinary device features. Background films may extend through their PMLs, but ports never create additional waveguide-to-PML geometry; only the polygons exported from the layout are simulated.
 - `LiNbO3` is created as a frequency- and temperature-dependent anisotropic sampled material using the Zelmon/Moretti model and the selected X/Y/Z crystal cut.
-- Grating-coupler exports solve the first three fiber modes, identify the near-degenerate Gaussian/circular HE11 pair closest to the fiber index, and excite only its verified local-TE member (Ey for an unrotated grating). The passive tilted fiber port independently verifies that same physical polarization and reports its power toward the grating (`|T_in|`), reflected power toward the source (`|T_out|`), physical net (`|T_in| - |T_out|`), and raw signed `Tnet` diagnostic. Orthogonal-polarization power is not added to the normalization. The reported coupling efficiency is the source-normalized selected waveguide-mode power divided by the selected-polarization forward power measured at that passive fiber port; source-normalized waveguide mode and total powers remain available separately. Power traces remain linear, while coupling efficiency is plotted side by side in both linear and dB units.
+- Grating-coupler exports contain exactly two modal ports: the active tilted fiber source and the passive access-waveguide receiver. The first three fiber modes are solved and the rotation-aware local-TE member of the near-degenerate HE11 pair is excited. A separate Z-normal power monitor below the source measures incident power with explicit signed-flux correction; it is not a port. The waveguide receiver selects the fundamental TE mode using the stack-derived effective-index check, while a nearby power monitor measures total waveguide flux. Both selected-TE and total-waveguide spectra are normalized to the measured fiber input and plotted in linear and dB units.
 - A 1×2 MMI export launches mode 1 from its input port, measures input power 2 µm before the input taper, plots both output powers relative to that measured input, and plots the normalized longitudinal |E|² distribution through the complete MMI.
 - GPU and CPU modes are selectable through `SETTINGS['resource_mode']`; GPU is the default for every 3D export.
 - The first cell exposes run, diagnostic-preview, and GPU-system-check switches. Project saving is mandatory: one inspection FSP is written before the solve and one solved/best FSP is written afterward.
@@ -8518,7 +8756,7 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
             _notebook_cell("code", final_fsp_cell),
             *(
                 [
-                    _notebook_cell("markdown", "## 10 · Grating coupling efficiency\n\nThe upper tilted fiber port is the only source. A second passive port on the same fiber axis measures forward, reflected and net modal power below it. The coupling-efficiency curve is the selected waveguide-mode power normalized by that measured forward fiber power; source-normalized waveguide powers are retained separately. Power accounting is linear, and coupling efficiency is displayed side by side in linear and dB units.\n"),
+                    _notebook_cell("markdown", "## 10 · Grating coupling efficiency\n\nThe tilted fiber FDTD port is the only source. A non-modal Z-normal power monitor below it measures the actual incident power. The passive waveguide FDTD port reports fundamental-TE power, and a nearby power monitor reports total waveguide power. Both output spectra are divided by the measured fiber input and displayed in linear and dB units.\n"),
                     _notebook_cell("code", grating_analysis_cell),
                 ]
                 if grating_analysis

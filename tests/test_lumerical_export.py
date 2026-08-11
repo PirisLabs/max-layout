@@ -193,7 +193,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn('("pitch", "Pitch", "um")', save_source)
         self.assertIn('("fiber_offset", "Fiber offset", "um")', save_source)
         self.assertIn('("angle_theta", "Fiber angle theta", "deg")', save_source)
-        self.assertIn('("fiber_power_monitor_below_source_um", "Fiber power-plane distance below source", "um")', save_source)
+        self.assertIn('("fiber_power_monitor_below_source_um", "Horizontal fiber-input monitor distance below source", "um")', save_source)
         self.assertIn('("mmi_length", "MMI length", "um")', save_source)
         self.assertIn('("taper_power", "MMI taper profile exponent", "")', save_source)
         self.assertIn('("input_reference_before_taper_um", "Input power-reference distance before taper", "um")', save_source)
@@ -313,13 +313,24 @@ class LumericalExportTests(unittest.TestCase):
             }
             exec(lumerical._SWEEP_RUNTIME_REMOTE, namespace)
             wavelength_m = np.asarray([1.25e-6, 1.30e-6, 1.35e-6])
+            def grating_details(response):
+                response = np.asarray(response, dtype=float)
+                return {
+                    "fiber_input_power": np.ones(response.size),
+                    "waveguide_mode_power": response,
+                    "waveguide_total_power": response + 0.05,
+                    "waveguide_total_transmission": response + 0.05,
+                }
+
+            first_response = np.asarray([0.20, 0.60, 0.25])
+            second_response = np.asarray([0.70, 0.55, 0.40])
             namespace["_save_sweep_case"](
                 0, "coupling_efficiency", wavelength_m,
-                np.asarray([0.20, 0.60, 0.25]), {},
+                first_response, grating_details(first_response),
             )
             namespace["_save_sweep_case"](
                 1, "coupling_efficiency", wavelength_m,
-                np.asarray([0.70, 0.55, 0.40]), {},
+                second_response, grating_details(second_response),
             )
             namespace["_finalize_sweep_results"]([])
             summary = (Path(temporary_directory) / "summary.txt").read_text(
@@ -354,7 +365,10 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("- Waveguide length: 5 um", summary)
         self.assertIn("- Fiber offset: 4.8 um", summary)
         self.assertIn("- Fiber angle theta: 7 deg", summary)
-        self.assertIn("- Fiber power-plane distance below source: 0.1 um", summary)
+        self.assertIn(
+            "- Horizontal fiber-input monitor distance below source: 0.1 um",
+            summary,
+        )
         self.assertNotIn("Waveguide target effective index", summary)
         self.assertNotIn('"waveguide_effective_index"', summary)
         self.assertIn("- Waveguide eigensolver modes searched: 20", summary)
@@ -417,25 +431,31 @@ class LumericalExportTests(unittest.TestCase):
 
         grating = factory.make_component("Grating coupler", 0.0, 0.0)
         generic_companions = factory.automatic_simulation_companions(grating)
-        generic_waveguide_planes = [
+        generic_power = next(
             item for item in generic_companions
-            if item.get("grating_monitor_role") in {"waveguide_total_power", "waveguide_mode_expansion"}
-        ]
-        self.assertEqual(
-            [item["params"]["y span"] for item in generic_waveguide_planes],
-            [3.0, 3.0],
+            if item.get("grating_monitor_role") == "waveguide_total_power"
         )
+        generic_receiver = next(
+            item for item in generic_companions
+            if item["kind"] == "FDTD port"
+            and item.get("simulation_parent_port") == "waveguide_point"
+        )
+        self.assertEqual(generic_power["params"]["y span"], 3.0)
+        self.assertEqual(generic_receiver["params"]["span_um"], 3.0)
 
         soi = factory.make_component("GC-SOI", 0.0, 0.0)
         soi_companions = factory.automatic_simulation_companions(soi)
-        soi_waveguide_planes = [
+        soi_power = next(
             item for item in soi_companions
-            if item.get("grating_monitor_role") in {"waveguide_total_power", "waveguide_mode_expansion"}
-        ]
-        self.assertEqual(
-            [item["params"]["y span"] for item in soi_waveguide_planes],
-            [2.5, 2.5],
+            if item.get("grating_monitor_role") == "waveguide_total_power"
         )
+        soi_receiver = next(
+            item for item in soi_companions
+            if item["kind"] == "FDTD port"
+            and item.get("simulation_parent_port") == "waveguide_point"
+        )
+        self.assertEqual(soi_power["params"]["y span"], 2.5)
+        self.assertEqual(soi_receiver["params"]["span_um"], 2.5)
 
     def test_apodized_grating_rejects_scalar_fill_sweep_and_preserves_pitch_sweep(self) -> None:
         original = component("GC-SOI")
@@ -926,41 +946,42 @@ class LumericalExportTests(unittest.TestCase):
             if item["kind"] in {"FDTD port", "Fiber-axis FDTD port"}
         }
         self.assertEqual(orders["fiber_source"], 1)
-        self.assertEqual(orders["fiber_input_power"], 2)
-        self.assertNotIn("waveguide_point", orders)
-        diagnostic_port = next(
+        self.assertEqual(orders["waveguide_point"], 2)
+        self.assertNotIn("fiber_input_power", orders)
+        input_power_monitor = next(
             item for item in companions
-            if item["kind"] == "Fiber-axis FDTD port"
+            if item["kind"] == "Power monitor"
             and item.get("simulation_parent_port") == "fiber_input_power"
         )
-        self.assertEqual(diagnostic_port["params"]["plane normal"], "Z")
-        self.assertTrue(diagnostic_port["params"]["align to fiber axis"])
-        self.assertEqual(diagnostic_port["params"]["fiber plane role"], "input power measurement")
-        self.assertEqual(diagnostic_port["params"]["mode number"], 0)
-        self.assertEqual(diagnostic_port["params"]["polarization"], "local TE")
+        self.assertEqual(input_power_monitor["params"]["plane normal"], "Z")
+        self.assertTrue(input_power_monitor["params"]["align to fiber axis"])
         self.assertEqual(
-            diagnostic_port["params"]["candidate mode numbers"], [1, 2, 3]
+            input_power_monitor["params"]["fiber plane role"],
+            "input power measurement",
         )
+        self.assertEqual(input_power_monitor["params"]["expected propagation sign"], -1.0)
+        self.assertNotIn("mode number", input_power_monitor["params"])
+        self.assertNotIn("polarization", input_power_monitor["params"])
         waveguide_power = next(
             item for item in companions
             if item["kind"] == "Power monitor"
             and item.get("grating_monitor_role") == "waveguide_total_power"
         )
-        waveguide_mode = next(
+        waveguide_receiver = next(
             item for item in companions
-            if item["kind"] == "Mode expansion monitor"
-            and item.get("grating_monitor_role") == "waveguide_mode_expansion"
+            if item["kind"] == "FDTD port"
+            and item.get("simulation_parent_port") == "waveguide_point"
         )
         self.assertEqual(waveguide_power["params"]["y span"], 2.5)
-        self.assertEqual(waveguide_mode["params"]["y span"], 2.5)
-        self.assertEqual(waveguide_mode["params"]["mode"], "fundamental mode")
-        self.assertEqual(waveguide_mode["params"]["target neff"], 0.0)
+        self.assertEqual(waveguide_receiver["params"]["span_um"], 2.5)
+        self.assertEqual(waveguide_receiver["params"]["mode"], "fundamental TE mode")
+        self.assertEqual(waveguide_receiver["params"]["target neff"], 0.0)
         self.assertEqual(
-            waveguide_mode["params"]["target neff strategy"],
+            waveguide_receiver["params"]["target neff strategy"],
             "automatic material-index midpoint",
         )
-        self.assertEqual(waveguide_mode["params"]["mode search count"], 20)
-        self.assertEqual(waveguide_power["x"] - waveguide_mode["x"], 1.0)
+        self.assertEqual(waveguide_receiver["params"]["mode search count"], 20)
+        self.assertEqual(waveguide_power["x"] - waveguide_receiver["x"], 1.0)
         fiber_source_component = next(
             item for item in companions
             if item["kind"] == "Fiber-axis FDTD port"
@@ -984,14 +1005,22 @@ class LumericalExportTests(unittest.TestCase):
         monitors = assignment_value(notebook, "MONITORS")
         fiber = fibers[0]
         source = next(port for port in ports if port["name"].endswith("fiber_axis"))
-        measurement = next(port for port in ports if port["name"].endswith("fiber_input_power"))
+        receiver = next(port for port in ports if port["name"].endswith("waveguide_point"))
+        measurement = next(
+            monitor for monitor in monitors
+            if monitor["name"].endswith("fiber_input_power")
+        )
         self.assertEqual(len(ports), 2)
         self.assertEqual(source["name"], "uid_1_fiber_axis")
+        self.assertEqual(receiver["name"], "uid_1_waveguide_point")
+        self.assertEqual(receiver["mode"], "fundamental TE mode")
         self.assertEqual(measurement["fiber plane role"], "input power measurement")
-        self.assertEqual(measurement["dir"], "Backward")
-        self.assertFalse(any(monitor["name"].endswith("fiber_input_power") for monitor in monitors))
+        self.assertEqual(measurement["monitor_kind"], "Power monitor")
+        self.assertEqual(measurement["plane normal"], "Z")
+        self.assertEqual(measurement["expected propagation sign"], -1.0)
+        self.assertFalse(any(port["name"].endswith("fiber_input_power") for port in ports))
         self.assertTrue(any(monitor["name"].endswith("waveguide_total_power") for monitor in monitors))
-        self.assertTrue(any(monitor["name"].endswith("waveguide_mode") for monitor in monitors))
+        self.assertFalse(any(monitor.get("monitor_kind") == "Mode expansion monitor" for monitor in monitors))
         self.assertEqual(fiber["z reference"], "center of SiO2 cladding")
         self.assertAlmostEqual(
             source["center"][0] - fiber["center"][0],
@@ -1107,73 +1136,43 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(defaults["mode degeneracy tolerance"], 0.01)
         self.assertEqual(defaults["minimum local TE fraction"], 0.8)
 
-    def test_passive_fiber_plane_reuses_and_verifies_source_ey_winner(self) -> None:
-        import ast
+    def test_fiber_input_plane_is_nonmodal_power_monitor(self) -> None:
+        from max_layout.ui.window import NativeLayoutWindow
 
-        helper_names = {
-            "_mode_profile_vector",
-            "_fiber_local_te_score",
-            "_select_fiber_local_te_mode",
-            "_reuse_verified_fiber_local_te_mode",
-        }
-        build_tree = ast.parse(lumerical._BUILD_CELL)
-        helper_nodes = [
-            node for node in build_tree.body
-            if isinstance(node, ast.FunctionDef) and node.name in helper_names
-        ]
-        self.assertEqual({node.name for node in helper_nodes}, helper_names)
-        namespace = {"np": np}
-        exec(
-            compile(
-                ast.fix_missing_locations(
-                    ast.Module(body=helper_nodes, type_ignores=[])
-                ),
-                "<passive-fiber-mode-reuse>",
-                "exec",
-            ),
-            namespace,
-        )
+        class Factory:
+            make_component = NativeLayoutWindow.make_component
+            automatic_simulation_companions = (
+                NativeLayoutWindow.automatic_simulation_companions
+            )
 
-        ey_mode = np.zeros((3, 4, 3), dtype=complex)
-        ey_mode[..., 1] = 1.0
-
-        class FakeFdtd:
             def __init__(self) -> None:
-                self.mode_updates = []
+                self.components = []
+                self.next_uid = 1
 
-            def select(self, _path):
-                return None
-
-            def updateportmodes(self, modes):
-                self.mode_updates.append(np.asarray(modes, dtype=int).tolist())
-
-            def getresult(self, _path, result_name):
-                if result_name == "mode profiles":
-                    return {"E2": ey_mode}
-                raise AssertionError(result_name)
-
-        fake_fdtd = FakeFdtd()
-        selection = namespace["_reuse_verified_fiber_local_te_mode"](
-            fake_fdtd,
-            "FDTD::ports::fiber_measurement",
-            {
-                "name": "fiber_measurement",
-                "angle phi": 0.0,
-                "candidate mode numbers": [1, 2],
-                "minimum local TE fraction": 0.8,
-            },
-            {
-                "mode number": 2,
-                "selected mode order": [1, 2],
-                "candidate mode numbers": [1, 2],
-                "local TE scores": {"1": 0.0, "2": 1.0},
-            },
+        factory = Factory()
+        grating = factory.make_component("Grating coupler", 0.0, 0.0)
+        factory.components.append(grating)
+        companions = factory.automatic_simulation_companions(grating)
+        fiber_ports = [
+            item for item in companions if item["kind"] == "Fiber-axis FDTD port"
+        ]
+        input_monitors = [
+            item for item in companions
+            if item["kind"] == "Power monitor"
+            and item.get("simulation_parent_port") == "fiber_input_power"
+        ]
+        self.assertEqual(len(fiber_ports), 1)
+        self.assertEqual(len(input_monitors), 1)
+        self.assertEqual(fiber_ports[0]["params"]["fiber plane role"], "source")
+        self.assertEqual(
+            input_monitors[0]["params"]["fiber plane role"],
+            "input power measurement",
         )
-        self.assertEqual(fake_fdtd.mode_updates, [2])
-        self.assertEqual(selection["mode number"], 2)
-        self.assertEqual(selection["selected mode order"], [2])
-        self.assertTrue(selection["inherited from source mode"])
-        self.assertAlmostEqual(selection["local TE scores"]["2"], 1.0)
+        self.assertEqual(input_monitors[0]["params"]["plane normal"], "Z")
+        self.assertEqual(input_monitors[0]["params"]["expected propagation sign"], -1.0)
+        self.assertNotIn("mode number", input_monitors[0]["params"])
+        self.assertNotIn("candidate mode numbers", input_monitors[0]["params"])
+        self.assertIn('fdtd.set("output power", True)', lumerical._BUILD_CELL)
 
     def test_sweep_fiber_fallback_reselects_pair_and_reaches_multigpu_worker(self) -> None:
         import ast
@@ -1933,7 +1932,16 @@ class LumericalExportTests(unittest.TestCase):
             wavelength = np.asarray([1.50e-6, 1.55e-6, 1.60e-6])
             response = np.asarray([0.2, 0.4, 0.3])
             namespace["_save_sweep_case"](
-                0, "coupling_efficiency", wavelength, response, {}
+                0,
+                "coupling_efficiency",
+                wavelength,
+                response,
+                {
+                    "fiber_input_power": np.ones(response.size),
+                    "waveguide_mode_power": response,
+                    "waveguide_total_power": response + 0.05,
+                    "waveguide_total_transmission": response + 0.05,
+                },
             )
             self.assertTrue(namespace["_sweep_case_is_complete"](0))
             original_fingerprint = namespace["SWEEP_CODE_FINGERPRINT"]
@@ -1963,29 +1971,20 @@ class LumericalExportTests(unittest.TestCase):
 
             def getresult(self, path, result_name=None):
                 self.calls.append((str(path), result_name))
+                if str(path) == "uid_1_fiber_input_power" and result_name == "T":
+                    return {"lambda": wavelength_m, "T": -np.ones(3)}
                 if str(path) == "uid_1_waveguide_total_power" and result_name == "T":
-                    return {"lambda": wavelength_m, "T": np.asarray([0.7, 0.8, 0.75])}
-                if str(path) == "uid_1_waveguide_mode":
-                    if result_name is None:
-                        return "expansion for waveguide_power"
+                    return {"lambda": wavelength_m, "T": -np.asarray([0.7, 0.8, 0.75])}
+                if str(path) in {
+                    "FDTD::ports::uid_1_waveguide_receiver",
+                    "::model::FDTD::ports::uid_1_waveguide_receiver",
+                }:
                     if result_name == "expansion for waveguide_power":
                         return {
                             "lambda": wavelength_m,
-                            "Tbackward": np.asarray([0.30, 0.40, 0.35]),
+                            "T_out": np.asarray([0.30, 0.40, 0.35]),
                         }
                     raise RuntimeError("Can not find result %r" % result_name)
-                if (
-                    str(path) in {
-                        "FDTD::ports::uid_1_fiber_input_power",
-                        "::model::FDTD::ports::uid_1_fiber_input_power",
-                    }
-                    and result_name == "expansion for port monitor"
-                ):
-                    return {
-                        "lambda": wavelength_m,
-                        "T_in": np.ones(3),
-                        "T_out": np.asarray([0.01, 0.02, 0.01]),
-                    }
                 raise RuntimeError("Can not find result %r" % result_name)
 
         with TemporaryDirectory() as temporary_directory:
@@ -2000,14 +1999,19 @@ class LumericalExportTests(unittest.TestCase):
                 "MONITORS": [],
                 "MMI_ANALYSIS": None,
                 "GRATING_ANALYSIS": {
+                    "fiber_input_power_monitor_name": "uid_1_fiber_input_power",
+                    "fiber_input_power_sign": -1.0,
                     "waveguide_power_monitor_name": "uid_1_waveguide_total_power",
-                    "waveguide_mode_monitor_name": "uid_1_waveguide_mode",
-                    "waveguide_expansion_result_name": "waveguide_power",
-                    "waveguide_modal_direction": "Tbackward",
-                    "fiber_input_measurement_port_name": "uid_1_fiber_input_power",
-                    "fiber_measurement_expansion_result_name": "expansion for port monitor",
-                    "fiber_measurement_mode_number": 1,
-                    "fiber_measurement_selected_mode_order": [1],
+                    "waveguide_total_power_sign": -1.0,
+                    "waveguide_port_name": "uid_1_waveguide_receiver",
+                    "waveguide_port_expansion_result_name": "expansion for waveguide_power",
+                    "waveguide_port_modal_direction": "T_out",
+                },
+                "SWEEP_PORT_MODE_SELECTIONS": {
+                    "uid_1_waveguide_receiver": {
+                        "mode number": 1,
+                        "selected mode order": [1],
+                    }
                 },
                 "fdtd": fake_fdtd,
             }
@@ -2021,7 +2025,10 @@ class LumericalExportTests(unittest.TestCase):
         np.testing.assert_allclose(response, [0.30, 0.40, 0.35])
         np.testing.assert_allclose(arrays["waveguide_mode_power"], response)
         self.assertIn(
-            ("uid_1_waveguide_mode", "expansion for waveguide_power"),
+            (
+                "FDTD::ports::uid_1_waveguide_receiver",
+                "expansion for waveguide_power",
+            ),
             fake_fdtd.calls,
         )
 
@@ -2035,29 +2042,20 @@ class LumericalExportTests(unittest.TestCase):
             def getresult(self, path, result_name=None):
                 path = str(path)
                 self.calls.append((path, result_name))
+                if path == "uid_1_fiber_input_power" and result_name == "T":
+                    return {"lambda": wavelength_m, "T": np.asarray([-0.5, -1.0])}
                 if path == "uid_1_waveguide_total_power" and result_name == "T":
-                    return {"lambda": wavelength_m, "T": np.asarray([0.8, 0.8])}
-                if path == "uid_1_waveguide_mode":
-                    if result_name is None:
-                        return "T\nexpansion for uid_1_waveguide_mode\nmode profiles"
-                    if result_name == "expansion for uid_1_waveguide_mode":
+                    return {"lambda": wavelength_m, "T": np.asarray([-0.4, -0.8])}
+                if path in {
+                    "FDTD::ports::uid_1_waveguide_receiver",
+                    "::model::FDTD::ports::uid_1_waveguide_receiver",
+                }:
+                    if result_name == "expansion for port monitor":
                         return {
                             "lambda": wavelength_m,
-                            "Tbackward": np.asarray([0.25, 0.50]),
+                            "T_out": np.asarray([0.25, 0.50]),
                         }
                     raise RuntimeError("Can not find result %r" % result_name)
-                if (
-                    path in {
-                        "FDTD::ports::uid_1_fiber_input_power",
-                        "::model::FDTD::ports::uid_1_fiber_input_power",
-                    }
-                    and result_name == "expansion for port monitor"
-                ):
-                    return {
-                        "lambda": wavelength_m,
-                        "T_in": np.asarray([0.5, 1.0]),
-                        "T_out": np.zeros(2),
-                    }
                 raise RuntimeError("Can not find result %r" % result_name)
 
         with TemporaryDirectory() as temporary_directory:
@@ -2072,13 +2070,21 @@ class LumericalExportTests(unittest.TestCase):
                 "MONITORS": [],
                 "MMI_ANALYSIS": None,
                 "GRATING_ANALYSIS": {
+                    "fiber_input_power_monitor_name": "uid_1_fiber_input_power",
+                    "fiber_input_power_sign": -1.0,
                     "waveguide_power_monitor_name": "uid_1_waveguide_total_power",
-                    "waveguide_mode_monitor_name": "uid_1_waveguide_mode",
-                    "waveguide_expansion_result_name": "waveguide_power",
-                    "waveguide_modal_direction": "Tbackward",
-                    "fiber_input_measurement_port_name": "uid_1_fiber_input_power",
-                    "fiber_measurement_mode_number": 1,
-                    "fiber_measurement_selected_mode_order": [1],
+                    "waveguide_total_power_sign": -1.0,
+                    "waveguide_port_name": "uid_1_waveguide_receiver",
+                    # The requested logical result is unavailable, so the
+                    # runtime must fall back to the standard port result.
+                    "waveguide_port_expansion_result_name": "missing logical result",
+                    "waveguide_port_modal_direction": "T_out",
+                },
+                "SWEEP_PORT_MODE_SELECTIONS": {
+                    "uid_1_waveguide_receiver": {
+                        "mode number": 1,
+                        "selected mode order": [1],
+                    }
                 },
                 "fdtd": fake_fdtd,
             }
@@ -2087,9 +2093,11 @@ class LumericalExportTests(unittest.TestCase):
 
         self.assertEqual(primary_name, "coupling_efficiency")
         np.testing.assert_allclose(response, [0.5, 0.5])
-        self.assertIn(("uid_1_waveguide_mode", None), fake_fdtd.calls)
         self.assertIn(
-            ("uid_1_waveguide_mode", "expansion for uid_1_waveguide_mode"),
+            (
+                "FDTD::ports::uid_1_waveguide_receiver",
+                "expansion for port monitor",
+            ),
             fake_fdtd.calls,
         )
 
@@ -2099,37 +2107,23 @@ class LumericalExportTests(unittest.TestCase):
         class FakeFDTD:
             def getresult(self, path, result_name=None):
                 path = str(path)
+                if path == "uid_1_fiber_input_power" and result_name == "T":
+                    return {"lambda": wavelength_m, "T": -np.ones(3)}
                 if path == "uid_1_waveguide_total_power" and result_name == "T":
-                    return {"lambda": wavelength_m, "T": np.asarray([0.31, 0.41, 0.36])}
-                if path == "uid_1_waveguide_mode":
-                    if result_name is None:
-                        return "expansion for waveguide_power"
-                    if result_name == "expansion for waveguide_power":
-                        return {
-                            "lambda": wavelength_m,
-                            "Tbackward": np.asarray([0.30, 0.40, 0.35]),
-                        }
-                if (
-                    path in {
-                        "FDTD::ports::uid_1_fiber_input_power",
-                        "::model::FDTD::ports::uid_1_fiber_input_power",
-                    }
-                    and result_name == "expansion for port monitor"
-                ):
+                    return {"lambda": wavelength_m, "T": -np.asarray([0.31, 0.41, 0.36])}
+                if path in {
+                    "FDTD::ports::uid_1_waveguide_receiver",
+                    "::model::FDTD::ports::uid_1_waveguide_receiver",
+                } and result_name == "expansion for port monitor":
                     return {
                         "lambda": wavelength_m,
                         "n": np.asarray([1, 2]),
-                        # Mode 1 is Ex and nearly dark. Mode 2 is the verified
-                        # Ey/local-TE receiver mode and carries the source.
-                        "T_in": np.asarray([
-                            [1e-5, 1.0],
-                            [1e-5, 1.0],
-                            [1e-5, 1.0],
-                        ]),
+                        # Mode 1 is the wrong polarization; mode 2 is the
+                        # verified local-TE waveguide receiver mode.
                         "T_out": np.asarray([
-                            [0.0, 0.01],
-                            [0.0, 0.02],
-                            [0.0, 0.01],
+                            [1e-5, 0.30],
+                            [1e-5, 0.40],
+                            [1e-5, 0.35],
                         ]),
                     }
                 raise RuntimeError("Can not find result %r" % result_name)
@@ -2145,14 +2139,19 @@ class LumericalExportTests(unittest.TestCase):
                 "MONITORS": [],
                 "MMI_ANALYSIS": None,
                 "GRATING_ANALYSIS": {
+                    "fiber_input_power_monitor_name": "uid_1_fiber_input_power",
+                    "fiber_input_power_sign": -1.0,
                     "waveguide_power_monitor_name": "uid_1_waveguide_total_power",
-                    "waveguide_mode_monitor_name": "uid_1_waveguide_mode",
-                    "waveguide_expansion_result_name": "waveguide_power",
-                    "waveguide_modal_direction": "Tbackward",
-                    "fiber_input_measurement_port_name": "uid_1_fiber_input_power",
-                    "fiber_measurement_expansion_result_name": "expansion for port monitor",
-                    "fiber_measurement_mode_number": 2,
-                    "fiber_measurement_selected_mode_order": [2, 1],
+                    "waveguide_total_power_sign": -1.0,
+                    "waveguide_port_name": "uid_1_waveguide_receiver",
+                    "waveguide_port_expansion_result_name": "expansion for port monitor",
+                    "waveguide_port_modal_direction": "T_out",
+                },
+                "SWEEP_PORT_MODE_SELECTIONS": {
+                    "uid_1_waveguide_receiver": {
+                        "mode number": 2,
+                        "selected mode order": [2, 1],
+                    }
                 },
                 "fdtd": FakeFDTD(),
             }
@@ -2161,8 +2160,8 @@ class LumericalExportTests(unittest.TestCase):
 
         self.assertEqual(primary_name, "coupling_efficiency")
         np.testing.assert_allclose(response, [0.30, 0.40, 0.35])
-        np.testing.assert_allclose(arrays["fiber_forward_power"], 1.0)
-        np.testing.assert_allclose(arrays["fiber_reflected_power"], [0.01, 0.02, 0.01])
+        np.testing.assert_allclose(arrays["fiber_input_power"], 1.0)
+        np.testing.assert_allclose(arrays["waveguide_mode_power"], response)
 
     def test_single_grating_analysis_extracts_verified_ey_mode_by_n_coordinate(self) -> None:
         import ast
@@ -2269,10 +2268,10 @@ class LumericalExportTests(unittest.TestCase):
         class FakeFDTD:
             def getresult(self, path, result_name=None):
                 path = str(path)
+                if path == "uid_1_fiber_input_power" and result_name == "T":
+                    return {"lambda": wavelength_m, "T": -np.ones(2)}
                 if path == "uid_1_waveguide_total_power" and result_name == "T":
-                    return {"lambda": wavelength_m, "T": np.ones(2)}
-                if path == "uid_1_waveguide_mode" and result_name is None:
-                    return "T\nneff\nmode profiles"
+                    return {"lambda": wavelength_m, "T": -np.ones(2)}
                 raise RuntimeError("Can not find result %r" % result_name)
 
         with TemporaryDirectory() as temporary_directory:
@@ -2286,11 +2285,19 @@ class LumericalExportTests(unittest.TestCase):
                 "MONITORS": [],
                 "MMI_ANALYSIS": None,
                 "GRATING_ANALYSIS": {
+                    "fiber_input_power_monitor_name": "uid_1_fiber_input_power",
+                    "fiber_input_power_sign": -1.0,
                     "waveguide_power_monitor_name": "uid_1_waveguide_total_power",
-                    "waveguide_mode_monitor_name": "uid_1_waveguide_mode",
-                    "waveguide_expansion_result_name": "waveguide_power",
-                    "waveguide_modal_direction": "Tbackward",
-                    "fiber_input_measurement_port_name": "uid_1_fiber_input_power",
+                    "waveguide_total_power_sign": -1.0,
+                    "waveguide_port_name": "uid_1_waveguide_receiver",
+                    "waveguide_port_expansion_result_name": "waveguide_power",
+                    "waveguide_port_modal_direction": "T_out",
+                },
+                "SWEEP_PORT_MODE_SELECTIONS": {
+                    "uid_1_waveguide_receiver": {
+                        "mode number": 1,
+                        "selected mode order": [1],
+                    }
                 },
                 "fdtd": FakeFDTD(),
             }
@@ -2300,10 +2307,8 @@ class LumericalExportTests(unittest.TestCase):
 
         message = str(caught.exception)
         self.assertIn("waveguide_power", message)
-        self.assertIn("Available", message)
-        self.assertIn("T", message)
-        self.assertIn("neff", message)
-        self.assertIn("mode profiles", message)
+        self.assertIn("port expansion", message)
+        self.assertIn("expansion for port monitor", message)
 
     def test_mmi_sweep_normalizes_each_output_branch_to_measured_input(self) -> None:
         wavelength_m = np.asarray([1.50e-6, 1.55e-6, 1.60e-6])
@@ -2684,7 +2689,7 @@ class LumericalExportTests(unittest.TestCase):
             runtime_source = cell_source_containing(notebook, "REMOTE_SWEEP_RUNTIME")
             self.assertIn('return "output_1_over_input"', runtime_source)
             self.assertIn('"output_2_over_input": output_2_over_input', runtime_source)
-            self.assertIn("SWEEP_CHECKPOINT_SCHEMA = 5", runtime_source)
+            self.assertIn("SWEEP_CHECKPOINT_SCHEMA = 6", runtime_source)
             self.assertIn('"code_fingerprint"', runtime_source)
             self.assertIn('"mmi_width": ("MMI width", "um")', runtime_source)
             self.assertIn('"mmi_length": ("MMI length", "um")', runtime_source)
@@ -2959,24 +2964,27 @@ class LumericalExportTests(unittest.TestCase):
         fiber_geometries = assignment_value(notebook, "FIBER_GEOMETRIES")
         self.assertEqual(len(ports), 2)
         self.assertFalse(any(port.get("auto_generated_for_grating") for port in ports))
-        self.assertEqual(len(fiber_ports), 2)
+        self.assertEqual(len(fiber_ports), 1)
         self.assertEqual(len(fiber_geometries), 1)
         source_port = next(port for port in fiber_ports if port["name"] == "fiber_out")
-        input_port = next(port for port in fiber_ports if port["name"] == "fiber_input_power")
+        input_monitor = next(
+            monitor for monitor in monitors
+            if monitor["name"] == "fiber_input_power"
+        )
         self.assertEqual(source_port["angle theta"], fiber_geometries[0]["angle theta"])
         self.assertAlmostEqual(
             source_port["center"][0] - fiber_geometries[0]["center"][0],
             np.tan(np.deg2rad(10.0)),
         )
         self.assertAlmostEqual(
-            input_port["center"][0] - fiber_geometries[0]["center"][0],
+            input_monitor["center"][0] - fiber_geometries[0]["center"][0],
             0.9 * np.tan(np.deg2rad(10.0)),
         )
-        self.assertEqual(input_port["fiber plane role"], "passive fiber measurement")
-        self.assertEqual(input_port["mode number"], 0)
-        self.assertEqual(input_port["polarization"], "local TE")
-        self.assertEqual(input_port["candidate mode numbers"], [1, 2, 3])
-        self.assertFalse(any(monitor["name"] == "fiber_input_power" for monitor in monitors))
+        self.assertEqual(input_monitor["fiber plane role"], "input power measurement")
+        self.assertEqual(input_monitor["monitor_kind"], "Power monitor")
+        self.assertNotIn("mode number", input_monitor)
+        self.assertNotIn("polarization", input_monitor)
+        self.assertNotIn("candidate mode numbers", input_monitor)
         self.assertAlmostEqual(
             source_port["rotation offset_um"],
             4.0 * fiber_geometries[0]["core diameter_um"] * np.tan(np.deg2rad(10.0)),
@@ -3073,13 +3081,20 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("GRATING_ANALYSIS =", payload)
         analysis = assignment_value(notebook, "GRATING_ANALYSIS")
         self.assertEqual(analysis["waveguide_power_monitor_name"], "waveguide_total_power")
-        self.assertEqual(analysis["waveguide_mode_monitor_name"], "waveguide_mode")
+        self.assertEqual(analysis["waveguide_port_name"], "uid_1_waveguide_point")
+        self.assertEqual(
+            analysis["waveguide_port_expansion_result_name"],
+            "expansion for port monitor",
+        )
         self.assertEqual(analysis["waveguide_target_neff"], 0.0)
-        self.assertEqual(analysis["waveguide_modal_direction"], "Tbackward")
+        self.assertEqual(analysis["waveguide_port_modal_direction"], "T_out")
         self.assertEqual(analysis["fiber_port_name"], "fiber_out")
-        self.assertEqual(analysis["fiber_input_measurement_port_name"], "fiber_input_power")
-        self.assertEqual(analysis["fiber_measurement_expansion_result_name"], "expansion for port monitor")
-        self.assertIsNone(analysis["fiber_input_monitor_name"])
+        self.assertEqual(
+            analysis["fiber_input_power_monitor_name"], "fiber_input_power"
+        )
+        self.assertEqual(analysis["fiber_input_power_sign"], -1.0)
+        self.assertNotIn("fiber_input_measurement_port_name", analysis)
+        self.assertNotIn("fiber_measurement_expansion_result_name", analysis)
         self.assertEqual(analysis["fiber_source_mode"], "auto local TE")
         self.assertEqual(analysis["fiber_polarization"], "local TE")
         self.assertEqual(analysis["fiber_mode_candidates"], [1, 2, 3])
@@ -3130,54 +3145,37 @@ class LumericalExportTests(unittest.TestCase):
         self.assertNotIn("farfieldux", analysis_source)
         self.assertNotIn("farfielduy", analysis_source)
         self.assertIn("grating_response.png", analysis_source)
-        self.assertIn("Passive tilted fiber port — power toward grating |T_in|", analysis_source)
-        self.assertIn("Passive tilted fiber-port power accounting", analysis_source)
-        self.assertIn("Source-normalized waveguide total power", analysis_source)
-        self.assertIn("Source-normalized selected waveguide-mode power", analysis_source)
-        self.assertIn("_waveguide_total_power", analysis_source)
-        self.assertIn("_waveguide_mode_power", analysis_source)
-        self.assertIn("_fiber_forward", analysis_source)
-        self.assertIn("_fiber_reflected", analysis_source)
-        self.assertIn("_fiber_net", analysis_source)
-        self.assertIn("_fiber_net_signed", analysis_source)
-        self.assertIn(
-            "fiber_net_power = fiber_forward_power - fiber_reflected_power",
-            analysis_source,
-        )
-        self.assertIn('"fiber_net_power_signed": fiber_net_power_signed', analysis_source)
-        self.assertIn("physical net |T_in| - |T_out|", analysis_source)
-        self.assertIn("raw signed Tnet diagnostic", analysis_source)
-        self.assertIn("passive tilted fiber port", analysis_source.lower())
+        self.assertIn("fiber_input_monitor_name", analysis_source)
+        self.assertIn('fdtd.getresult(fiber_input_monitor_name, "T")', analysis_source)
+        self.assertIn("fiber_input_sign * fiber_input_signed_raw", analysis_source)
+        self.assertIn("waveguide_mode_power / np.maximum", analysis_source)
+        self.assertIn("waveguide_total_power / np.maximum", analysis_source)
+        self.assertIn("no cos(theta) correction", analysis_source)
+        self.assertNotIn("passive tilted fiber port", analysis_source.lower())
         self.assertNotIn("grating_field_distribution.png", analysis_source)
         self.assertNotIn("field_intensity_normalized", analysis_source)
-        self.assertIn('waveguide_power_data = fdtd.getresult(waveguide_power_monitor_name, "T")', analysis_source)
-        self.assertIn('expansion_data = fdtd.getresult(waveguide_mode_monitor_name, expansion_result_name)', analysis_source)
-        self.assertIn('modal_direction_key = str(GRATING_ANALYSIS.get("waveguide_modal_direction", "Tbackward"))', analysis_source)
-        self.assertIn('_fiber_port_expansion(', analysis_source)
-        self.assertIn('_find_result_key(fiber_expansion, "T_in", "Tin", "T in")', analysis_source)
         self.assertIn(
-            "fiber_expansion, fiber_forward_key, magnitude=True",
+            'waveguide_power_data = fdtd.getresult(waveguide_power_monitor_name, "T")',
+            analysis_source,
+        )
+        self.assertIn("_port_expansion(", analysis_source)
+        self.assertIn(
+            'GRATING_ANALYSIS.get("waveguide_port_modal_direction", "T_out")',
             analysis_source,
         )
         self.assertIn(
-            "fiber_expansion, fiber_reflected_key, magnitude=True",
+            "fiber_coupling = waveguide_mode_power / np.maximum",
             analysis_source,
         )
-        self.assertIn(
-            "fiber_expansion, fiber_net_key, magnitude=False",
-            analysis_source,
-        )
-        self.assertIn("fiber_coupling = waveguide_mode_power_source_normalized / np.maximum", analysis_source)
         self.assertNotIn("np.abs(scattering) ** 2", analysis_source)
         self.assertIn("fiber_coupling", analysis_source)
         self.assertIn("fiber_coupling_db", analysis_source)
         self.assertIn("10.0 * np.log10", analysis_source)
-        self.assertIn("coupling efficiency [dB]", analysis_source)
-        self.assertIn("_grid[1, 0]", analysis_source)
-        self.assertIn("_grid[1, 1]", analysis_source)
-        self.assertIn("Incident-normalized waveguide coupling efficiency (linear)", analysis_source)
-        self.assertIn("Incident-normalized waveguide coupling efficiency (dB)", analysis_source)
-        self.assertIn("source-normalized linear power", analysis_source)
+        self.assertIn("normalized power [dB]", analysis_source)
+        self.assertIn("plt.subplots(1, 2", analysis_source)
+        self.assertIn("Waveguide transmission — linear", analysis_source)
+        self.assertIn("Waveguide transmission — dB", analysis_source)
+        self.assertIn("measured fiber input", analysis_source)
         self.assertIn("lam.fetch(_remote_grating_npz", analysis_source)
         self.assertIn("display(Image(filename=str(_local_response_png)", analysis_source)
         self.assertIn('fdtd.setexpansion(result_name, input_monitor_name)', build_source)
@@ -3621,9 +3619,9 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("edge_fraction > 0.05", preview)
         self.assertIn("PORT_MODE_VALID", preview)
         self.assertIn("not Ey-dominant", preview)
-        self.assertIn('str(GRATING_ANALYSIS["waveguide_mode_monitor_name"])', preview)
-        self.assertIn('"Waveguide fundamental mode"', preview)
-        self.assertIn('WAVEGUIDE_MODE_SELECTIONS.get(object_name, {})', preview)
+        self.assertIn('str(GRATING_ANALYSIS["waveguide_port_name"])', preview)
+        self.assertIn('"Waveguide receiver fundamental mode"', preview)
+        self.assertIn('PORT_MODE_SELECTIONS.get(object_name, {})', preview)
         self.assertIn("lam.show(PORT_MODE_PROFILES_FILE", preview)
         fetch = cell_source_containing(notebook, "REMOTE_ARTIFACTS")
         self.assertIn("port_mode_Ex_Ey.png", fetch)

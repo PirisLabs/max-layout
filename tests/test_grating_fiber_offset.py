@@ -69,7 +69,7 @@ def _fiber_companions(companions: list[dict]) -> tuple[dict, dict, dict]:
     power = next(
         item
         for item in companions
-        if item["kind"] == "Fiber-axis FDTD port"
+        if item["kind"] == "Power monitor"
         and item.get("simulation_parent_port") == "fiber_input_power"
     )
     return fiber, source, power
@@ -250,7 +250,7 @@ class GratingFiberOffsetTests(unittest.TestCase):
                     self.assertEqual(float(item["y"]), old_y)
                     self.assertEqual(float(item["fiber_offset_um"]), 1.5)
 
-    def test_angle_theta_tilts_fiber_source_and_passive_plane_together(self) -> None:
+    def test_angle_theta_tilts_fiber_source_and_power_monitor_together(self) -> None:
         for kind in ("Grating coupler", "GC-SOI"):
             with self.subTest(kind=kind):
                 factory = _Factory()
@@ -301,9 +301,17 @@ class GratingFiberOffsetTests(unittest.TestCase):
                     float(source["params"]["rotation offset_um"]),
                     expected_rotation_offset,
                 )
-                self.assertAlmostEqual(
-                    float(power["params"]["rotation offset_um"]),
-                    expected_rotation_offset,
+                self.assertNotIn("rotation offset_um", power["params"])
+                self.assertEqual(power["kind"], "Power monitor")
+                self.assertEqual(power["params"]["plane normal"], "Z")
+                self.assertEqual(
+                    power["params"]["fiber plane role"],
+                    "input power measurement",
+                )
+                self.assertEqual(power["params"]["expected propagation sign"], -1.0)
+                self.assertGreater(
+                    float(power["params"]["x span"]),
+                    float(source["params"]["span_um"]),
                 )
 
     def test_rotated_offset_moves_only_fiber_axis_companions(self) -> None:
@@ -319,8 +327,11 @@ class GratingFiberOffsetTests(unittest.TestCase):
         waveguide_companions = [
             item
             for item in companions
-            if item.get("grating_monitor_role")
-            in {"waveguide_total_power", "waveguide_mode_expansion"}
+            if item.get("grating_monitor_role") == "waveguide_total_power"
+            or (
+                item.get("kind") == "FDTD port"
+                and item.get("simulation_parent_port") == "waveguide_point"
+            )
         ]
         before = {
             int(item["uid"]): (float(item["x"]), float(item["y"]))
@@ -443,7 +454,26 @@ class GratingFiberOffsetTests(unittest.TestCase):
                     second_centers[name][1] - first_centers[name][1],
                     expected_delta[1],
                 )
-        self.assertEqual(first_monitors, second_monitors)
+        input_monitor_name = next(
+            name for name in first_monitors if name.endswith("fiber_input_power")
+        )
+        waveguide_monitor_name = next(
+            name for name in first_monitors if name.endswith("waveguide_total_power")
+        )
+        self.assertEqual(
+            second_monitors[waveguide_monitor_name],
+            first_monitors[waveguide_monitor_name],
+        )
+        self.assertAlmostEqual(
+            second_monitors[input_monitor_name][0]
+            - first_monitors[input_monitor_name][0],
+            expected_delta[0],
+        )
+        self.assertAlmostEqual(
+            second_monitors[input_monitor_name][1]
+            - first_monitors[input_monitor_name][1],
+            expected_delta[1],
+        )
 
         for case, expected_theta in (
             (first_case, 6.0),
@@ -458,7 +488,7 @@ class GratingFiberOffsetTests(unittest.TestCase):
                 for item in case["ports"]
                 if str(item.get("plane normal", "")).upper() == "Z"
             ]
-            self.assertEqual(len(fiber_ports), 2)
+            self.assertEqual(len(fiber_ports), 1)
             for port in fiber_ports:
                 self.assertEqual(float(port["angle theta"]), expected_theta)
                 bottom = tuple(map(float, port["fiber bottom center_um"]))
@@ -481,6 +511,30 @@ class GratingFiberOffsetTests(unittest.TestCase):
                     * float(fiber["core diameter_um"])
                     * math.tan(math.radians(expected_theta)),
                 )
+            input_monitors = [
+                item
+                for item in case["monitors"]
+                if item.get("fiber plane role") == "input power measurement"
+            ]
+            self.assertEqual(len(input_monitors), 1)
+            input_monitor = input_monitors[0]
+            self.assertEqual(input_monitor["monitor_kind"], "Power monitor")
+            self.assertEqual(input_monitor["plane normal"], "Z")
+            self.assertEqual(float(input_monitor["angle theta"]), expected_theta)
+            self.assertEqual(float(input_monitor["expected propagation sign"]), -1.0)
+            self.assertNotIn("rotation offset_um", input_monitor)
+            bottom = tuple(map(float, input_monitor["fiber bottom center_um"]))
+            height = float(input_monitor["fiber axis height_um"])
+            phi = math.radians(float(input_monitor["angle phi"]))
+            expected_lateral = height * math.tan(math.radians(expected_theta))
+            self.assertAlmostEqual(
+                float(input_monitor["center"][0]),
+                bottom[0] + expected_lateral * math.cos(phi),
+            )
+            self.assertAlmostEqual(
+                float(input_monitor["center"][1]),
+                bottom[1] + expected_lateral * math.sin(phi),
+            )
 
         first_pose_ports = centers_by_name(first_case, "ports")
         third_pose_ports = centers_by_name(third_case, "ports")
@@ -556,9 +610,21 @@ class GratingFiberOffsetTests(unittest.TestCase):
                     for port in exported["ports"]
                     if str(port.get("plane normal", "")).upper() == "Z"
                 ]
-                self.assertEqual(len(fiber_ports), 2)
+                self.assertEqual(len(fiber_ports), 1)
                 self.assertTrue(
                     all(float(port["angle theta"]) == theta for port in fiber_ports)
+                )
+                input_monitors = [
+                    monitor
+                    for monitor in exported["monitors"]
+                    if monitor.get("fiber plane role") == "input power measurement"
+                ]
+                self.assertEqual(len(input_monitors), 1)
+                self.assertEqual(input_monitors[0]["monitor_kind"], "Power monitor")
+                self.assertEqual(input_monitors[0]["plane normal"], "Z")
+                self.assertEqual(float(input_monitors[0]["angle theta"]), theta)
+                self.assertEqual(
+                    float(input_monitors[0]["expected propagation sign"]), -1.0
                 )
 
     def test_fiber_pose_is_labeled_and_available_to_sweeps(self) -> None:

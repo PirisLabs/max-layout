@@ -2024,39 +2024,6 @@ class NativeLayoutWindow(QMainWindow):
                 )
                 companions.append(total_power)
 
-                expansion = self.make_component(
-                    "Mode expansion monitor", float(center[0]), float(center[1])
-                )
-                expansion["orientation_deg"] = outward
-                expansion["auto_placed"] = True
-                expansion["simulation_parent_uid"] = int(component["uid"])
-                expansion["simulation_parent_port"] = port_name
-                expansion["grating_monitor_role"] = "waveguide_mode_expansion"
-                expansion["waveguide_end_offset_um"] = port_offset_um
-                expansion["params"].update(
-                    {
-                        "name": f"uid_{int(component['uid'])}_waveguide_mode",
-                        "monitor geometry": "surface",
-                        "plane normal": "X",
-                        "distance_um": 0.0,
-                        "x span": 0.0,
-                        "y span": monitor_span_um,
-                        "z span": 2.25,
-                        # Zero is the automatic sentinel.  The notebook replaces
-                        # it with the midpoint derived from the dispersive core
-                        # and adjacent stack materials at the center wavelength.
-                        "mode": "fundamental mode",
-                        "target neff": 0.0,
-                        "target neff strategy": "automatic material-index midpoint",
-                        "neff tolerance": max(0.0, float(grating_params.get("waveguide_neff_tolerance", 0.3))),
-                        "mode search count": max(1, int(grating_params.get("waveguide_mode_search_count", 20))),
-                        "expansion for": power_name,
-                        "expansion result name": "waveguide_power",
-                    }
-                )
-                companions.append(expansion)
-                continue
-
             placed = self.make_component("FDTD port", float(center[0]), float(center[1]))
             placed["orientation_deg"] = outward
             placed["auto_placed"] = True
@@ -2085,6 +2052,21 @@ class NativeLayoutWindow(QMainWindow):
                         "target neff strategy": "automatic material-index midpoint",
                         "neff tolerance": mmi_neff_tolerance,
                         "mode search count": mmi_mode_search_count,
+                    }
+                )
+            elif kind in {"Grating coupler", "GC-SOI"} and port_name == "waveguide_point":
+                placed["params"].update(
+                    {
+                        "mode": "fundamental TE mode",
+                        "polarization": "local TE",
+                        "target neff": 0.0,
+                        "target neff strategy": "automatic material-index midpoint",
+                        "neff tolerance": max(
+                            0.0, float(component_params.get("waveguide_neff_tolerance", 0.3))
+                        ),
+                        "mode search count": max(
+                            1, int(component_params.get("waveguide_mode_search_count", 20))
+                        ),
                     }
                 )
             next_order += 1
@@ -2246,11 +2228,11 @@ class NativeLayoutWindow(QMainWindow):
                     )
             companions.append(fiber_port)
 
-            # A second, passive Fiber-axis FDTD port measures the power that
-            # leaves the source and propagates down the tilted fiber.  Native
-            # power monitors are axis-aligned, so they cannot provide the
-            # required plane normal.  The analysis selects only the port whose
-            # fiber-plane role is ``source`` for injection.
+            # A non-modal Z-normal power monitor measures the actual incident
+            # flux below the tilted source.  Lumerical DFT monitors cannot be
+            # rotated; the monitor is centered on the tilted fiber-axis
+            # intersection and made wide enough to capture its full projected
+            # beam.  Its signed T is negative for the downward (-Z) source.
             monitor_below_source_um = max(
                 0.001,
                 float(grating_params.get("fiber_power_monitor_below_source_um", 0.1)),
@@ -2261,11 +2243,12 @@ class NativeLayoutWindow(QMainWindow):
             measurement_lateral_um = monitor_below_source_um * math.tan(
                 math.radians(fiber_angle_deg)
             )
+            projected_monitor_span_um = float(
+                fiber_port["params"].get("span_um", 20.0)
+            ) / max(math.cos(math.radians(fiber_angle_deg)), 1e-3)
             fiber_power_x = fiber_port_x - measurement_lateral_um * math.cos(measurement_phi_rad)
             fiber_power_y = fiber_port_y - measurement_lateral_um * math.sin(measurement_phi_rad)
-            fiber_power = self.make_component(
-                "Fiber-axis FDTD port", fiber_power_x, fiber_power_y
-            )
+            fiber_power = self.make_component("Power monitor", fiber_power_x, fiber_power_y)
             fiber_power["orientation_deg"] = float(component.get("orientation_deg", 0.0))
             fiber_power["auto_placed"] = True
             fiber_power["simulation_parent_uid"] = int(component["uid"])
@@ -2274,33 +2257,18 @@ class NativeLayoutWindow(QMainWindow):
             fiber_power["params"].update(
                 {
                     "name": f"uid_{int(component['uid'])}_fiber_input_power",
-                    "order": automatic_order_base + 1,
-                    "dir": str(fiber_port["params"].get("dir", "Backward")),
                     "fiber plane role": "input power measurement",
-                    "port geometry": "surface",
+                    "monitor geometry": "surface",
                     "plane normal": "Z",
                     "z reference": fiber_port["params"]["z reference"],
                     "distance_um": port_distance_um - monitor_below_source_um,
-                    "span_um": float(fiber_port["params"].get("span_um", 20.0)),
-                    "z_span_um": 0.0,
-                    "mode": str(fiber_port["params"].get("mode", "user select")),
-                    "mode number": int(fiber_port["params"].get("mode number", 0)),
-                    "polarization": str(fiber_port["params"].get("polarization", "local TE")),
-                    "candidate mode numbers": list(
-                        fiber_port["params"].get("candidate mode numbers", [1, 2, 3])
-                    ),
-                    "mode degeneracy tolerance": float(
-                        fiber_port["params"].get("mode degeneracy tolerance", 0.01)
-                    ),
-                    "minimum local TE fraction": float(
-                        fiber_port["params"].get("minimum local TE fraction", 0.8)
-                    ),
-                    # The grating parent's angle_theta is the only authority;
-                    # source, passive plane, and fiber geometry move together.
+                    "x span": projected_monitor_span_um,
+                    "y span": projected_monitor_span_um,
+                    "z span": 0.0,
                     "angle theta": fiber_angle_deg,
                     "angle phi": float(fiber_port["params"].get("angle phi", 0.0)),
                     "align to fiber axis": True,
-                    "rotation offset_um": float(fiber_port["params"].get("rotation offset_um", 0.0)),
+                    "expected propagation sign": -1.0,
                 }
             )
             companions.append(fiber_power)
@@ -2320,56 +2288,97 @@ class NativeLayoutWindow(QMainWindow):
             grating_params = component.get("params", {})
             monitor_span_um = automatic_waveguide_port_span_um(component, "waveguide_point")
             waveguide_power_name = f"uid_{parent_uid}_waveguide_total_power"
-            # Older projects used a waveguide-side FDTD port. Convert it to a
-            # mode-expansion monitor so the tilted fiber remains the only port/source.
+            # Restore the passive waveguide receiver in projects created
+            # during the temporary mode-expansion-only implementation.
             for candidate in companions:
                 if (
-                    candidate.get("kind") == "FDTD port"
+                    candidate.get("kind") == "Mode expansion monitor"
                     and candidate.get("simulation_parent_port") == "waveguide_point"
                 ):
-                    converted = safe_json_copy(DEFAULT_COMPONENT_VALUES["Mode expansion monitor"])
+                    old = candidate.get("params", {})
+                    converted = safe_json_copy(DEFAULT_COMPONENT_VALUES["FDTD port"])
                     converted.update(
                         {
-                            "name": f"uid_{parent_uid}_waveguide_mode",
-                            "monitor geometry": "surface",
+                            "name": f"uid_{parent_uid}_waveguide_point",
                             "plane normal": "X",
                             "distance_um": 0.0,
-                            "x span": 0.0,
-                            "y span": monitor_span_um,
-                            "z span": 2.25,
-                            "mode": "fundamental mode",
+                            "span_um": monitor_span_um,
+                            "z_span_um": float(old.get("z span", 2.25)),
+                            "mode": "fundamental TE mode",
+                            "polarization": "local TE",
                             "target neff": 0.0,
                             "target neff strategy": "automatic material-index midpoint",
                             "neff tolerance": max(0.0, float(grating_params.get("waveguide_neff_tolerance", 0.3))),
                             "mode search count": max(1, int(grating_params.get("waveguide_mode_search_count", 20))),
-                            "expansion for": waveguide_power_name,
-                            "expansion result name": "waveguide_power",
+                            "order": 2,
                         }
                     )
-                    candidate["kind"] = "Mode expansion monitor"
-                    candidate["grating_monitor_role"] = "waveguide_mode_expansion"
+                    candidate["kind"] = "FDTD port"
+                    candidate.pop("grating_monitor_role", None)
                     candidate["params"] = converted
+            has_waveguide_receiver = any(
+                candidate.get("kind") == "FDTD port"
+                and candidate.get("simulation_parent_port") == "waveguide_point"
+                for candidate in companions
+            )
+            if not has_waveguide_receiver:
+                global_waveguide = component_global_ports(component).get("waveguide_point")
+                if global_waveguide is not None:
+                    outward = float(global_waveguide["outward_orientation_deg"]) % 360.0
+                    center_x, center_y = map(float, global_waveguide["center"])
+                    clearance_um = max(
+                        0.0,
+                        float(grating_params.get("fdtd_port_offset_from_waveguide_end_um", 2.0)),
+                    )
+                    inward = math.radians(outward + 180.0)
+                    receiver = self.make_component(
+                        "FDTD port",
+                        center_x + clearance_um * math.cos(inward),
+                        center_y + clearance_um * math.sin(inward),
+                    )
+                    receiver["orientation_deg"] = outward
+                    receiver["auto_placed"] = True
+                    receiver["simulation_parent_uid"] = parent_uid
+                    receiver["simulation_parent_port"] = "waveguide_point"
+                    receiver["params"].update(
+                        {
+                            "name": f"uid_{parent_uid}_waveguide_point",
+                            "order": 2,
+                            "plane normal": "X",
+                            "distance_um": 0.0,
+                            "span_um": monitor_span_um,
+                            "z_span_um": 2.25,
+                            "mode": "fundamental TE mode",
+                            "polarization": "local TE",
+                            "target neff": 0.0,
+                            "target neff strategy": "automatic material-index midpoint",
+                            "neff tolerance": max(0.0, float(grating_params.get("waveguide_neff_tolerance", 0.3))),
+                            "mode search count": max(1, int(grating_params.get("waveguide_mode_search_count", 20))),
+                        }
+                    )
+                    self.components.append(receiver)
+                    companions.append(receiver)
             has_waveguide_power = any(
                 candidate.get("kind") == "Power monitor"
                 and candidate.get("grating_monitor_role") == "waveguide_total_power"
                 for candidate in companions
             )
             if not has_waveguide_power:
-                mode_monitor = next(
+                receiver = next(
                     (
                         candidate for candidate in companions
-                        if candidate.get("kind") == "Mode expansion monitor"
+                        if candidate.get("kind") == "FDTD port"
                         and candidate.get("simulation_parent_port") == "waveguide_point"
                     ),
                     None,
                 )
-                if mode_monitor is not None:
+                if receiver is not None:
                     total_power = self.make_component(
                         "Power monitor",
-                        float(mode_monitor.get("x", 0.0)),
-                        float(mode_monitor.get("y", 0.0)),
+                        float(receiver.get("x", 0.0)),
+                        float(receiver.get("y", 0.0)),
                     )
-                    total_power["orientation_deg"] = float(mode_monitor.get("orientation_deg", 0.0))
+                    total_power["orientation_deg"] = float(receiver.get("orientation_deg", 0.0))
                     total_power["auto_placed"] = True
                     total_power["simulation_parent_uid"] = parent_uid
                     total_power["simulation_parent_port"] = "waveguide_point"
@@ -2387,15 +2396,8 @@ class NativeLayoutWindow(QMainWindow):
                     )
                     self.components.append(total_power)
                     companions.append(total_power)
-            # Migrate the briefly used axis-aligned power monitor to a passive
-            # Fiber-axis FDTD port.  This preserves old project names and Z
-            # locations while making the measurement plane perpendicular to
-            # the tilted fiber.
-            existing_orders = [
-                int(candidate.get("params", {}).get("order", 0))
-                for candidate in companions
-                if candidate.get("kind") in {"FDTD port", "Fiber-axis FDTD port"}
-            ]
+            # Demote any legacy passive fiber port back to the intended
+            # non-modal input-power monitor.
             fiber_source = next(
                 (
                     candidate for candidate in companions
@@ -2407,11 +2409,11 @@ class NativeLayoutWindow(QMainWindow):
             source_params = fiber_source.get("params", {}) if fiber_source is not None else {}
             for candidate in companions:
                 if (
-                    candidate.get("kind") == "Power monitor"
+                    candidate.get("kind") == "Fiber-axis FDTD port"
                     and candidate.get("simulation_parent_port") == "fiber_input_power"
                 ):
                     old = candidate.get("params", {})
-                    converted = safe_json_copy(DEFAULT_COMPONENT_VALUES["Fiber-axis FDTD port"])
+                    converted = safe_json_copy(DEFAULT_COMPONENT_VALUES["Power monitor"])
                     span_um = max(
                         float(old.get("span_um", 0.0)),
                         float(old.get("x span", 0.0)),
@@ -2421,37 +2423,24 @@ class NativeLayoutWindow(QMainWindow):
                     converted.update(
                         {
                             "name": str(old.get("name", f"uid_{parent_uid}_fiber_input_power")),
-                            "order": max(existing_orders + [0]) + 1,
-                            "dir": str(source_params.get("dir", "Backward")),
                             "fiber plane role": "input power measurement",
-                            "port geometry": "surface",
+                            "monitor geometry": "surface",
                             "plane normal": "Z",
                             "z reference": str(old.get("z reference", "top of stack")),
                             "distance_um": float(old.get("distance_um", 0.0)),
-                            "span_um": span_um,
-                            "z_span_um": 0.0,
-                            "mode": str(source_params.get("mode", "user select")),
-                            "mode number": int(source_params.get("mode number", 0)),
-                            "polarization": str(source_params.get("polarization", "local TE")),
-                            "candidate mode numbers": list(
-                                source_params.get("candidate mode numbers", [1, 2, 3])
-                            ),
-                            "mode degeneracy tolerance": float(
-                                source_params.get("mode degeneracy tolerance", 0.01)
-                            ),
-                            "minimum local TE fraction": float(
-                                source_params.get("minimum local TE fraction", 0.8)
-                            ),
+                            "x span": span_um,
+                            "y span": span_um,
+                            "z span": 0.0,
                             "angle theta": grating_angle_theta_deg(component),
                             "angle phi": float(source_params.get("angle phi", old.get("angle phi", 0.0))),
                             "align to fiber axis": True,
-                            "rotation offset_um": float(source_params.get("rotation offset_um", 0.0)),
+                            "expected propagation sign": -1.0,
                         }
                     )
-                    candidate["kind"] = "Fiber-axis FDTD port"
+                    candidate["kind"] = "Power monitor"
                     candidate["params"] = converted
             has_input_power = any(
-                candidate.get("kind") == "Fiber-axis FDTD port"
+                candidate.get("kind") == "Power monitor"
                 and candidate.get("simulation_parent_port") == "fiber_input_power"
                 for candidate in companions
             )
@@ -2469,7 +2458,7 @@ class NativeLayoutWindow(QMainWindow):
                 )
                 lateral_um = below_source_um * math.tan(math.radians(source_theta_deg))
                 fiber_power = self.make_component(
-                    "Fiber-axis FDTD port",
+                    "Power monitor",
                     float(fiber_source.get("x", 0.0)) - lateral_um * math.cos(source_phi_rad),
                     float(fiber_source.get("y", 0.0)) - lateral_um * math.sin(source_phi_rad),
                 )
@@ -2480,31 +2469,18 @@ class NativeLayoutWindow(QMainWindow):
                 fiber_power["params"].update(
                     {
                         "name": f"uid_{parent_uid}_fiber_input_power",
-                        "order": int(source_params.get("order", 1)) + 1,
-                        "dir": str(source_params.get("dir", "Backward")),
                         "fiber plane role": "input power measurement",
-                        "port geometry": "surface",
+                        "monitor geometry": "surface",
                         "plane normal": "Z",
                         "z reference": str(source_params.get("z reference", "top of stack")),
                         "distance_um": float(source_params.get("distance_um", 0.0)) - below_source_um,
-                        "span_um": float(source_params.get("span_um", 20.0)),
-                        "z_span_um": 0.0,
-                        "mode": str(source_params.get("mode", "user select")),
-                        "mode number": int(source_params.get("mode number", 0)),
-                        "polarization": str(source_params.get("polarization", "local TE")),
-                        "candidate mode numbers": list(
-                            source_params.get("candidate mode numbers", [1, 2, 3])
-                        ),
-                        "mode degeneracy tolerance": float(
-                            source_params.get("mode degeneracy tolerance", 0.01)
-                        ),
-                        "minimum local TE fraction": float(
-                            source_params.get("minimum local TE fraction", 0.8)
-                        ),
+                        "x span": float(source_params.get("span_um", 20.0)),
+                        "y span": float(source_params.get("span_um", 20.0)),
+                        "z span": 0.0,
                         "angle theta": source_theta_deg,
                         "angle phi": float(source_params.get("angle phi", 0.0)),
                         "align to fiber axis": True,
-                        "rotation offset_um": float(source_params.get("rotation offset_um", 0.0)),
+                        "expected propagation sign": -1.0,
                     }
                 )
                 self.components.append(fiber_power)
@@ -2545,21 +2521,10 @@ class NativeLayoutWindow(QMainWindow):
                             center_y += before_mode_um * math.sin(inward_angle)
                             port_offset_um += before_mode_um
                             companion.setdefault("params", {}).update(
-                                {"x span": 0.0, "y span": monitor_span_um, "z span": 2.25}
-                            )
-                        elif role == "waveguide_mode_expansion":
-                            companion.setdefault("params", {}).update(
                                 {
                                     "x span": 0.0,
                                     "y span": monitor_span_um,
                                     "z span": 2.25,
-                                    "mode": "fundamental mode",
-                                    "target neff": 0.0,
-                                    "target neff strategy": "automatic material-index midpoint",
-                                    "neff tolerance": max(0.0, float(component.get("params", {}).get("waveguide_neff_tolerance", 0.3))),
-                                    "mode search count": max(1, int(component.get("params", {}).get("waveguide_mode_search_count", 20))),
-                                    "expansion for": f"uid_{parent_uid}_waveguide_total_power",
-                                    "expansion result name": "waveguide_power",
                                 }
                             )
                     elif (
@@ -2646,7 +2611,13 @@ class NativeLayoutWindow(QMainWindow):
                 )
             if (
                 str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"}
-                and companion.get("kind") in {"Fiber geometry", "Fiber-axis FDTD port"}
+                and (
+                    companion.get("kind") in {"Fiber geometry", "Fiber-axis FDTD port"}
+                    or (
+                        companion.get("kind") == "Power monitor"
+                        and companion.get("simulation_parent_port") == "fiber_input_power"
+                    )
+                )
             ):
                 migrate_grating_fiber_offset_parameter(component)
                 params = component.get("params", {})
@@ -2695,98 +2666,65 @@ class NativeLayoutWindow(QMainWindow):
                             }
                         )
                 elif companion.get("kind") == "Fiber-axis FDTD port":
-                    is_measurement = companion.get("simulation_parent_port") == "fiber_input_power"
+                    rotation_offset_um = 4.0 * float(
+                        params.get("fiber_core_diameter_um", 9.0)
+                    ) * math.tan(math.radians(theta_deg))
+                    companion["params"].update(
+                        {
+                            "fiber plane role": "source",
+                            "port geometry": "surface",
+                            "plane normal": "Z",
+                            "z reference": source_z_reference,
+                            "distance_um": source_distance_um,
+                            "span_um": float(companion["params"].get("span_um", 20.0)),
+                            "z_span_um": 0.0,
+                            "angle theta": theta_deg,
+                            "angle phi": float(companion["params"].get("angle phi", 0.0)),
+                            "align to fiber axis": True,
+                            "rotation offset_um": rotation_offset_um,
+                        }
+                    )
+                elif companion.get("kind") == "Power monitor":
                     below_source_um = max(
                         0.001,
                         float(params.get("fiber_power_monitor_below_source_um", 0.1)),
                     )
                     source_port = next(
                         (
-                            item
-                            for item in companions
+                            item for item in companions
                             if item.get("kind") == "Fiber-axis FDTD port"
                             and item.get("simulation_parent_port") != "fiber_input_power"
                         ),
                         None,
                     )
                     source_port_params = source_port.get("params", {}) if source_port is not None else {}
-                    rotation_offset_um = 4.0 * float(
-                        params.get("fiber_core_diameter_um", 9.0)
-                    ) * math.tan(math.radians(theta_deg))
+                    span_um = float(source_port_params.get("span_um", 20.0)) / max(
+                        math.cos(math.radians(theta_deg)), 1e-3
+                    )
                     companion["params"].update(
                         {
-                            "fiber plane role": (
-                                "input power measurement" if is_measurement else "source"
-                            ),
-                            "port geometry": "surface",
+                            "fiber plane role": "input power measurement",
+                            "monitor geometry": "surface",
                             "plane normal": "Z",
                             "z reference": source_z_reference,
-                            "distance_um": (
-                                source_distance_um - below_source_um
-                                if is_measurement else source_distance_um
-                            ),
-                            "span_um": float(
-                                source_port_params.get(
-                                    "span_um", companion["params"].get("span_um", 20.0)
-                                )
-                            ),
-                            "z_span_um": 0.0,
-                            "mode": str(
-                                source_port_params.get(
-                                    "mode", companion["params"].get("mode", "user select")
-                                )
-                            ),
-                            "mode number": int(
-                                source_port_params.get(
-                                    "mode number", companion["params"].get("mode number", 0)
-                                )
-                            ),
-                            "polarization": str(
-                                source_port_params.get(
-                                    "polarization", companion["params"].get("polarization", "local TE")
-                                )
-                            ),
-                            "candidate mode numbers": list(
-                                source_port_params.get(
-                                    "candidate mode numbers",
-                                    companion["params"].get("candidate mode numbers", [1, 2, 3]),
-                                )
-                            ),
-                            "mode degeneracy tolerance": float(
-                                source_port_params.get(
-                                    "mode degeneracy tolerance",
-                                    companion["params"].get("mode degeneracy tolerance", 0.01),
-                                )
-                            ),
-                            "minimum local TE fraction": float(
-                                source_port_params.get(
-                                    "minimum local TE fraction",
-                                    companion["params"].get("minimum local TE fraction", 0.8),
-                                )
-                            ),
+                            "distance_um": source_distance_um - below_source_um,
+                            "x span": span_um,
+                            "y span": span_um,
+                            "z span": 0.0,
                             "angle theta": theta_deg,
                             "angle phi": float(source_port_params.get("angle phi", 0.0)),
                             "align to fiber axis": True,
-                            "rotation offset_um": rotation_offset_um,
+                            "expected propagation sign": -1.0,
                         }
                     )
-                    if is_measurement:
-                        companion["params"]["order"] = int(source_port_params.get("order", 1)) + 1
-                        companion["params"]["dir"] = str(source_port_params.get("dir", "Backward"))
-                        phi_rad = angle + math.radians(
-                            float(source_port_params.get("angle phi", 0.0))
-                        )
-                        lateral_um = below_source_um * math.tan(math.radians(theta_deg))
-                        source_x = float(
-                            source_port.get("x", companion["x"])
-                            if source_port is not None else companion["x"]
-                        )
-                        source_y = float(
-                            source_port.get("y", companion["y"])
-                            if source_port is not None else companion["y"]
-                        )
-                        companion["x"] = source_x - lateral_um * math.cos(phi_rad)
-                        companion["y"] = source_y - lateral_um * math.sin(phi_rad)
+                    phi_rad = angle + math.radians(
+                        float(source_port_params.get("angle phi", 0.0))
+                    )
+                    lateral_um = below_source_um * math.tan(math.radians(theta_deg))
+                    source_x = float(source_port.get("x", companion["x"]) if source_port else companion["x"])
+                    source_y = float(source_port.get("y", companion["y"]) if source_port else companion["y"])
+                    companion["x"] = source_x - lateral_um * math.cos(phi_rad)
+                    companion["y"] = source_y - lateral_um * math.sin(phi_rad)
         return True
 
     def configure_test_block_sweeps(self, component: dict[str, Any]) -> bool:
@@ -3467,10 +3405,10 @@ class NativeLayoutWindow(QMainWindow):
             parameter_label = (
                 "Fiber offset (µm)" if key == "fiber_offset"
                 else "Angle theta (degrees)" if key == "angle_theta"
-                else "Fiber-axis power plane below source (µm)" if key == "fiber_power_monitor_below_source_um"
+                else "Horizontal fiber-input monitor below source (µm)" if key == "fiber_power_monitor_below_source_um"
                 else "Waveguide mode-monitor offset from end (µm)" if key == "fdtd_port_offset_from_waveguide_end_um"
                 else "Waveguide monitor span (µm)" if key == "waveguide_monitor_span_um"
-                else "Total-power monitor before mode plane (µm)" if key == "waveguide_total_power_before_mode_um"
+                else "Total-power monitor before receiver port (µm)" if key == "waveguide_total_power_before_mode_um"
                 else "Allowed effective-index difference" if key == "waveguide_neff_tolerance"
                 else "Waveguide modes to search" if key == "waveguide_mode_search_count"
                 else "Apodized fill factors (one per tooth)" if key == "fill_factors"
