@@ -320,7 +320,7 @@ rather than as colored top planes only. Very thick first/last background layers 
 cropped by the chosen domain and continue through the PML.
 
 Every generated Lumerical notebook manages the complete remote licence
-lifecycle: roam exactly three Shared-Web HPC Packs for a four-hour session,
+lifecycle: roam exactly three Shared-Web HPC Packs for a two-hour session,
 build and run, save and fetch results, close FDTD, release the HPC packs, and
 close the remote session. Remote build, solve, analysis, and save stages are
 checked explicitly so a hidden remote traceback cannot become a misleading

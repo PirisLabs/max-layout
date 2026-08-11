@@ -1382,6 +1382,8 @@ def _rf_license_json(raw, label, require_usage=False):
     value = objects[-1]
     if str(value.get("status", "")).upper() != "SUCCESS":
         raise RuntimeError(label + " failed: " + repr(value))
+    if require_usage and value.get("usage") is None and "no products to display" in str(value.get("message", "")).casefold():
+        value["usage"] = []
     if require_usage and (
         not isinstance(value.get("usage"), list)
         or any(not isinstance(item, dict) for item in value["usage"])
@@ -1392,7 +1394,7 @@ def _rf_license_json(raw, label, require_usage=False):
 def _rf_in_use(label):
     result = subprocess.run(_SSH + [HOST,
         f'{LIC}/LicensingSettings web shared products in-use '
-        '--type roaming --licenseModel "Shared Web" --mode user'],
+        '--type roaming --mode user'],
         capture_output=True, text=True, timeout=180)
     output = (result.stdout + result.stderr).strip()
     if result.returncode != 0:

@@ -1703,7 +1703,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("Lambda.stop_work_processes", inventory_cell)
         self.assertIn('("run_once", "stop_work_processes")', inventory_cell)
         self.assertIn("MULTIGPU_LICENSE_CHECKOUT_REMOTE", orchestration_cell)
-        self.assertIn('"--expires", "PT4H"', inventory_cell)
+        self.assertIn('"--expires", "PT2H"', inventory_cell)
         self.assertIn(
             "_multigpu_run_once_checked(client, MULTIGPU_LICENSE_RELEASE_REMOTE",
             orchestration_cell,
@@ -3446,7 +3446,7 @@ class LumericalExportTests(unittest.TestCase):
         checkout_source = sources[checkout]
         release_source = sources[checkin]
         self.assertIn('max(0, 3 - _existing_count)', checkout_source)
-        self.assertIn('--expires "PT4H"', checkout_source)
+        self.assertIn('--expires "PT2H"', checkout_source)
         self.assertIn('--type roaming --licenseModel "Shared Web" --mode user', checkout_source)
         self.assertIn('--type roaming', release_source)
         self.assertIn('--licenseModel "Shared Web" --mode user', release_source)

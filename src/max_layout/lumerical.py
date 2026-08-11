@@ -1520,6 +1520,8 @@ def _ansys_json_object(raw_output, label):
 def _ansys_in_use(raw_output, label):
     value = _ansys_json_object(raw_output, label)
     usage = value.get("usage")
+    if usage is None and "no products to display" in str(value.get("message", "")).casefold():
+        usage = []
     if not isinstance(usage, list) or any(not isinstance(item, dict) for item in usage):
         raise RuntimeError(label + " returned an invalid usage list: " + repr(value))
     return usage
@@ -1553,7 +1555,7 @@ if r.returncode != 0:
 # 2. Query this host first so rerunning the cell never blindly reserves another 3.
 _in_use_command = (
     f'{LIC}/LicensingSettings web shared products in-use '
-    '--type roaming --licenseModel "Shared Web" --mode user'
+    '--type roaming --mode user'
 )
 _before = subprocess.run(
     _SSH + [HOST, _in_use_command], capture_output=True, text=True, timeout=180
@@ -1563,12 +1565,12 @@ if _before.returncode != 0:
     raise RuntimeError("Pre-check of roaming HPC Packs failed: " + _before_out[-700:])
 _existing_count = _hpc_pack_count(_ansys_in_use(_before_out, "HPC Pack pre-check"), "HPC Pack pre-check")
 
-# 3. Bring the local roaming total to three, with a four-hour expiry.
+# 3. Bring the local roaming total to three, with a two-hour expiry.
 _needed_count = max(0, 3 - _existing_count)
 if _needed_count:
     r = subprocess.run(_SSH + [HOST,
         f'{LIC}/LicensingSettings web shared products checkout '
-        f'--name "{HPC_PACK_NAME}" --count {_needed_count} --expires "PT4H" '
+        f'--name "{HPC_PACK_NAME}" --count {_needed_count} --expires "PT2H" '
         '--type roaming --licenseModel "Shared Web" --mode user'],
         capture_output=True, text=True, timeout=180)
     out = (r.stdout + r.stderr).strip()
@@ -1587,7 +1589,7 @@ if _after.returncode != 0:
 _verified_count = _hpc_pack_count(_ansys_in_use(_after_out, "HPC Pack post-check"), "HPC Pack post-check")
 if _verified_count < 3:
     raise RuntimeError("HPC Pack checkout was not verified: %d of 3 packs are visible" % _verified_count)
-print("HPC Packs: %d roaming packs verified on this host (requested expiry PT4H)" % _verified_count)
+print("HPC Packs: %d roaming packs verified on this host (requested expiry PT2H)" % _verified_count)
 '''
 
 
@@ -8016,6 +8018,8 @@ def _license_json(raw, label, require_usage=False):
     value = objects[-1]
     if str(value.get("status", "")).upper() != "SUCCESS":
         raise RuntimeError(label + " failed: " + repr(value))
+    if require_usage and value.get("usage") is None and "no products to display" in str(value.get("message", "")).casefold():
+        value["usage"] = []
     if require_usage and (
         not isinstance(value.get("usage"), list)
         or any(not isinstance(item, dict) for item in value["usage"])
@@ -8039,7 +8043,7 @@ def _pack_count(value, label):
 def _in_use(label):
     result = subprocess.run(
         [os.path.join(_lic, "LicensingSettings"), "web", "shared", "products", "in-use",
-         "--type", "roaming", "--licenseModel", "Shared Web", "--mode", "user"],
+         "--type", "roaming", "--mode", "user"],
         capture_output=True, text=True, timeout=180,
     )
     output = (result.stdout + result.stderr).strip()
@@ -8069,7 +8073,7 @@ _needed = max(0, 3 - _existing)
 if _needed:
     _checkout = subprocess.run(
         [os.path.join(_lic, "LicensingSettings"), "web", "shared", "products", "checkout",
-         "--name", _hpc_name, "--count", str(_needed), "--expires", "PT4H",
+         "--name", _hpc_name, "--count", str(_needed), "--expires", "PT2H",
          "--type", "roaming", "--licenseModel", "Shared Web", "--mode", "user"],
         capture_output=True, text=True, timeout=180,
     )
@@ -8107,6 +8111,8 @@ def _license_json(raw, label, require_usage=False):
     value = objects[-1]
     if str(value.get("status", "")).upper() != "SUCCESS":
         raise RuntimeError(label + " failed: " + repr(value))
+    if require_usage and value.get("usage") is None and "no products to display" in str(value.get("message", "")).casefold():
+        value["usage"] = []
     if require_usage and (
         not isinstance(value.get("usage"), list)
         or any(not isinstance(item, dict) for item in value["usage"])
@@ -8117,7 +8123,7 @@ def _license_json(raw, label, require_usage=False):
 def _in_use(label):
     result = subprocess.run(
         [os.path.join(_lic, "LicensingSettings"), "web", "shared", "products", "in-use",
-         "--type", "roaming", "--licenseModel", "Shared Web", "--mode", "user"],
+         "--type", "roaming", "--mode", "user"],
         capture_output=True, text=True, timeout=180,
     )
     output = (result.stdout + result.stderr).strip()
@@ -8684,6 +8690,8 @@ def _release_license_json(raw_output, label, require_usage=False):
     value = objects[-1]
     if str(value.get("status", "")).upper() != "SUCCESS":
         raise RuntimeError(label + " failed: " + repr(value))
+    if require_usage and value.get("usage") is None and "no products to display" in str(value.get("message", "")).casefold():
+        value["usage"] = []
     if require_usage and (
         not isinstance(value.get("usage"), list)
         or any(not isinstance(item, dict) for item in value["usage"])
@@ -8695,7 +8703,7 @@ def _release_license_json(raw_output, label, require_usage=False):
 def _release_in_use(label):
     command = (
         f'{LIC}/LicensingSettings web shared products in-use '
-        '--type roaming --licenseModel "Shared Web" --mode user'
+        '--type roaming --mode user'
     )
     result = subprocess.run(
         _SSH + [HOST, command], capture_output=True, text=True, timeout=180
