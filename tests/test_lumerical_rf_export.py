@@ -450,7 +450,7 @@ class LumericalRFExportTests(unittest.TestCase):
                 self.assertLess(fetch, release)
                 self.assertLessEqual(release, close)
 
-                self.assertIn('--count 3 --expires "P1D" --mode user', sources[checkout])
+                self.assertIn('--count 3 --expires "PT4H" --mode user', sources[checkout])
                 self.assertIn("--count 3 --mode user", sources[release])
                 self.assertIn("close()", sources[release])
                 self.assertIn("rf_results.npz", source)

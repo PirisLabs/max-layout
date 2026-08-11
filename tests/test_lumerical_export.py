@@ -355,7 +355,8 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("- Fiber offset: 4.8 um", summary)
         self.assertIn("- Fiber angle theta: 7 deg", summary)
         self.assertIn("- Fiber power-plane distance below source: 0.1 um", summary)
-        self.assertIn("- Waveguide target effective index: 2", summary)
+        self.assertNotIn("Waveguide target effective index", summary)
+        self.assertNotIn('"waveguide_effective_index"', summary)
         self.assertIn("- Waveguide eigensolver modes searched: 20", summary)
         self.assertIn("- Geometry build tolerance: 0.0005 um", summary)
         self.assertIn("Target-best major parameters:\n- Pitch: 0.77 um", summary)
@@ -556,9 +557,9 @@ class LumericalExportTests(unittest.TestCase):
                 [0.317, 0.317],
             )
 
-    def test_grating_platforms_have_distinct_neff_validation_defaults(self) -> None:
-        self.assertEqual(component("Grating coupler")["params"]["waveguide_effective_index"], 2.0)
-        self.assertEqual(component("GC-SOI")["params"]["waveguide_effective_index"], 2.5)
+    def test_grating_and_mmi_neff_targets_are_runtime_derived(self) -> None:
+        for kind in ("Grating coupler", "GC-SOI", "1x2 MMI"):
+            self.assertNotIn("waveguide_effective_index", component(kind)["params"])
 
     def test_standard_tfln_grating_and_stack_defaults(self) -> None:
         params = component("Grating coupler")["params"]
@@ -712,7 +713,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(params["fdtd_port_offset_from_waveguide_end_um"], 2.0)
         self.assertEqual(params["waveguide_monitor_span_um"], 2.5)
         self.assertEqual(params["waveguide_total_power_before_mode_um"], 1.0)
-        self.assertEqual(params["waveguide_effective_index"], 2.5)
+        self.assertNotIn("waveguide_effective_index", params)
         self.assertEqual(params["waveguide_neff_tolerance"], 0.3)
         self.assertEqual(params["waveguide_mode_search_count"], 20)
         polygons, _ = component_geometry_arrays(grating)
@@ -938,7 +939,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(diagnostic_port["params"]["mode number"], 0)
         self.assertEqual(diagnostic_port["params"]["polarization"], "local TE")
         self.assertEqual(
-            diagnostic_port["params"]["candidate mode numbers"], [1, 2]
+            diagnostic_port["params"]["candidate mode numbers"], [1, 2, 3]
         )
         waveguide_power = next(
             item for item in companions
@@ -953,7 +954,11 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(waveguide_power["params"]["y span"], 2.5)
         self.assertEqual(waveguide_mode["params"]["y span"], 2.5)
         self.assertEqual(waveguide_mode["params"]["mode"], "fundamental mode")
-        self.assertEqual(waveguide_mode["params"]["target neff"], 2.5)
+        self.assertEqual(waveguide_mode["params"]["target neff"], 0.0)
+        self.assertEqual(
+            waveguide_mode["params"]["target neff strategy"],
+            "automatic material-index midpoint",
+        )
         self.assertEqual(waveguide_mode["params"]["mode search count"], 20)
         self.assertEqual(waveguide_power["x"] - waveguide_mode["x"], 1.0)
         fiber_source_component = next(
@@ -965,7 +970,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(fiber_source_component["params"]["mode number"], 0)
         self.assertEqual(fiber_source_component["params"]["polarization"], "local TE")
         self.assertEqual(
-            fiber_source_component["params"]["candidate mode numbers"], [1, 2]
+            fiber_source_component["params"]["candidate mode numbers"], [1, 2, 3]
         )
         notebook, _warnings = generate_lumerical_notebook(
             [grating, *companions],
@@ -1003,6 +1008,7 @@ class LumericalExportTests(unittest.TestCase):
         helper_names = {
             "_mode_profile_vector",
             "_fiber_local_te_score",
+            "_fiber_gaussian_circular_scores",
             "_fiber_candidate_neff",
             "_select_fiber_local_te_mode",
         }
@@ -1021,10 +1027,12 @@ class LumericalExportTests(unittest.TestCase):
         )
         select_fiber_mode = namespace["_select_fiber_local_te_mode"]
 
-        ex_mode = np.zeros((3, 4, 3), dtype=complex)
+        high_neff_mode = np.zeros((3, 4, 3), dtype=complex)
         ey_mode = np.zeros((3, 4, 3), dtype=complex)
-        ex_mode[..., 0] = 1.0
+        ex_mode = np.zeros((3, 4, 3), dtype=complex)
+        high_neff_mode[..., 0] = 1.0
         ey_mode[..., 1] = 1.0
+        ex_mode[..., 0] = 1.0
 
         class FakeFdtd:
             def __init__(self) -> None:
@@ -1039,17 +1047,23 @@ class LumericalExportTests(unittest.TestCase):
 
             def getresult(self, _path, result_name):
                 if result_name == "mode profiles":
-                    return {"E1": ex_mode, "E2": ey_mode}
+                    return {"E1": high_neff_mode, "E2": ey_mode, "E3": ex_mode}
                 if result_name == "neff":
                     return {
-                        "neff1": np.asarray([1.447000]),
-                        "neff2": np.asarray([1.447004]),
+                        "lambda": np.linspace(1.50e-6, 1.60e-6, 4),
+                        "n": np.asarray([1, 2, 3]),
+                        "neff": np.asarray([
+                            [1.72, 1.4440, 1.4445],
+                            [1.71, 1.4439, 1.4444],
+                            [1.70, 1.4438, 1.4443],
+                            [1.69, 1.4437, 1.4442],
+                        ]),
                     }
                 raise AssertionError(result_name)
 
         base_port = {
             "name": "fiber_source",
-            "candidate mode numbers": [1, 2],
+            "candidate mode numbers": [1, 2, 3],
             "minimum local TE fraction": 0.8,
             "mode degeneracy tolerance": 0.01,
         }
@@ -1061,12 +1075,13 @@ class LumericalExportTests(unittest.TestCase):
             {**base_port, "angle phi": 0.0},
         )
         self.assertEqual(unrotated["mode number"], 2)
-        self.assertEqual(unrotated["selected mode order"], [1, 2])
+        self.assertEqual(unrotated["degenerate mode pair"], [2, 3])
+        self.assertEqual(unrotated["selected mode order"], [2, 3, 1])
         self.assertEqual(unrotated["target polarization xy"], [0.0, 1.0])
         self.assertAlmostEqual(unrotated["local TE scores"]["1"], 0.0)
         self.assertAlmostEqual(unrotated["local TE scores"]["2"], 1.0)
         self.assertLess(unrotated["neff degeneracy delta"], 0.01)
-        self.assertEqual(unrotated_fdtd.mode_updates, [[1, 2]])
+        self.assertEqual(unrotated_fdtd.mode_updates, [[1, 2, 3]])
 
         rotated_fdtd = FakeFdtd()
         rotated = select_fiber_mode(
@@ -1074,20 +1089,21 @@ class LumericalExportTests(unittest.TestCase):
             "FDTD::ports::fiber_source",
             {**base_port, "angle phi": 90.0},
         )
-        self.assertEqual(rotated["mode number"], 1)
-        self.assertEqual(rotated["selected mode order"], [1, 2])
+        self.assertEqual(rotated["mode number"], 3)
+        self.assertEqual(rotated["degenerate mode pair"], [2, 3])
+        self.assertEqual(rotated["selected mode order"], [3, 2, 1])
         self.assertAlmostEqual(rotated["target polarization xy"][0], -1.0)
         self.assertAlmostEqual(rotated["target polarization xy"][1], 0.0, places=12)
-        self.assertAlmostEqual(rotated["local TE scores"]["1"], 1.0)
+        self.assertAlmostEqual(rotated["local TE scores"]["3"], 1.0)
         self.assertAlmostEqual(rotated["local TE scores"]["2"], 0.0, places=12)
         self.assertLess(rotated["neff degeneracy delta"], 0.01)
-        self.assertEqual(rotated_fdtd.mode_updates, [[1, 2]])
+        self.assertEqual(rotated_fdtd.mode_updates, [[1, 2, 3]])
 
-    def test_fiber_port_export_defaults_request_both_local_te_candidates(self) -> None:
+    def test_fiber_port_export_defaults_request_first_three_local_te_candidates(self) -> None:
         defaults = DEFAULT_COMPONENT_VALUES["Fiber-axis FDTD port"]
         self.assertEqual(defaults["mode number"], 0)
         self.assertEqual(defaults["polarization"], "local TE")
-        self.assertEqual(defaults["candidate mode numbers"], [1, 2])
+        self.assertEqual(defaults["candidate mode numbers"], [1, 2, 3])
         self.assertEqual(defaults["mode degeneracy tolerance"], 0.01)
         self.assertEqual(defaults["minimum local TE fraction"], 0.8)
 
@@ -1164,6 +1180,8 @@ class LumericalExportTests(unittest.TestCase):
 
         helper_names = {
             "_sweep_mode_profile_vector",
+            "_sweep_candidate_neff",
+            "_sweep_gaussian_circular_scores",
             "_sweep_reselect_fiber_local_te",
         }
         sweep_tree = ast.parse(lumerical._SWEEP_RUNTIME_REMOTE)
@@ -1227,13 +1245,79 @@ class LumericalExportTests(unittest.TestCase):
 
         unrotated, unrotated_updates = sweep_selection(0.0)
         self.assertEqual(unrotated["mode number"], 2)
-        self.assertEqual(unrotated["selected mode order"], [1, 2])
+        self.assertEqual(unrotated["selected mode order"], [2, 1])
         self.assertEqual(unrotated_updates, [[1, 2]])
 
         rotated, rotated_updates = sweep_selection(90.0)
         self.assertEqual(rotated["mode number"], 1)
         self.assertEqual(rotated["selected mode order"], [1, 2])
         self.assertEqual(rotated_updates, [[1, 2]])
+
+        # The multi-GPU worker uses this fallback without the seed selector.
+        # Two modes can be equally local-TE, so it must prefer the circular
+        # Gaussian member of the neff-degenerate pair over an elongated field.
+        coordinate = np.linspace(-1.0, 1.0, 25)
+        grid_x, grid_y = np.meshgrid(coordinate, coordinate, indexing="ij")
+        elongated_amplitude = np.exp(
+            -0.25 * ((grid_x / 0.75) ** 2 + (grid_y / 0.13) ** 2)
+        )
+        circular_amplitude = np.exp(
+            -0.25 * ((grid_x / 0.28) ** 2 + (grid_y / 0.28) ** 2)
+        )
+        high_mode = np.zeros((25, 25, 3), dtype=complex)
+        elongated_mode = np.zeros_like(high_mode)
+        circular_mode = np.zeros_like(high_mode)
+        high_mode[..., 0] = circular_amplitude
+        elongated_mode[..., 1] = elongated_amplitude
+        circular_mode[..., 1] = circular_amplitude
+
+        class ThreeModeFdtd(FakeFdtd):
+            def getresult(self, _path, result_name):
+                if result_name == "mode profiles":
+                    return {"E1": high_mode, "E2": elongated_mode, "E3": circular_mode}
+                if result_name == "neff":
+                    return {
+                        "lambda": np.linspace(1.50e-6, 1.60e-6, 4),
+                        "n": np.asarray([1, 2, 3]),
+                        "neff": np.asarray([
+                            [1.70, 1.4440, 1.4445],
+                            [1.69, 1.4439, 1.4444],
+                            [1.68, 1.4438, 1.4443],
+                            [1.67, 1.4437, 1.4442],
+                        ]),
+                    }
+                raise AssertionError(result_name)
+
+        three_mode_fdtd = ThreeModeFdtd()
+        three_mode_namespace = {"np": np, "fdtd": three_mode_fdtd}
+        exec(
+            compile(
+                ast.Module(body=helper_nodes, type_ignores=[]),
+                "<sweep-three-mode-selection>",
+                "exec",
+            ),
+            three_mode_namespace,
+        )
+        selected = three_mode_namespace["_sweep_reselect_fiber_local_te"](
+            "FDTD::ports::fiber_source",
+            {
+                "name": "fiber_source",
+                "angle phi": 0.0,
+                "candidate mode numbers": [1, 2, 3],
+                "fiber target neff": 1.444,
+                "minimum local TE fraction": 0.8,
+                "mode degeneracy tolerance": 0.01,
+            },
+            {"mode number": 2, "candidate mode numbers": [1, 2, 3]},
+        )
+        self.assertEqual(selected["degenerate mode pair"], [2, 3])
+        self.assertEqual(selected["mode number"], 3)
+        self.assertGreater(
+            selected["gaussian scores"]["3"], selected["gaussian scores"]["2"]
+        )
+        self.assertGreater(
+            selected["circularity scores"]["3"], selected["circularity scores"]["2"]
+        )
 
         sweep_cases, spec = soi_sweep_cases()
         notebook, _warnings = lumerical.generate_lumerical_multigpu_sweep_notebook(
@@ -1620,6 +1704,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("Lambda.stop_work_processes", inventory_cell)
         self.assertIn('("run_once", "stop_work_processes")', inventory_cell)
         self.assertIn("MULTIGPU_LICENSE_CHECKOUT_REMOTE", orchestration_cell)
+        self.assertIn('"--expires", "PT4H"', inventory_cell)
         self.assertIn(
             "_multigpu_run_once_checked(client, MULTIGPU_LICENSE_RELEASE_REMOTE",
             orchestration_cell,
@@ -2565,7 +2650,7 @@ class LumericalExportTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     {float(port["target neff"]) for port in remote_case["ports"]},
-                    {2.0},
+                    {0.0},
                 )
                 self.assertEqual(
                     {str(port["polarization"]) for port in remote_case["ports"]},
@@ -2890,7 +2975,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertEqual(input_port["fiber plane role"], "passive fiber measurement")
         self.assertEqual(input_port["mode number"], 0)
         self.assertEqual(input_port["polarization"], "local TE")
-        self.assertEqual(input_port["candidate mode numbers"], [1, 2])
+        self.assertEqual(input_port["candidate mode numbers"], [1, 2, 3])
         self.assertFalse(any(monitor["name"] == "fiber_input_power" for monitor in monitors))
         self.assertAlmostEqual(
             source_port["rotation offset_um"],
@@ -2989,7 +3074,7 @@ class LumericalExportTests(unittest.TestCase):
         analysis = assignment_value(notebook, "GRATING_ANALYSIS")
         self.assertEqual(analysis["waveguide_power_monitor_name"], "waveguide_total_power")
         self.assertEqual(analysis["waveguide_mode_monitor_name"], "waveguide_mode")
-        self.assertEqual(analysis["waveguide_target_neff"], 2.5)
+        self.assertEqual(analysis["waveguide_target_neff"], 0.0)
         self.assertEqual(analysis["waveguide_modal_direction"], "Tbackward")
         self.assertEqual(analysis["fiber_port_name"], "fiber_out")
         self.assertEqual(analysis["fiber_input_measurement_port_name"], "fiber_input_power")
@@ -2997,7 +3082,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIsNone(analysis["fiber_input_monitor_name"])
         self.assertEqual(analysis["fiber_source_mode"], "auto local TE")
         self.assertEqual(analysis["fiber_polarization"], "local TE")
-        self.assertEqual(analysis["fiber_mode_candidates"], [1, 2])
+        self.assertEqual(analysis["fiber_mode_candidates"], [1, 2, 3])
         self.assertEqual(analysis["frequency_points"], 31)
         settings = assignment_value(notebook, "SETTINGS")
         self.assertEqual(settings["resource_mode"], "GPU")
@@ -3359,7 +3444,7 @@ class LumericalExportTests(unittest.TestCase):
 
         checkout_source = sources[checkout]
         release_source = sources[checkin]
-        self.assertIn('--count 3 --expires "P1D" --mode user', checkout_source)
+        self.assertIn('--count 3 --expires "PT4H" --mode user', checkout_source)
         self.assertIn('--count 3 --mode user', release_source)
         self.assertIn("fdtd.close()", release_source)
         self.assertIn("max_layout_results.npz", cell_source_containing(notebook, "REMOTE_RESULTS_SAVER"))
@@ -3415,7 +3500,8 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("REMOTE_INSPECTION_FSP_SAVED = True", all_source)
         self.assertIn("REMOTE_FINAL_FSP_SAVED = True", all_source)
         self.assertIn("lam.fetch(REMOTE_INSPECTION_PROJECT_FILE", all_source)
-        self.assertIn("REMOTE_ARTIFACTS.insert(0, REMOTE_PROJECT_FILE)", all_source)
+        self.assertIn("lam.fetch(REMOTE_PROJECT_FILE", all_source)
+        self.assertNotIn("REMOTE_ARTIFACTS.insert(0, REMOTE_PROJECT_FILE)", all_source)
         self.assertIn("if SHOW_GEOMETRY_PREVIEW:", all_source)
         self.assertIn("if SHOW_PORT_MODE_PREVIEW:", all_source)
         self.assertIn('if bool(SETTINGS.get("run_gpu_system_check", False)):', all_source)

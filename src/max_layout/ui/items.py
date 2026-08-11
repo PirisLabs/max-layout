@@ -39,6 +39,16 @@ _PREVIEW_MAX_VERTICES = max(32, int(os.environ.get("MAX_LAYOUT_PREVIEW_MAX_VERTI
 # raster cache; see ComponentGraphicsItem.apply_cache_mode.
 _DIRECT_PAINT_EXTENT_UM = float(os.environ.get("MAX_LAYOUT_DIRECT_PAINT_EXTENT_UM", "1200"))
 _PREVIEW_MAX_POLYGONS_PER_LAYER = max(100, int(os.environ.get("MAX_LAYOUT_PREVIEW_MAX_POLYGONS_PER_LAYER", "500")))
+_PREVIEW_CACHE_MAX_VERTICES = max(
+    1000, int(os.environ.get("MAX_LAYOUT_PREVIEW_CACHE_MAX_VERTICES", "250000"))
+)
+# Exact preview is the default: the canvas and flattened GDS are derived from
+# identical polygons.  Very large legacy layouts may explicitly opt into the
+# old approximate display behavior through this environment switch; export is
+# full resolution in either mode.
+_APPROXIMATE_PREVIEW = str(os.environ.get("MAX_LAYOUT_APPROXIMATE_PREVIEW", "0")).strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
 
 def clear_preview_caches() -> None:
@@ -117,13 +127,15 @@ def component_preview_cache_key(component: dict[str, Any]) -> str:
     local["orientation_deg"] = 0.0
     local["attachment"] = None
     _canonicalize_component_layers(local)
-    _apply_preview_resolution(local)
+    if _APPROXIMATE_PREVIEW:
+        _apply_preview_resolution(local)
     # Preview geometry is independent of UID and global transform.  Caching it
     # avoids rebuilding identical gdstk cells on every scene refresh.
     cache_payload = {
         "kind": local.get("kind"),
         "mirrored": bool(local.get("mirrored", False)),
         "params": local.get("params", {}),
+        "approximate_preview": _APPROXIMATE_PREVIEW,
     }
     return json.dumps(cache_payload, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -176,7 +188,8 @@ def component_local_polygons(component: dict[str, Any]) -> list[tuple[np.ndarray
     local["orientation_deg"] = 0.0
     local["attachment"] = None
     _canonicalize_component_layers(local)
-    _apply_preview_resolution(local)
+    if _APPROXIMATE_PREVIEW:
+        _apply_preview_resolution(local)
     cache_key = component_preview_cache_key(component)
     cached = _PREVIEW_GEOMETRY_CACHE.get(cache_key)
     if cached is not None:
@@ -205,12 +218,16 @@ def component_local_polygons(component: dict[str, Any]) -> list[tuple[np.ndarray
         result.append((points, layer, datatype))
     if _needs_exact_t_electrode_preview(local):
         result=_union_preview_polygons(result)
-    else:
+    elif _APPROXIMATE_PREVIEW:
         result = _sample_dense_preview_polygons(result)
-    _PREVIEW_GEOMETRY_CACHE[cache_key] = result
-    _PREVIEW_GEOMETRY_CACHE.move_to_end(cache_key)
-    while len(_PREVIEW_GEOMETRY_CACHE) > _PREVIEW_GEOMETRY_CACHE_LIMIT:
-        _PREVIEW_GEOMETRY_CACHE.popitem(last=False)
+    # A single exact test block can contain hundreds of thousands of vertices.
+    # Draw it exactly, but do not retain an unbounded copy in both geometry and
+    # painter-path caches.  Ordinary components still get the fast shared cache.
+    if sum(len(points) for points, _layer, _datatype in result) <= _PREVIEW_CACHE_MAX_VERTICES:
+        _PREVIEW_GEOMETRY_CACHE[cache_key] = result
+        _PREVIEW_GEOMETRY_CACHE.move_to_end(cache_key)
+        while len(_PREVIEW_GEOMETRY_CACHE) > _PREVIEW_GEOMETRY_CACHE_LIMIT:
+            _PREVIEW_GEOMETRY_CACHE.popitem(last=False)
     return result
 
 
@@ -220,14 +237,16 @@ def component_layer_paths(
 ) -> dict[tuple[int, int], QPainterPath]:
     """Return immutable standard Qt paths shared by identical components."""
     cache_key = component_preview_cache_key(component)
-    cached = _PREVIEW_PATH_CACHE.get(cache_key)
-    if cached is not None:
-        _PREVIEW_PATH_CACHE.move_to_end(cache_key)
-        return cached
+    cacheable = sum(len(points) for points, _layer, _datatype in polygons) <= _PREVIEW_CACHE_MAX_VERTICES
+    if cacheable:
+        cached = _PREVIEW_PATH_CACHE.get(cache_key)
+        if cached is not None:
+            _PREVIEW_PATH_CACHE.move_to_end(cache_key)
+            return cached
     layer_paths: dict[tuple[int, int], QPainterPath] = {}
     for points, layer, datatype in polygons:
         preview_points = points
-        if component.get("kind") == "Boolean geometry" and len(points) > 2000:
+        if _APPROXIMATE_PREVIEW and component.get("kind") == "Boolean geometry" and len(points) > 2000:
             stride = max(1, math.ceil(len(points) / 2000))
             preview_points = points[::stride]
         # Every polygon on a layer shares one path, and adjoining sections of a device overlap
@@ -246,10 +265,11 @@ def component_layer_paths(
         path.setFillRule(Qt.FillRule.WindingFill)
         path.addPolygon(polygon)
         path.closeSubpath()
-    _PREVIEW_PATH_CACHE[cache_key] = layer_paths
-    _PREVIEW_PATH_CACHE.move_to_end(cache_key)
-    while len(_PREVIEW_PATH_CACHE) > _PREVIEW_PATH_CACHE_LIMIT:
-        _PREVIEW_PATH_CACHE.popitem(last=False)
+    if cacheable:
+        _PREVIEW_PATH_CACHE[cache_key] = layer_paths
+        _PREVIEW_PATH_CACHE.move_to_end(cache_key)
+        while len(_PREVIEW_PATH_CACHE) > _PREVIEW_PATH_CACHE_LIMIT:
+            _PREVIEW_PATH_CACHE.popitem(last=False)
     return layer_paths
 
 
@@ -919,6 +939,7 @@ class EbeamContainerItem(QGraphicsObject):
         self.group_handle: WriteFieldGroupHandle | None = None
         self._bounds = QRectF()
         self._drag_snapshot: str | None = None
+        self._drag_start_position = QPointF()
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
@@ -980,6 +1001,7 @@ class EbeamContainerItem(QGraphicsObject):
 
     def mousePressEvent(self, event) -> None:
         self._drag_snapshot = self.main_window.snapshot()
+        self._drag_start_position = QPointF(self.pos())
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
@@ -987,5 +1009,9 @@ class EbeamContainerItem(QGraphicsObject):
         self._drag_snapshot = None
         super().mouseReleaseEvent(event)
         if snapshot is not None:
-            self.main_window.commit_interaction_snapshot(snapshot)
+            moved = QLineF(self._drag_start_position, self.pos()).length() > 1e-9
+            if moved:
+                self.main_window.finish_ebeam_group_move(self.uid, snapshot)
+            else:
+                self.main_window.commit_interaction_snapshot(snapshot)
         self.main_window.refresh_project_tree()

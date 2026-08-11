@@ -371,7 +371,7 @@ class LumericalOptimizationTests(unittest.TestCase):
                     sum(bool(port["is_source"]) for port in pose["ports"]), 1
                 )
                 for port in pose["ports"]:
-                    self.assertEqual(port["candidate_mode_numbers"], [1, 2])
+                    self.assertEqual(port["candidate_mode_numbers"], [1, 2, 3])
 
                 source = "\n".join(
                     "".join(cell["source"])

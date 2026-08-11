@@ -140,10 +140,8 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                      # at least twice the physical waveguide width.
                      'waveguide_monitor_span_um': 3.0,
                      'waveguide_total_power_before_mode_um': 1.0,
-                     # TFLN ridge/slab guides are typically near 2.0.  This
-                     # value validates the automatically selected fundamental
-                     # mode; it is not used to force an eigensolver mode.
-                     'waveguide_effective_index': 2.0,
+                     # The solver derives its mode target from the active
+                     # dispersive core and adjacent dielectric indices.
                      'waveguide_neff_tolerance': 0.3,
                      'waveguide_mode_search_count': 20,
                      'layer': 2,
@@ -160,10 +158,7 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
              'input_length': 6.0,
              'input_reference_before_taper_um': 2.0,
              'fdtd_port_clearance_um': 2.0,
-             # All three MMI ports cross the same single-mode access
-             # waveguide.  Use one platform target to validate the input,
-             # upper-output, and lower-output fundamental TE modes.
-             'waveguide_effective_index': 2.0,
+             # All three ports share one stack-derived modal target.
              'waveguide_neff_tolerance': 0.3,
              'waveguide_mode_search_count': 20,
              'output_length': 6.0,
@@ -413,6 +408,7 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                        'primary_axis': 'x',
                        'serpentine': True,
                        'preserve_manual_grid_position': True,
+                       'manual_layout_locked': False,
                        'show_order': True,
                        'outline_width': 1.0,
                        'field_layer': 6,
@@ -797,7 +793,6 @@ DEFAULT_COMPONENT_VALUES["GC-SOI"] = {
     "fdtd_port_offset_from_waveguide_end_um": 2.0,
     "waveguide_monitor_span_um": 2.5,
     "waveguide_total_power_before_mode_um": 1.0,
-    "waveguide_effective_index": 2.5,
     "waveguide_neff_tolerance": 0.3,
     "waveguide_mode_search_count": 20,
     "slab_layer": PHOTONIC_LAYER,
@@ -843,7 +838,7 @@ DEFAULT_COMPONENT_VALUES.update(
             # Zero means the exporter calculates the near-degenerate pair and
             # selects the member polarized transverse to the grating axis.
             "mode number": 0, "polarization": "local TE",
-            "candidate mode numbers": [1, 2],
+            "candidate mode numbers": [1, 2, 3],
             "mode degeneracy tolerance": 0.01,
             "minimum local TE fraction": 0.8,
             "angle theta": 7.0, "angle phi": 0.0,
@@ -921,7 +916,12 @@ PHOTONIC_COMPONENT_KINDS = (
 )
 
 DEFAULT_COMPONENT_VALUES["Photonic test block"] = {
-    "include_ebeam_fields": True,
+    # Write fields are deliberately a separate, movable editor object.  New
+    # photonic scan blocks therefore contain only their fabrication geometry;
+    # users can cover the finished block from the E-beam toolbar afterwards.
+    # An older project that explicitly saved True remains supported by the
+    # GDS builder for backwards compatibility.
+    "include_ebeam_fields": False,
     "ebeam_field_size": 520.0,
     "ebeam_edge_clearance": 10.0,
     "parameter_text_height": 12.0,

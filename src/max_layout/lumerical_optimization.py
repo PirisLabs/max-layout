@@ -798,9 +798,10 @@ def _fiber_pose_contract(
                 ],
                 "candidate_mode_numbers": [
                     int(mode_number)
-                    for mode_number in port.get("candidate mode numbers", [1, 2])
+                    for mode_number in port.get("candidate mode numbers", [1, 2, 3])
                     if int(mode_number) > 0
                 ],
+                "fiber_target_neff": float(port.get("fiber target neff", 1.44)),
                 "mode_degeneracy_tolerance": max(
                     0.0, float(port.get("mode degeneracy tolerance", 0.01))
                 ),
@@ -818,7 +819,7 @@ def _fiber_pose_contract(
         "fiber_z_um": float(fiber_z_um),
         "phi_deg": float(fiber.get("angle phi", component.get("orientation_deg", 0.0))),
         "core_diameter_um": max(1e-6, float(fiber.get("core diameter_um", 9.0))),
-        "nominal_angle_theta": float(params.get("angle_theta", fiber.get("angle theta", 7.0))),
+        "nominal_angle_theta": float(params["angle_theta"]),
         "nominal_fiber_offset": float(params.get("fiber_offset", 0.0)),
         "fiber_tox_offset_um": float(params.get("fiber_tox_offset_um", 0.65)),
         "fiber_power_monitor_below_source_um": max(
@@ -968,6 +969,31 @@ import numpy as np
 import lumapi
 
 UM = 1e-6
+BUILD_CPU_THREADS = max(
+    1,
+    min(int(SETTINGS.get("build_cpu_threads", 30)), os.cpu_count() or 1),
+)
+
+
+def _activate_cpu_model_work(session):
+    """Use the clamped CPU row for geometry edits and embedded eigensolvers."""
+    session.setresource("FDTD", 1, "active", False)
+    session.setresource("FDTD", 2, "device type", "CPU")
+    session.setresource("FDTD", 2, "active", True)
+    session.setresource("FDTD", 2, "processes", 1)
+    session.setresource("FDTD", 2, "threads", BUILD_CPU_THREADS)
+
+
+def _activate_gpu_solve(session):
+    """Activate the GPU only at the point where an FDTD solve is launched."""
+    session.setresource("FDTD", 1, "device type", "GPU")
+    session.setresource("FDTD", 1, "active", True)
+    session.setresource("FDTD", 2, "device type", "CPU")
+    session.setresource("FDTD", 2, "active", True)
+    session.setresource("FDTD", 2, "processes", 1)
+    session.setresource("FDTD", 2, "threads", BUILD_CPU_THREADS)
+
+
 all_parameter_rows = list(OPTIMIZATION_SPEC["parameters"])
 alignment_parameter_names = list(map(str, OPTIMIZATION_SPEC.get("alignment_parameters", [])))
 alignment_parameter_rows = [
@@ -1001,7 +1027,7 @@ def _numeric_source_mode_label(value):
     if match is None:
         raise RuntimeError(
             "The resolved optimization source mode must be numeric 'mode N'; received %r. "
-            "The 3D seed build must finish its two-mode fiber-polarization selection first."
+            "The 3D seed build must finish its three-candidate fiber-polarization selection first."
             % text
         )
     return "mode %d" % int(match.group(1))
@@ -1060,7 +1086,7 @@ def _resolved_runtime_port_mode(port_contract):
             "candidate mode numbers",
             runtime_port.get(
                 "candidate mode numbers",
-                port_contract.get("candidate_mode_numbers", [1, 2]),
+                port_contract.get("candidate_mode_numbers", [1, 2, 3]),
             ),
         )
     )
@@ -1107,7 +1133,7 @@ def _synchronize_resolved_fiber_mode_contract():
                 "is_source": True,
                 "mode_number": 0,
                 "selected_mode_order": [],
-                "candidate_mode_numbers": [1, 2],
+                "candidate_mode_numbers": [1, 2, 3],
             })
             source_mode = "mode %d" % source_mode_number
             OPT_OBJECTIVE_PORTS["source_mode"] = source_mode
@@ -1364,7 +1390,7 @@ def _fiber_pose_updates(alignment_parameters, shape_parameters=None):
             "mode_number": int(port.get("mode_number", 0)),
             "selected_mode_order": list(port.get("selected_mode_order", [])),
             "candidate_mode_numbers": list(
-                port.get("candidate_mode_numbers", [1, 2])
+                port.get("candidate_mode_numbers", [1, 2, 3])
             ),
             "mode_degeneracy_tolerance": float(
                 port.get("mode_degeneracy_tolerance", 0.01)
@@ -1426,7 +1452,10 @@ def _apply_fiber_pose_to_session(
                         "name": str(port["name"]),
                         "angle phi": float(port["phi_deg"]),
                         "candidate mode numbers": list(
-                            port.get("candidate_mode_numbers", [1, 2])
+                            port.get("candidate_mode_numbers", [1, 2, 3])
+                        ),
+                        "fiber target neff": float(
+                            port.get("fiber_target_neff", 1.44)
                         ),
                         "mode degeneracy tolerance": float(
                             port.get("mode_degeneracy_tolerance", 0.01)
@@ -1609,8 +1638,10 @@ def _alignment_port_score(fdtd_session):
 
 def _alignment_loss(alignment_values, fdtd_session, shape_values):
     values = np.asarray(alignment_values, dtype=float).ravel()
+    _activate_cpu_model_work(fdtd_session)
     _apply_fiber_pose_to_session(values, fdtd_session, shape_values, update_modes=True)
     _require_numeric_source_mode()
+    _activate_gpu_solve(fdtd_session)
     fdtd_session.run("FDTD", "GPU")
     score = _alignment_port_score(fdtd_session)
     ALIGNMENT_EVALUATION_PARAMETERS.append(values.copy())
@@ -1660,10 +1691,11 @@ def _optimize_fiber_alignment(base_fsp, shape_values, output_fsp, max_iterations
 
     owner = lumapi.FDTD(
         hide=True,
-        serverArgs={"threads": str(max(1, int(SETTINGS.get("build_cpu_threads", 30))))},
+        serverArgs={"threads": str(BUILD_CPU_THREADS)},
     )
     try:
         owner.load(base_fsp)
+        _activate_cpu_model_work(owner)
         steps = np.asarray([
             0.05 if str(row["parameter"]) == "angle_theta" else 0.01
             for row in alignment_parameter_rows
@@ -1861,9 +1893,10 @@ def _run_lumopt2(module):
     gc.collect()
     validation_owner = lumapi.FDTD(
         hide=True,
-        serverArgs={"threads": str(max(1, int(SETTINGS.get("build_cpu_threads", 30))))},
+        serverArgs={"threads": str(BUILD_CPU_THREADS)},
     )
     validation_owner.load(REMOTE_VALIDATION_FSP)
+    _activate_cpu_model_work(validation_owner)
     return (
         validation_owner,
         best_parameters,
@@ -1888,9 +1921,9 @@ def _run_legacy_lumopt():
         initial_params=initial_params,
         bounds=parameter_bounds,
         dx=float(OPTIMIZATION_SPEC["parameterized_geometry"]["finite_difference_step"]),
-        threads_per_job=max(1, int(SETTINGS.get("build_cpu_threads", 30))),
+        threads_per_job=BUILD_CPU_THREADS,
         num_jobs=1,
-        deps_num_threads=max(1, int(SETTINGS.get("build_cpu_threads", 30))),
+        deps_num_threads=BUILD_CPU_THREADS,
     )
     wavelengths = Wavelengths(
         start=float(objective["wavelength_start_um"]) * UM,
@@ -2060,14 +2093,16 @@ try:
         ADJOINT_ENGINE = "GPU forward-solve fiber alignment"
         ADJOINT_FDTD_OWNER = lumapi.FDTD(
             hide=True,
-            serverArgs={"threads": str(max(1, int(SETTINGS.get("build_cpu_threads", 30))))},
+            serverArgs={"threads": str(BUILD_CPU_THREADS)},
         )
         ADJOINT_FDTD_OWNER.load(REMOTE_OPTIMIZER_BASE_FSP)
+        _activate_cpu_model_work(ADJOINT_FDTD_OWNER)
 
     # Preserve the best geometry and run one final forward GPU validation.  It
     # produces the actual best-design broadband upper/lower MMI ratios (or
     # grating CE) rather than treating the optimizer's scalar history as a
     # substitute for a spectral response.  No per-iteration FSP is retained.
+    _activate_cpu_model_work(ADJOINT_FDTD_OWNER)
     ADJOINT_FDTD_OWNER.switchtolayout()
     update_max_layout_geometry(best_params, ADJOINT_FDTD_OWNER, True)
     _apply_fiber_pose_to_session(
@@ -2080,6 +2115,7 @@ try:
     ADJOINT_FDTD_OWNER.set("source port", str(OPT_OBJECTIVE_PORTS["source_port"]))
     ADJOINT_FDTD_OWNER.set("source mode", _require_numeric_source_mode())
     _require_numeric_source_mode()
+    _activate_gpu_solve(ADJOINT_FDTD_OWNER)
     ADJOINT_FDTD_OWNER.run("FDTD", "GPU")
 
     def _port_transmission(port_name):
@@ -2145,7 +2181,7 @@ try:
 
     # Forward/adjoint and best-design validation GPU work is complete.  Use
     # CPU for serialization and plotting while retaining the solved project.
-    cpu_threads = max(1, min(int(SETTINGS.get("build_cpu_threads", 30)), os.cpu_count() or 1))
+    cpu_threads = BUILD_CPU_THREADS
     try:
         ADJOINT_FDTD_OWNER.setresource("FDTD", 1, "active", False)
         ADJOINT_FDTD_OWNER.setresource("FDTD", 2, "device type", "CPU")
@@ -2290,7 +2326,17 @@ try:
         return ("%.*g" % (int(digits), number)) if np.isfinite(number) else str(number)
 
     def _text_json(value):
-        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        def _reported(item):
+            if isinstance(item, dict):
+                return {
+                    str(key): _reported(child)
+                    for key, child in item.items()
+                    if str(key) != "waveguide_effective_index"
+                }
+            if isinstance(item, (list, tuple)):
+                return [_reported(child) for child in item]
+            return item
+        return json.dumps(_reported(value), sort_keys=True, separators=(",", ":"), default=str)
 
     def _text_section(lines, title):
         if lines:
@@ -2340,7 +2386,6 @@ try:
         "fdtd_port_offset_from_waveguide_end_um": ("Waveguide FDTD-port offset from waveguide end", "um"),
         "waveguide_monitor_span_um": ("Waveguide mode-monitor transverse span", "um"),
         "waveguide_total_power_before_mode_um": ("Total-power plane distance before waveguide mode plane", "um"),
-        "waveguide_effective_index": ("Waveguide target effective index", ""),
         "waveguide_neff_tolerance": ("Waveguide effective-index tolerance", ""),
         "waveguide_mode_search_count": ("Waveguide eigensolver modes searched", ""),
         "tolerance": ("Geometry build tolerance", "um"),
@@ -2364,7 +2409,7 @@ try:
             lines.append("%s%s: %s%s" % (prefix, label, _text_parameter_value(parameters[key]), suffix))
             found += 1
             shown.add(key)
-        ignored = {"name", "layer", "datatype"}
+        ignored = {"name", "layer", "datatype", "waveguide_effective_index"}
         for key, value in parameters.items():
             if (
                 key in shown or key in ignored or key.endswith("_layer")
@@ -2467,7 +2512,7 @@ try:
             str(objective_contract.get("wavelength_points", "")),
         ),
         "- Resources: forward/adjoint solve=GPU | best-design validation=GPU | model-build CPU threads=%s | post-processing=CPU"
-        % str(SETTINGS.get("build_cpu_threads", 30)),
+        % str(BUILD_CPU_THREADS),
         "- Numerical controls: mesh accuracy=%s | dt factor=%s | PML=%s | geometry/PML overlap=%s um"
         % (
             str(SETTINGS.get("mesh_accuracy", 2)),
@@ -2487,6 +2532,22 @@ try:
             _text_number(SETTINGS.get("tfln_temperature_K", 296.3)),
         ),
     ])
+    waveguide_index_estimate = dict(
+        globals().get("WAVEGUIDE_INDEX_ESTIMATE", {})
+    )
+    if waveguide_index_estimate:
+        text_lines.append(
+            "- Automatic waveguide mode target: core n=%s | adjacent dielectric n=%s | "
+            "midpoint neff=%s at %s um | core=%s | surroundings=%s"
+            % (
+                _text_number(waveguide_index_estimate.get("core_index")),
+                _text_number(waveguide_index_estimate.get("surrounding_index")),
+                _text_number(waveguide_index_estimate.get("target_neff")),
+                _text_number(waveguide_index_estimate.get("wavelength_um")),
+                _text_json(waveguide_index_estimate.get("core_materials", [])),
+                _text_json(waveguide_index_estimate.get("surrounding_materials", [])),
+            )
+        )
 
     _text_section(text_lines, "SOURCES / PORTS / MONITORS")
     text_lines.extend([

@@ -433,7 +433,10 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
     if kind in {"RF test block", "Photonic test block"}:
         excluded_devices={int(index) for index in p.get("excluded_device_indices",[])}
         # Write fields are a photonic e-beam concern; the RF block does not draw them.
-        draw_fields=kind=="Photonic test block" and bool(p.get("include_ebeam_fields",True))
+        # New photonic test blocks keep E-beam coverage as a separate movable
+        # component.  Continue honoring an explicit True in older project JSON,
+        # but never synthesize fields merely because the legacy key is absent.
+        draw_fields=kind=="Photonic test block" and bool(p.get("include_ebeam_fields",False))
         field_size=float(p.get("ebeam_field_size",520.0));clearance=float(p.get("ebeam_edge_clearance",10.0))
         usable=field_size-2.0*clearance
         if draw_fields and usable<=0.0:raise ValueError(f"Photonic test block edge clearance {clearance:g} µm leaves no usable area in a {field_size:g} µm write field.")

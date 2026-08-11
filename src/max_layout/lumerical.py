@@ -566,6 +566,73 @@ def _collect_export_data(
     return geometry, ports, fiber_geometries, monitors, bbox, warnings + [f"Layout origin moved by ({origin[0]:.6g}, {origin[1]:.6g}) µm for simulation."]
 
 
+def _apply_authoritative_grating_angles(
+    components: list[dict[str, Any]],
+    ports: list[dict[str, Any]],
+    fiber_geometries: list[dict[str, Any]],
+    monitors: list[dict[str, Any]],
+    warnings: list[str],
+) -> None:
+    """Make each grating parent's ``angle_theta`` the sole tilt authority.
+
+    Automatically placed fiber geometry, source, and passive measurement
+    objects are convenient editable views of the parent component.  They are
+    not independent simulation inputs.  Re-applying the parent value during
+    export prevents an old companion object's default angle from silently
+    disagreeing with the project JSON.
+    """
+    canonical_by_uid: dict[int, float] = {}
+    for component in components:
+        if str(component.get("kind", "")) not in {"Grating coupler", "GC-SOI"}:
+            continue
+        params = component.setdefault("params", {})
+        if "angle_theta" in params:
+            theta_deg = float(params["angle_theta"])
+        elif "fiber_tilt_deg" in params:
+            theta_deg = float(params.pop("fiber_tilt_deg"))
+            params["angle_theta"] = theta_deg
+            warnings.append(
+                "Migrated legacy fiber_tilt_deg to the authoritative parent angle_theta."
+            )
+        else:
+            matching_values = [
+                float(item["angle theta"])
+                for item in [*fiber_geometries, *ports, *monitors]
+                if int(item.get("parent_component_uid", -1))
+                == int(component.get("uid", 0))
+                and "angle theta" in item
+            ]
+            if not matching_values:
+                raise ValueError(
+                    "Grating component UID %s has no authoritative angle_theta"
+                    % component.get("uid", 0)
+                )
+            theta_deg = matching_values[0]
+            params["angle_theta"] = theta_deg
+            warnings.append(
+                "Migrated an older grating companion tilt to the authoritative parent angle_theta."
+            )
+        if not math.isfinite(theta_deg) or theta_deg < 0.0 or theta_deg >= 90.0:
+            raise ValueError(
+                "Grating component UID %s angle_theta must be at least 0 and below 90 degrees"
+                % component.get("uid", 0)
+            )
+        canonical_by_uid[int(component.get("uid", 0))] = theta_deg
+
+    for item in [*fiber_geometries, *ports, *monitors]:
+        parent_uid = int(item.get("parent_component_uid", -1))
+        if parent_uid not in canonical_by_uid:
+            continue
+        theta_deg = canonical_by_uid[parent_uid]
+        previous = item.get("angle theta")
+        item["angle theta"] = theta_deg
+        if previous is not None and abs(float(previous) - theta_deg) > 1e-9:
+            warnings.append(
+                "Synchronized %s angle theta from %.6g° to parent angle_theta %.6g°."
+                % (item.get("name", "simulation object"), float(previous), theta_deg)
+            )
+
+
 def _stack_vertical_levels(stack: list[dict[str, Any]]) -> tuple[float, float, float, float]:
     """Return device top, stack top, and upper-silica top/center."""
     active = [row for row in stack if float(row.get("thickness_um", 0.0)) > 0.0]
@@ -652,10 +719,18 @@ def _synchronize_fiber_port_parameters(
         )
 
     def align_plane(item: dict[str, Any], fiber: dict[str, Any]) -> None:
-        theta_deg = float(fiber.get("angle theta", item.get("angle theta", 7.0)))
+        if "angle theta" not in fiber:
+            raise ValueError(
+                "Fiber geometry %s has no angle theta; its grating parent angle_theta must be exported"
+                % fiber.get("name", "fiber")
+            )
+        theta_deg = float(fiber["angle theta"])
         phi_deg = float(fiber.get("angle phi", item.get("angle phi", 0.0)))
         item["angle theta"] = theta_deg
         item["angle phi"] = phi_deg
+        core_index = float(fiber.get("core index", 1.44427))
+        cladding_index = float(fiber.get("cladding index", core_index))
+        item["fiber target neff"] = 0.5 * (core_index + cladding_index)
         if not bool(item.get("align to fiber axis", True)):
             return
         fiber_bottom_z = _item_vertical_reference(fiber, levels) + float(fiber.get("distance_um", 0.0))
@@ -675,7 +750,7 @@ def _synchronize_fiber_port_parameters(
         fiber = matching_fiber(port)
         if fiber is None:
             continue
-        theta_deg = float(fiber.get("angle theta", port.get("angle theta", 7.0)))
+        theta_deg = float(fiber["angle theta"])
         phi_deg = float(fiber.get("angle phi", port.get("angle phi", 0.0)))
         previous_theta = float(port.get("angle theta", theta_deg))
         previous_phi = float(port.get("angle phi", phi_deg))
@@ -752,7 +827,7 @@ def _promote_fiber_measurement_ports(
                     "mode": "user select",
                     "mode number": 0,
                     "polarization": "local TE",
-                    "candidate mode numbers": [1, 2],
+                    "candidate mode numbers": [1, 2, 3],
                     "mode degeneracy tolerance": float(
                         monitor.get("mode degeneracy tolerance", 0.01)
                     ),
@@ -1194,13 +1269,13 @@ r = subprocess.run(_SSH + [HOST,
     capture_output=True, text=True, timeout=180)
 print((r.stdout + r.stderr).strip())
 
-# 2. roam 3 HPC Packs to this session for 24 h, exactly like TFLN_GC_1310.ipynb.
+# 2. roam 3 HPC Packs to this session for 4 h.
 r = subprocess.run(_SSH + [HOST,
     f'{LIC}/LicensingSettings web shared products checkout '
-    '--name "Ansys HPC Pack - Shared Web" --count 3 --expires "P1D" --mode user'],
+    '--name "Ansys HPC Pack - Shared Web" --count 3 --expires "PT4H" --mode user'],
     capture_output=True, text=True, timeout=180)
 out = (r.stdout + r.stderr).strip()
-print("HPC Packs:", "3 roamed to this session for 24 h" if "SUCCESS" in out else out[:400])
+print("HPC Packs:", "3 roamed to this session for 4 h" if "SUCCESS" in out else out[:400])
 '''
 
 
@@ -1372,6 +1447,127 @@ def _add_required_materials(fdtd):
             n_e[center_index],
         )
     )
+
+
+def _maximum_material_index(fdtd, material, frequency_hz):
+    """Return the largest finite index component at one frequency."""
+    if str(material).strip().lower() in {"air", "vacuum", "<vacuum>"}:
+        return 1.0
+    values = np.asarray(fdtd.getindex(str(material), float(frequency_hz)))
+    finite = np.abs(values[np.isfinite(values)])
+    if finite.size < 1 or float(np.max(finite)) <= 0.0:
+        raise RuntimeError(
+            "Could not resolve a finite refractive index for material %s"
+            % material
+        )
+    return float(np.max(finite))
+
+
+def _derive_waveguide_neff_from_stack(fdtd, z_ranges):
+    """Estimate the guided-mode index from the actual dispersive stack.
+
+    The geometry material is the core.  The closest active background films
+    immediately below and above the contiguous geometry block are its
+    surroundings.  Their largest index is deliberately conservative for an
+    asymmetric stack.  The midpoint is a stable eigensolver target without
+    encoding platform-specific constants such as 2.0 or 2.5.
+    """
+    analysis_uid = int(
+        (GRATING_ANALYSIS or MMI_ANALYSIS or {}).get("component_uid", -1)
+    )
+    device_gds_layers = {
+        int(polygon.get("layer", -1))
+        for polygon in GEOMETRY
+        if int(polygon.get("component_uid", -2)) == analysis_uid
+    }
+    metal_tokens = ("gold", "silver", "aluminium", "aluminum", "copper", "au (", "ag (", "al (")
+
+    def row_layers(row):
+        values = row.get("gds_layers", [row.get("gds_layer", -1)])
+        if isinstance(values, (str, int, float)):
+            values = [values]
+        return {int(value) for value in values}
+
+    def is_device_dielectric(row):
+        material = str(row.get("material", "")).strip().lower()
+        return (
+            str(row.get("role", "background")).lower() == "geometry"
+            and not any(token in material for token in metal_tokens)
+            and (not device_gds_layers or bool(row_layers(row) & device_gds_layers))
+        )
+
+    def is_background_dielectric(row):
+        material = str(row.get("material", "")).strip().lower()
+        return (
+            str(row.get("role", "background")).lower() != "geometry"
+            and not any(token in material for token in metal_tokens)
+        )
+
+    geometry_indices = [
+        index
+        for index, (row, _z0, _z1) in enumerate(z_ranges)
+        if is_device_dielectric(row)
+    ]
+    if not geometry_indices:
+        raise RuntimeError(
+            "Automatic waveguide mode selection needs one active geometry material"
+        )
+    wavelength_center_um = 0.5 * (
+        float(SETTINGS.get("wavelength_start_um", 1.25))
+        + float(SETTINGS.get("wavelength_stop_um", 1.35))
+    )
+    frequency_hz = 299792458.0 / (wavelength_center_um * UM)
+    core_rows = [z_ranges[index][0] for index in geometry_indices]
+    core_index = max(
+        _maximum_material_index(fdtd, row.get("material", ""), frequency_hz)
+        for row in core_rows
+    )
+
+    first_geometry = min(geometry_indices)
+    last_geometry = max(geometry_indices)
+    surrounding_rows = []
+    for index in range(first_geometry - 1, -1, -1):
+        row = z_ranges[index][0]
+        if is_background_dielectric(row):
+            surrounding_rows.append(row)
+            break
+    for index in range(last_geometry + 1, len(z_ranges)):
+        row = z_ranges[index][0]
+        if is_background_dielectric(row):
+            surrounding_rows.append(row)
+            break
+    if not surrounding_rows:
+        raise RuntimeError(
+            "Automatic waveguide mode selection needs an active surrounding dielectric"
+        )
+    surrounding_indices = [
+        _maximum_material_index(fdtd, row.get("material", ""), frequency_hz)
+        for row in surrounding_rows
+    ]
+    cladding_index = max(surrounding_indices)
+    if core_index <= cladding_index:
+        raise RuntimeError(
+            "The geometry material index %.6g is not above the surrounding index %.6g"
+            % (core_index, cladding_index)
+        )
+    target_neff = 0.5 * (core_index + cladding_index)
+    result = {
+        "strategy": "midpoint of actual core and adjacent dielectric indices",
+        "wavelength_um": float(wavelength_center_um),
+        "core_materials": [str(row.get("material", "")) for row in core_rows],
+        "surrounding_materials": [
+            str(row.get("material", "")) for row in surrounding_rows
+        ],
+        "core_index": float(core_index),
+        "surrounding_index": float(cladding_index),
+        "target_neff": float(target_neff),
+    }
+    print(
+        "Derived waveguide mode target at %.6g um: core n=%.6g, "
+        "surrounding n=%.6g, midpoint neff=%.6g."
+        % (wavelength_center_um, core_index, cladding_index, target_neff)
+    )
+    return result
 
 
 def _layer_builder_geometry(origin_x_um, origin_y_um, geometry=None):
@@ -1752,7 +1948,12 @@ def _add_fiber_geometries(
             name = f"uid_{fiber.get('component_uid', 0)}_{name}"
         used_names.add(name)
         bottom_x_um, bottom_y_um = map(float, fiber.get("center", (0.0, 0.0)))
-        theta_deg = float(fiber.get("angle theta", 10.0))
+        if "angle theta" not in fiber:
+            raise ValueError(
+                "Fiber geometry %s has no angle theta"
+                % fiber.get("name", name)
+            )
+        theta_deg = float(fiber["angle theta"])
         phi_deg = float(fiber.get("angle phi", 0.0))
         core_diameter_um = max(1e-6, float(fiber.get("core diameter_um", 9.0)))
         cladding_diameter_um = max(core_diameter_um, float(fiber.get("cladding diameter_um", 50.0)))
@@ -1913,8 +2114,62 @@ def _fiber_local_te_score(mode_profile, mode_number, grating_axis_deg):
     return desired_power / max(total_power, 1e-300)
 
 
+def _fiber_gaussian_circular_scores(mode_profile, mode_number):
+    """Return Gaussian-overlap and circular-second-moment scores in [0, 1]."""
+    electric = _mode_profile_vector(mode_profile, mode_number)
+    intensity = np.asarray(np.sum(np.abs(electric) ** 2, axis=-1), dtype=float)
+    intensity = np.squeeze(intensity)
+    while intensity.ndim > 2:
+        intensity = np.sum(intensity, axis=0)
+    if intensity.ndim != 2 or min(intensity.shape) < 2:
+        return 0.0, 0.0
+    peak = float(np.max(intensity))
+    total = float(np.sum(intensity))
+    if not np.isfinite(peak) or peak <= 0.0 or total <= 0.0:
+        return 0.0, 0.0
+    weights = intensity / total
+    coordinate_0 = np.linspace(-1.0, 1.0, intensity.shape[0])
+    coordinate_1 = np.linspace(-1.0, 1.0, intensity.shape[1])
+    grid_0, grid_1 = np.meshgrid(coordinate_0, coordinate_1, indexing="ij")
+    center_0 = float(np.sum(weights * grid_0))
+    center_1 = float(np.sum(weights * grid_1))
+    delta_0 = grid_0 - center_0
+    delta_1 = grid_1 - center_1
+    covariance = np.asarray(
+        [
+            [np.sum(weights * delta_0 * delta_0), np.sum(weights * delta_0 * delta_1)],
+            [np.sum(weights * delta_0 * delta_1), np.sum(weights * delta_1 * delta_1)],
+        ],
+        dtype=float,
+    )
+    eigenvalues = np.maximum(np.linalg.eigvalsh(covariance), 1e-12)
+    circularity = float(np.clip(eigenvalues[0] / eigenvalues[-1], 0.0, 1.0))
+    inverse_covariance = np.linalg.pinv(covariance + np.eye(2) * 1e-12)
+    radius_squared = (
+        inverse_covariance[0, 0] * delta_0 ** 2
+        + 2.0 * inverse_covariance[0, 1] * delta_0 * delta_1
+        + inverse_covariance[1, 1] * delta_1 ** 2
+    )
+    gaussian = np.exp(-0.5 * radius_squared)
+    gaussian_similarity = float(
+        np.sum(intensity * gaussian)
+        / max(
+            np.sqrt(np.sum(intensity ** 2) * np.sum(gaussian ** 2)),
+            1e-300,
+        )
+    )
+    boundary_peak = float(
+        max(
+            np.max(intensity[0, :]), np.max(intensity[-1, :]),
+            np.max(intensity[:, 0]), np.max(intensity[:, -1]),
+        )
+    )
+    gaussian_quality = gaussian_similarity * max(0.0, 1.0 - boundary_peak / peak)
+    return float(np.clip(gaussian_quality, 0.0, 1.0)), circularity
+
+
 def _fiber_candidate_neff(fdtd, port_path, candidate_modes):
-    """Best-effort central neff values for degeneracy validation."""
+    """Central neff per mode, including wavelength-by-mode result tensors."""
     try:
         dataset = fdtd.getresult(port_path, "neff")
         available = list(dataset.keys())
@@ -1938,18 +2193,54 @@ def _fiber_candidate_neff(fdtd, port_path, candidate_modes):
     try:
         plain_key = normalized.get("neff")
         values = np.real(np.asarray(dataset[plain_key])).squeeze()
-        if values.size == len(candidate_modes):
-            for mode_number, value in zip(candidate_modes, values.ravel()):
-                if np.isfinite(value):
-                    result[int(mode_number)] = float(value)
+        if values.ndim == 0:
+            values = values.reshape(1)
+        mode_key = normalized.get("n")
+        if mode_key is not None:
+            mode_coordinate = np.asarray(dataset[mode_key]).squeeze().ravel()
+            mode_numbers = [int(round(float(value))) for value in mode_coordinate]
+        else:
+            mode_numbers = list(map(int, candidate_modes))
+        mode_count = len(mode_numbers)
+        if values.ndim == 1 and values.size == mode_count:
+            mode_matrix = values.reshape(1, mode_count)
+        else:
+            candidate_axes = [
+                axis for axis, size in enumerate(values.shape)
+                if size == mode_count
+            ]
+            spectral_key = normalized.get("lambda") or normalized.get("f")
+            spectral_size = None
+            if spectral_key is not None:
+                spectral_size = np.asarray(dataset[spectral_key]).squeeze().size
+            if len(candidate_axes) > 1 and spectral_size is not None:
+                non_spectral_axes = [
+                    axis for axis in candidate_axes
+                    if values.shape[axis] != spectral_size
+                ]
+                if non_spectral_axes:
+                    candidate_axes = non_spectral_axes
+            if not candidate_axes:
+                raise ValueError("neff tensor has no mode-coordinate axis")
+            # Lumerical datasets conventionally place the mode coordinate last;
+            # choosing the last match also resolves equal wavelength/mode counts.
+            mode_axis = candidate_axes[-1]
+            mode_matrix = np.moveaxis(values, mode_axis, -1).reshape(-1, mode_count)
+        for column, mode_number in enumerate(mode_numbers):
+            if int(mode_number) not in set(map(int, candidate_modes)):
+                continue
+            finite = np.asarray(mode_matrix[:, column]).ravel()
+            finite = finite[np.isfinite(finite)]
+            if finite.size:
+                result[int(mode_number)] = float(np.median(finite))
     except Exception:
         pass
     return result
 
 
 def _select_fiber_local_te_mode(fdtd, port_path, port):
-    """Calculate both HE11 partners and identify the rotation-correct one."""
-    raw_candidates = port.get("candidate mode numbers", (1, 2))
+    """Solve three candidates and choose the Gaussian local-TE HE11 partner."""
+    raw_candidates = port.get("candidate mode numbers", (1, 2, 3))
     candidate_modes = []
     for value in raw_candidates:
         mode_number = int(value)
@@ -1960,12 +2251,12 @@ def _select_fiber_local_te_mode(fdtd, port_path, port):
             "Fiber port %s requires at least two candidate mode numbers"
             % port.get("name", port_path)
         )
-    candidate_modes = candidate_modes[:2]
+    candidate_modes = candidate_modes[:3]
     fdtd.select(port_path)
     update_status = fdtd.updateportmodes(np.asarray(candidate_modes, dtype=int))
     if update_status is not None and float(np.asarray(update_status).squeeze()) < 0.0:
         raise RuntimeError(
-            "Lumerical could not calculate both fiber modes %r for %s"
+            "Lumerical could not calculate the fiber candidates %r for %s"
             % (candidate_modes, port.get("name", port_path))
         )
     mode_profile = fdtd.getresult(port_path, "mode profiles")
@@ -1976,7 +2267,54 @@ def _select_fiber_local_te_mode(fdtd, port_path, port):
         )
         for mode_number in candidate_modes
     }
-    selected_mode = max(candidate_modes, key=lambda mode_number: scores[mode_number])
+    gaussian_scores = {}
+    circularity_scores = {}
+    for mode_number in candidate_modes:
+        gaussian_scores[mode_number], circularity_scores[mode_number] = (
+            _fiber_gaussian_circular_scores(mode_profile, mode_number)
+        )
+    neff_by_mode = _fiber_candidate_neff(fdtd, port_path, candidate_modes)
+    degeneracy_tolerance = max(
+        0.0, float(port.get("mode degeneracy tolerance", 0.01))
+    )
+    target_neff = float(port.get("fiber target neff", 1.44))
+    if len(neff_by_mode) == len(candidate_modes):
+        candidate_pairs = [
+            (first, second)
+            for pair_index, first in enumerate(candidate_modes)
+            for second in candidate_modes[pair_index + 1:]
+            if abs(neff_by_mode[first] - neff_by_mode[second])
+            <= degeneracy_tolerance
+        ]
+        if not candidate_pairs:
+            raise RuntimeError(
+                "None of the first three fiber modes at %s form the expected near-degenerate "
+                "HE11 pair: neff=%r, tolerance=%.6g"
+                % (port.get("name", port_path), neff_by_mode, degeneracy_tolerance)
+            )
+        degenerate_pair = min(
+            candidate_pairs,
+            key=lambda pair: (
+                abs(0.5 * (neff_by_mode[pair[0]] + neff_by_mode[pair[1]]) - target_neff),
+                abs(neff_by_mode[pair[0]] - neff_by_mode[pair[1]]),
+            ),
+        )
+    else:
+        # Some Lumerical builds expose vector fields before the per-mode neff
+        # keys.  Keep all three solved fields, but fall back to the two modes
+        # nearest the eigensolver's fundamental ordering.
+        degenerate_pair = tuple(candidate_modes[:2])
+    composite_scores = {
+        mode_number: (
+            0.75 * scores[mode_number]
+            + 0.15 * gaussian_scores[mode_number]
+            + 0.10 * circularity_scores[mode_number]
+        )
+        for mode_number in degenerate_pair
+    }
+    selected_mode = max(
+        degenerate_pair, key=lambda mode_number: composite_scores[mode_number]
+    )
     minimum_fraction = float(port.get("minimum local TE fraction", 0.8))
     if scores[selected_mode] < minimum_fraction:
         raise RuntimeError(
@@ -1984,27 +2322,25 @@ def _select_fiber_local_te_mode(fdtd, port_path, port):
             "grating axis at %.6g deg. Scores=%r; required >= %.6g."
             % (grating_axis_deg, scores, minimum_fraction)
         )
-    # Do not call updateportmodes a second time merely to reorder an already
-    # calculated pair.  The port group selects the source by eigensolver mode
-    # number, and the result extractor uses the dataset's explicit ``n``
-    # coordinate.  Retaining the original calculated order avoids a second
-    # expensive embedded eigensolver pass.
-    retained_modes = list(candidate_modes)
-    neff_by_mode = _fiber_candidate_neff(fdtd, port_path, candidate_modes)
+    partner_mode = next(
+        mode_number for mode_number in degenerate_pair if mode_number != selected_mode
+    )
+    retained_modes = [selected_mode, partner_mode] + [
+        mode_number
+        for mode_number in candidate_modes
+        if mode_number not in {selected_mode, partner_mode}
+    ]
     degeneracy_delta = None
-    if len(neff_by_mode) == len(candidate_modes):
+    if all(mode_number in neff_by_mode for mode_number in degenerate_pair):
         degeneracy_delta = abs(
-            neff_by_mode[candidate_modes[0]] - neff_by_mode[candidate_modes[1]]
-        )
-        degeneracy_tolerance = max(
-            0.0, float(port.get("mode degeneracy tolerance", 0.01))
+            neff_by_mode[degenerate_pair[0]] - neff_by_mode[degenerate_pair[1]]
         )
         if degeneracy_delta > degeneracy_tolerance:
             raise RuntimeError(
                 "Fiber modes %r at %s are not the expected near-degenerate pair: "
                 "neff=%r, delta=%.6g > %.6g"
                 % (
-                    candidate_modes, port.get("name", port_path), neff_by_mode,
+                    degenerate_pair, port.get("name", port_path), neff_by_mode,
                     degeneracy_delta, degeneracy_tolerance,
                 )
             )
@@ -2015,22 +2351,36 @@ def _select_fiber_local_te_mode(fdtd, port_path, port):
         "selected mode order": list(map(int, retained_modes)),
         # Port-group source labels and expansion-result ``n`` coordinates use
         # the eigensolver mode number.  Keep that identity explicit so a
-        # two-mode fiber result is never reduced by position alone.
+        # multi-mode fiber result is never reduced by position alone.
         "selected mode result number": int(selected_mode),
         "candidate mode numbers": list(map(int, candidate_modes)),
+        "degenerate mode pair": list(map(int, degenerate_pair)),
         "local TE scores": {str(key): float(value) for key, value in scores.items()},
+        "gaussian scores": {
+            str(key): float(value) for key, value in gaussian_scores.items()
+        },
+        "circularity scores": {
+            str(key): float(value) for key, value in circularity_scores.items()
+        },
+        "composite scores": {
+            str(key): float(value) for key, value in composite_scores.items()
+        },
         "grating axis deg": float(grating_axis_deg),
         "target polarization xy": [float(target_x), float(target_y)],
         "polarization": "local TE",
         "candidate neff": {str(key): float(value) for key, value in neff_by_mode.items()},
+        "fiber target neff": float(target_neff),
         "neff degeneracy delta": degeneracy_delta,
+        "minimum local TE fraction": float(minimum_fraction),
     }
     print(
-        "Fiber port %s calculated modes %r and selected eigensolver mode %d: "
-        "local-TE score %.6f for target (Ex,Ey)=(%.6g,%.6g), grating axis %.6g deg%s."
+        "Fiber port %s calculated modes %r, identified HE11 pair %r, and selected mode %d: "
+        "local-TE %.6f, Gaussian %.6f, circularity %.6f for target "
+        "(Ex,Ey)=(%.6g,%.6g), grating axis %.6g deg%s."
         % (
-            port.get("name", port_path), candidate_modes, selected_mode,
-            scores[selected_mode], target_x, target_y, grating_axis_deg,
+            port.get("name", port_path), candidate_modes, degenerate_pair,
+            selected_mode, scores[selected_mode], gaussian_scores[selected_mode],
+            circularity_scores[selected_mode], target_x, target_y, grating_axis_deg,
             "" if degeneracy_delta is None else ", neff delta %.6g" % degeneracy_delta,
         )
     )
@@ -2043,7 +2393,7 @@ def _reuse_verified_fiber_local_te_mode(fdtd, port_path, port, source_selection)
     The automatic passive plane is only 0.1 um below the source and has the
     same fiber, tilt, span, and axis.  Calculating both degenerate partners a
     second time is redundant.  Calculate only the source winner here, verify
-    its local-TE fraction, and fall back to a full two-mode search if the local
+    its local-TE fraction, and fall back to a full three-candidate search if the local
     mode numbering unexpectedly changes.
     """
     selected_mode = max(1, int(source_selection.get("mode number", 1)))
@@ -2063,7 +2413,7 @@ def _reuse_verified_fiber_local_te_mode(fdtd, port_path, port, source_selection)
     if local_te_score < minimum_fraction:
         print(
             "Passive fiber mode %d at %s is not the source's local-TE partner "
-            "(score %.6f); running the full two-mode fallback."
+            "(score %.6f); running the full three-candidate fallback."
             % (selected_mode, port.get("name", port_path), local_te_score)
         )
         return _select_fiber_local_te_mode(fdtd, port_path, port)
@@ -2134,7 +2484,7 @@ def _add_ports(
                     fiber, device_top_um, stack_top_um,
                     silica_cladding_top_um, silica_cladding_center_um,
                 ) + float(fiber.get("distance_um", 0.0))
-                fiber_theta_deg = float(fiber.get("angle theta", port.get("angle theta", 0.0)))
+                fiber_theta_deg = float(fiber["angle theta"])
                 fiber_phi_deg = float(fiber.get("angle phi", port.get("angle phi", 0.0)))
                 axial_height_um = z_um - fiber_z_um
                 lateral_um = axial_height_um * np.tan(np.deg2rad(fiber_theta_deg))
@@ -2269,6 +2619,33 @@ def _add_ports(
                 % name
             )
         target_neff = float(port.get("target neff", 0.0))
+        automatic_waveguide_port = bool(
+            (
+                MMI_ANALYSIS
+                and name in {
+                    str(MMI_ANALYSIS.get("input_port_name", "")),
+                    *map(str, MMI_ANALYSIS.get("output_port_names", [])),
+                }
+            )
+            or (
+                GRATING_ANALYSIS
+                and axis != "z-axis"
+                and int(port.get("parent_component_uid", -1))
+                == int(GRATING_ANALYSIS.get("component_uid", -2))
+            )
+        )
+        if automatic_waveguide_port:
+            estimate = dict(globals().get("WAVEGUIDE_INDEX_ESTIMATE", {}))
+            target_neff = float(estimate.get("target_neff", target_neff))
+            port["target neff"] = target_neff
+            port["target neff strategy"] = str(
+                estimate.get("strategy", "material-index midpoint")
+            )
+        if MMI_ANALYSIS and name in {
+            str(MMI_ANALYSIS.get("input_port_name", "")),
+            *map(str, MMI_ANALYSIS.get("output_port_names", [])),
+        }:
+            MMI_ANALYSIS["port_target_neff"] = target_neff
         if target_neff > 0.0:
             neff_tolerance = max(0.0, float(port.get("neff tolerance", 0.3)))
             try:
@@ -2291,9 +2668,9 @@ def _add_ports(
             selected_neff = float(np.median(finite_neff))
             if abs(selected_neff - target_neff) > neff_tolerance:
                 raise RuntimeError(
-                    "FDTD port %s selected neff %.6g, outside the shared MMI access-waveguide "
-                    "target %.6g +/- %.6g. Verify that the port crosses the intended access "
-                    "waveguide and that all three MMI ports use the same platform index."
+                    "FDTD port %s selected neff %.6g, outside the automatic access-waveguide "
+                    "material-derived target %.6g +/- %.6g. Verify that the port crosses the intended access "
+                    "waveguide and that the material stack describes that waveguide."
                     % (name, selected_neff, target_neff, neff_tolerance)
                 )
             PORT_MODE_SELECTIONS[name] = {
@@ -2304,7 +2681,7 @@ def _add_ports(
                 "polarization": str(port.get("polarization", "")),
             }
             print(
-                "Validated FDTD port %s mode: neff %.6g around shared target %.6g."
+                "Validated FDTD port %s mode: neff %.6g around shared material-derived target %.6g."
                 % (name, selected_neff, target_neff)
             )
         if is_fiber_mode_port:
@@ -2455,17 +2832,25 @@ def _add_monitors(
             fdtd.set("z span", z_span * UM)
         if monitor_kind == "Mode expansion monitor":
             target_neff = float(monitor.get("target neff", 0.0))
+            if str(monitor.get("grating_monitor_role", "")) == "waveguide_mode_expansion":
+                estimate = dict(globals().get("WAVEGUIDE_INDEX_ESTIMATE", {}))
+                target_neff = float(estimate.get("target_neff", target_neff))
+                monitor["target neff"] = target_neff
+                monitor["target neff strategy"] = str(
+                    estimate.get("strategy", "material-index midpoint")
+                )
             if target_neff > 0.0:
                 neff_tolerance = max(0.0, float(monitor.get("neff tolerance", 0.3)))
                 # Use the same robust rule for every grating platform: select
-                # the automatic fundamental (highest-index) mode.  In FDTD
+                # the automatic fundamental (highest-index) mode.  Its target
+                # is derived from the actual dispersive core and adjacent
+                # dielectric indices, never a platform-specific constant. In FDTD
                 # 2026 R1, "use max index" and "number of trial modes" are
                 # read-only while this automatic selection is active; writing
                 # either raises "requested property is inactive".  A fresh
                 # monitor already uses the official max-index default, and
                 # updatemodes() selects that highest-index mode when no stored
-                # profile exists.  The editable target below only validates
-                # the result (about 2.0 for TFLN, about 2.5 for SOI).
+                # profile exists.  The material-derived target validates it.
                 # Searching a small user-selected mode list near an entered n
                 # can instead return the SiO2 slab/cladding mode (~1.42).
                 fdtd.set("mode selection", "fundamental mode")
@@ -2490,10 +2875,9 @@ def _add_monitors(
                 neff_error = abs(selected_neff - target_neff)
                 if neff_error > neff_tolerance:
                     raise RuntimeError(
-                        "Waveguide mode monitor %s found fundamental neff %.6g, outside target %.6g +/- %.6g. "
-                        "Verify that the intended waveguide cross-section crosses both the power and "
-                        "mode-expansion planes, and set the platform target appropriately (typically "
-                        "about 2.0 for TFLN or 2.5 for SOI)."
+                        "Waveguide mode monitor %s found fundamental neff %.6g, outside the material-derived "
+                        "target %.6g +/- %.6g. Verify that the intended waveguide cross-section crosses both "
+                        "the power and mode-expansion planes and that the material stack is correct."
                         % (name, selected_neff, target_neff, neff_tolerance)
                     )
                 WAVEGUIDE_MODE_SELECTIONS[name] = {
@@ -2501,11 +2885,14 @@ def _add_monitors(
                     "neff": selected_neff,
                     "target neff": target_neff,
                     "neff tolerance": neff_tolerance,
+                    "index estimate": dict(
+                        globals().get("WAVEGUIDE_INDEX_ESTIMATE", {})
+                    ),
                     "selection": "automatic fundamental highest-index mode",
                 }
                 print(
                     "Selected fundamental highest-index waveguide mode %d on %s: "
-                    "neff %.6g (platform target %.6g)."
+                    "neff %.6g (material-derived target %.6g)."
                     % (selected_mode_number, name, selected_neff, target_neff)
                 )
             else:
@@ -2544,6 +2931,13 @@ def build_simulation():
         hide=bool(SETTINGS.get("hide_cad", True)),
         serverArgs={"threads": str(build_cpu_threads)},
     )
+    # Geometry, Layer Builder setup, meshing, and all embedded eigensolvers
+    # are CPU work.  Configure that explicitly before any model object is
+    # created; the GPU row is activated only later, immediately before run().
+    fdtd.setresource("FDTD", 1, "device type", "CPU")
+    fdtd.setresource("FDTD", 1, "active", True)
+    fdtd.setresource("FDTD", 1, "processes", 1)
+    fdtd.setresource("FDTD", 1, "threads", build_cpu_threads)
     build_timings["FDTD startup"] = time.perf_counter() - stage_started
     print(
         "Model construction CPU allocation: %d thread%s"
@@ -2600,6 +2994,23 @@ def build_simulation():
     if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
         raise ValueError("The freely positioned FDTD X/Y bounds must have positive spans")
     z_ranges = _stack_z_ranges(MATERIAL_STACK)
+    if GRATING_ANALYSIS or MMI_ANALYSIS:
+        waveguide_index_estimate = _derive_waveguide_neff_from_stack(fdtd, z_ranges)
+        globals()["WAVEGUIDE_INDEX_ESTIMATE"] = waveguide_index_estimate
+        if GRATING_ANALYSIS:
+            GRATING_ANALYSIS["waveguide_target_neff"] = float(
+                waveguide_index_estimate["target_neff"]
+            )
+            GRATING_ANALYSIS["waveguide_index_estimate"] = dict(
+                waveguide_index_estimate
+            )
+        if MMI_ANALYSIS:
+            MMI_ANALYSIS["port_target_neff"] = float(
+                waveguide_index_estimate["target_neff"]
+            )
+            MMI_ANALYSIS["waveguide_index_estimate"] = dict(
+                waveguide_index_estimate
+            )
     if not z_ranges:
         print("Warning: every stack thickness is zero; no material objects will be added.")
         z_min_um, z_max_um, device_z_um, device_top_um = -1.0, 1.0, 0.0, 0.0
@@ -2951,7 +3362,7 @@ def _draw_process_projection(axis, coordinate_index, coordinate_label):
             fiber, device_top, stack_top, silica_cladding_top, silica_cladding_center
         ) + float(fiber.get("distance_um", 0.0))
         length = float(fiber.get("fiber length_um", 20.0))
-        theta = np.deg2rad(float(fiber.get("angle theta", 10.0)))
+        theta = np.deg2rad(float(fiber["angle theta"]))
         phi = np.deg2rad(float(fiber.get("angle phi", 0.0)))
         horizontal_delta = 0.5 * length * np.tan(theta) * (
             np.cos(phi) if coordinate_index == 0 else np.sin(phi)
@@ -3320,7 +3731,7 @@ else:
                     float(selection.get("target neff", 0.0)),
                 )
             else:
-                report += ", selected mode %d from pair %r" % (
+                report += ", selected mode %d after candidates %r" % (
                     int(selection.get("mode number", preferred_mode_number)),
                     selection.get("candidate mode numbers", []),
                 )
@@ -3528,7 +3939,7 @@ if GRATING_ANALYSIS:
         "Waveguide mode-expansion monitor: %s, target neff %.6g"
         % (
             GRATING_ANALYSIS["waveguide_mode_monitor_name"],
-            float(GRATING_ANALYSIS.get("waveguide_target_neff", 2.5)),
+            float(GRATING_ANALYSIS["waveguide_target_neff"]),
         )
     )
 elif MMI_ANALYSIS:
@@ -3681,7 +4092,17 @@ def _summary_number(value, digits=8):
 
 
 def _summary_json(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    def _reported(item):
+        if isinstance(item, dict):
+            return {
+                str(key): _reported(child)
+                for key, child in item.items()
+                if str(key) != "waveguide_effective_index"
+            }
+        if isinstance(item, (list, tuple)):
+            return [_reported(child) for child in item]
+        return item
+    return json.dumps(_reported(value), sort_keys=True, separators=(",", ":"), default=str)
 
 
 def _summary_section(lines, title):
@@ -3737,7 +4158,6 @@ _SUMMARY_MAJOR_PARAMETERS = (
     ("fdtd_port_offset_from_waveguide_end_um", "Waveguide FDTD-port offset from waveguide end", "um"),
     ("waveguide_monitor_span_um", "Waveguide mode-monitor transverse span", "um"),
     ("waveguide_total_power_before_mode_um", "Total-power plane distance before waveguide mode plane", "um"),
-    ("waveguide_effective_index", "Waveguide target effective index", ""),
     ("waveguide_neff_tolerance", "Waveguide effective-index tolerance", ""),
     ("waveguide_mode_search_count", "Waveguide eigensolver modes searched", ""),
     ("tolerance", "Geometry build tolerance", "um"),
@@ -3766,7 +4186,7 @@ def _append_major_component_parameters(lines, component):
     # Preserve future geometry parameters even before they receive a curated
     # label above.  Layer/datatype selectors are already captured by the exact
     # JSON and material-stack sections, so omit only those layout identifiers.
-    ignored = {"name", "layer", "datatype"}
+    ignored = {"name", "layer", "datatype", "waveguide_effective_index"}
     for key, value in params.items():
         if (
             key in shown or key in ignored or key.endswith("_layer")
@@ -3887,6 +4307,20 @@ summary_lines.extend([
         str(SETTINGS.get("antisymmetry_boundary", "") or "none"),
     ),
 ])
+waveguide_index_estimate = dict(globals().get("WAVEGUIDE_INDEX_ESTIMATE", {}))
+if waveguide_index_estimate:
+    summary_lines.append(
+        "- Automatic waveguide mode target: core n=%s | adjacent dielectric n=%s | "
+        "midpoint neff=%s at %s um | core=%s | surroundings=%s"
+        % (
+            _summary_number(waveguide_index_estimate.get("core_index")),
+            _summary_number(waveguide_index_estimate.get("surrounding_index")),
+            _summary_number(waveguide_index_estimate.get("target_neff")),
+            _summary_number(waveguide_index_estimate.get("wavelength_um")),
+            _summary_json(waveguide_index_estimate.get("core_materials", [])),
+            _summary_json(waveguide_index_estimate.get("surrounding_materials", [])),
+        )
+    )
 
 _summary_section(summary_lines, "SOURCES / PORTS / MONITORS")
 if GRATING_ANALYSIS:
@@ -4063,9 +4497,11 @@ with open(REMOTE_RESULTS_JSON, "w", encoding="utf-8") as stream:
 for required_path in (REMOTE_RESULTS_NPZ, REMOTE_RESULTS_JSON, REMOTE_TEXT_SUMMARY):
     if not os.path.isfile(required_path) or os.path.getsize(required_path) <= 0:
         raise RuntimeError("Required result artifact was not created: " + required_path)
-save_verified_project(REMOTE_PROJECT_FILE)
-REMOTE_FINAL_FSP_SAVED = True
-print("Saved solved/final FSP:", REMOTE_PROJECT_FILE)
+if not bool(globals().get("REMOTE_FINAL_FSP_SAVED", False)):
+    raise RuntimeError("The dedicated pre-analysis final-FSP stage did not complete")
+if not os.path.isfile(REMOTE_PROJECT_FILE) or os.path.getsize(REMOTE_PROJECT_FILE) <= 0:
+    raise RuntimeError("The verified solved/final FSP is missing or empty: " + REMOTE_PROJECT_FILE)
+print("Verified previously saved solved/final FSP:", REMOTE_PROJECT_FILE)
 if (
     os.path.isfile(globals().get("REMOTE_RUNTIME_PROJECT_FILE", ""))
     and os.path.abspath(REMOTE_RUNTIME_PROJECT_FILE)
@@ -4341,7 +4777,7 @@ else:
             % (fiber_measurement_mode_number, float(np.nanmax(fiber_coupling)))
         )
     mode_selection = dict(WAVEGUIDE_MODE_SELECTIONS.get(waveguide_mode_monitor_name, {}))
-    selected_neff = float(mode_selection.get("neff", GRATING_ANALYSIS.get("waveguide_target_neff", 2.5)))
+    selected_neff = float(mode_selection.get("neff", GRATING_ANALYSIS["waveguide_target_neff"]))
     selected_mode_number = int(mode_selection.get("mode number", 0))
     print(
         "Passive fiber accounting uses %s / %s fields %s, %s and %s."
@@ -4771,7 +5207,7 @@ else:
         port_names=np.asarray(mmi_port_names),
         port_selected_neff=mmi_port_neff,
         port_target_neff=np.asarray([
-            float(MMI_ANALYSIS.get("port_target_neff", 2.0))
+            float(MMI_ANALYSIS["port_target_neff"])
         ]),
         field_x_m=field_x_m,
         field_y_m=field_y_m,
@@ -4937,6 +5373,111 @@ def _sweep_mode_profile_vector(mode_profile, mode_number):
     )
 
 
+def _sweep_candidate_neff(port_path, candidate_modes):
+    """Read per-mode neff from keyed or wavelength-by-mode sweep datasets."""
+    resolver = globals().get("_fiber_candidate_neff")
+    if callable(resolver):
+        return dict(resolver(fdtd, port_path, candidate_modes))
+    dataset = fdtd.getresult(port_path, "neff")
+    normalized = {
+        "".join(character for character in str(key).lower() if character.isalnum()): key
+        for key in dataset.keys()
+    }
+    result = {}
+    for mode_number in candidate_modes:
+        key = normalized.get("neff%d" % int(mode_number))
+        if key is not None:
+            finite = np.real(np.asarray(dataset[key])).ravel()
+            finite = finite[np.isfinite(finite)]
+            if finite.size:
+                result[int(mode_number)] = float(np.median(finite))
+    if len(result) == len(candidate_modes):
+        return result
+    plain_key = normalized.get("neff")
+    if plain_key is None:
+        return result
+    values = np.real(np.asarray(dataset[plain_key])).squeeze()
+    if values.ndim == 0:
+        values = values.reshape(1)
+    mode_key = normalized.get("n")
+    if mode_key is not None:
+        mode_numbers = [
+            int(round(float(value)))
+            for value in np.asarray(dataset[mode_key]).squeeze().ravel()
+        ]
+    else:
+        mode_numbers = list(map(int, candidate_modes))
+    mode_count = len(mode_numbers)
+    if values.ndim == 1 and values.size == mode_count:
+        matrix = values.reshape(1, mode_count)
+    else:
+        axes = [axis for axis, size in enumerate(values.shape) if size == mode_count]
+        spectral_key = normalized.get("lambda") or normalized.get("f")
+        if len(axes) > 1 and spectral_key is not None:
+            spectral_size = np.asarray(dataset[spectral_key]).squeeze().size
+            axes = [axis for axis in axes if values.shape[axis] != spectral_size] or axes
+        if not axes:
+            return result
+        matrix = np.moveaxis(values, axes[-1], -1).reshape(-1, mode_count)
+    requested = set(map(int, candidate_modes))
+    for column, mode_number in enumerate(mode_numbers):
+        if mode_number not in requested:
+            continue
+        finite = np.asarray(matrix[:, column]).ravel()
+        finite = finite[np.isfinite(finite)]
+        if finite.size:
+            result[int(mode_number)] = float(np.median(finite))
+    return result
+
+
+def _sweep_gaussian_circular_scores(mode_profile, mode_number):
+    """Match the seed selector's Gaussian/circular HE11 quality scoring."""
+    seed_scorer = globals().get("_fiber_gaussian_circular_scores")
+    if callable(seed_scorer):
+        return tuple(map(float, seed_scorer(mode_profile, mode_number)))
+    electric = _sweep_mode_profile_vector(mode_profile, mode_number)
+    intensity = np.asarray(np.sum(np.abs(electric) ** 2, axis=-1), dtype=float)
+    intensity = np.squeeze(intensity)
+    while intensity.ndim > 2:
+        intensity = np.sum(intensity, axis=0)
+    if intensity.ndim != 2 or min(intensity.shape) < 2:
+        return 0.0, 0.0
+    peak = float(np.max(intensity))
+    total = float(np.sum(intensity))
+    if not np.isfinite(peak) or peak <= 0.0 or total <= 0.0:
+        return 0.0, 0.0
+    weights = intensity / total
+    axis_0 = np.linspace(-1.0, 1.0, intensity.shape[0])
+    axis_1 = np.linspace(-1.0, 1.0, intensity.shape[1])
+    grid_0, grid_1 = np.meshgrid(axis_0, axis_1, indexing="ij")
+    center_0 = float(np.sum(weights * grid_0))
+    center_1 = float(np.sum(weights * grid_1))
+    delta_0, delta_1 = grid_0 - center_0, grid_1 - center_1
+    covariance = np.asarray([
+        [np.sum(weights * delta_0 * delta_0), np.sum(weights * delta_0 * delta_1)],
+        [np.sum(weights * delta_0 * delta_1), np.sum(weights * delta_1 * delta_1)],
+    ], dtype=float)
+    eigenvalues = np.maximum(np.linalg.eigvalsh(covariance), 1e-12)
+    circularity = float(np.clip(eigenvalues[0] / eigenvalues[-1], 0.0, 1.0))
+    inverse = np.linalg.pinv(covariance + np.eye(2) * 1e-12)
+    radius_squared = (
+        inverse[0, 0] * delta_0 ** 2
+        + 2.0 * inverse[0, 1] * delta_0 * delta_1
+        + inverse[1, 1] * delta_1 ** 2
+    )
+    gaussian = np.exp(-0.5 * radius_squared)
+    similarity = float(
+        np.sum(intensity * gaussian)
+        / max(np.sqrt(np.sum(intensity ** 2) * np.sum(gaussian ** 2)), 1e-300)
+    )
+    boundary_peak = float(max(
+        np.max(intensity[0, :]), np.max(intensity[-1, :]),
+        np.max(intensity[:, 0]), np.max(intensity[:, -1]),
+    ))
+    quality = similarity * max(0.0, 1.0 - boundary_peak / peak)
+    return float(np.clip(quality, 0.0, 1.0)), circularity
+
+
 def _sweep_reselect_fiber_local_te(port_path, port, previous_selection):
     """Re-score the degenerate pair after a tilted fiber geometry change."""
     selector = globals().get("_select_fiber_local_te_mode")
@@ -4946,13 +5487,13 @@ def _sweep_reselect_fiber_local_te(port_path, port, previous_selection):
         int(value)
         for value in port.get(
             "candidate mode numbers",
-            previous_selection.get("candidate mode numbers", [1, 2]),
+            previous_selection.get("candidate mode numbers", [1, 2, 3]),
         )
         if int(value) > 0
     ]
-    candidates = list(dict.fromkeys(candidates))[:2]
-    if len(candidates) != 2:
-        raise RuntimeError("A fiber sweep requires exactly two candidate modes")
+    candidates = list(dict.fromkeys(candidates))[:3]
+    if len(candidates) < 2:
+        raise RuntimeError("A fiber sweep requires at least two candidate modes")
     fdtd.select(port_path)
     fdtd.updateportmodes(np.asarray(candidates, dtype=int))
     profile = fdtd.getresult(port_path, "mode profiles")
@@ -4960,76 +5501,101 @@ def _sweep_reselect_fiber_local_te(port_path, port, previous_selection):
     phi = np.deg2rad(phi_deg)
     target_x, target_y = -np.sin(phi), np.cos(phi)
     scores = {}
+    gaussian_scores = {}
+    circularity_scores = {}
     for mode_number in candidates:
         electric = _sweep_mode_profile_vector(profile, mode_number)
         desired = target_x * electric[..., 0] + target_y * electric[..., 1]
         scores[mode_number] = float(np.sum(np.abs(desired) ** 2)) / max(
             float(np.sum(np.abs(electric) ** 2)), 1e-300
         )
-    selected_mode = max(candidates, key=lambda number: scores[number])
-    minimum_fraction = float(port.get("minimum local TE fraction", 0.8))
-    if scores[selected_mode] < minimum_fraction:
-        raise RuntimeError(
-            "No fiber mode is sufficiently normal to the %.6g degree grating axis: %r"
-            % (phi_deg, scores)
+        gaussian_scores[mode_number], circularity_scores[mode_number] = (
+            _sweep_gaussian_circular_scores(profile, mode_number)
         )
-    # The pair was just calculated in candidate order.  Select the source by
-    # its eigensolver mode number; do not run the same two-mode calculation a
-    # second time simply to reorder the stored results.
-    selected_order = list(candidates)
     neff_delta = None
+    selected_pair = tuple(candidates[:2])
     try:
-        neff_dataset = fdtd.getresult(port_path, "neff")
-        normalized_keys = {
-            "".join(character for character in str(key).lower() if character.isalnum()): key
-            for key in neff_dataset.keys()
-        }
-        neff_values = []
-        for mode_number in candidates:
-            key = normalized_keys.get("neff%d" % mode_number)
-            if key is not None:
-                values = np.real(np.asarray(neff_dataset[key])).ravel()
-                finite = values[np.isfinite(values)]
-                if finite.size:
-                    neff_values.append(float(np.median(finite)))
-        if len(neff_values) < 2 and normalized_keys.get("neff") is not None:
-            values = np.real(
-                np.asarray(neff_dataset[normalized_keys["neff"]])
-            ).ravel()
-            finite = values[np.isfinite(values)]
-            if finite.size >= 2:
-                neff_values = list(map(float, finite[:2]))
-        if len(neff_values) >= 2:
-            neff_delta = abs(neff_values[0] - neff_values[1])
+        neff_by_mode = _sweep_candidate_neff(port_path, candidates)
+        if len(neff_by_mode) == len(candidates):
             tolerance = max(
                 0.0, float(port.get("mode degeneracy tolerance", 0.01))
             )
-            if neff_delta > tolerance:
+            pairs = [
+                (first, second)
+                for pair_index, first in enumerate(candidates)
+                for second in candidates[pair_index + 1:]
+                if abs(neff_by_mode[first] - neff_by_mode[second]) <= tolerance
+            ]
+            if not pairs:
                 raise RuntimeError(
-                    "Fiber modes %r are not near-degenerate after tilt update: "
-                    "delta neff %.6g > %.6g"
-                    % (candidates, neff_delta, tolerance)
+                    "The first three fiber modes %r contain no near-degenerate pair "
+                    "after tilt update: neff=%r, tolerance=%.6g"
+                    % (candidates, neff_by_mode, tolerance)
                 )
+            fiber_target = float(port.get("fiber target neff", 1.44))
+            selected_pair = min(
+                pairs,
+                key=lambda pair: abs(
+                    0.5 * (neff_by_mode[pair[0]] + neff_by_mode[pair[1]])
+                    - fiber_target
+                ),
+            )
+            neff_delta = abs(
+                neff_by_mode[selected_pair[0]] - neff_by_mode[selected_pair[1]]
+            )
     except RuntimeError:
         raise
     except Exception:
         # Some Lumerical builds expose only profile fields here.  The nominal
         # seed-build degeneracy check has already validated this same pair.
         neff_delta = None
+    composite_scores = {
+        mode_number: (
+            0.75 * scores[mode_number]
+            + 0.15 * gaussian_scores[mode_number]
+            + 0.10 * circularity_scores[mode_number]
+        )
+        for mode_number in selected_pair
+    }
+    selected_mode = max(selected_pair, key=lambda number: composite_scores[number])
+    minimum_fraction = float(port.get("minimum local TE fraction", 0.8))
+    if scores[selected_mode] < minimum_fraction:
+        raise RuntimeError(
+            "No fiber mode is sufficiently normal to the %.6g degree grating axis: %r"
+            % (phi_deg, scores)
+        )
+    partner_mode = next(
+        mode_number for mode_number in selected_pair if mode_number != selected_mode
+    )
+    selected_order = [selected_mode, partner_mode] + [
+        mode_number
+        for mode_number in candidates
+        if mode_number not in {selected_mode, partner_mode}
+    ]
     selection = dict(previous_selection)
     selection.update({
         "mode number": int(selected_mode),
         "selected mode order": list(selected_order),
         "candidate mode numbers": list(candidates),
+        "degenerate mode pair": list(selected_pair),
         "local TE scores": {str(key): float(value) for key, value in scores.items()},
+        "gaussian scores": {
+            str(key): float(value) for key, value in gaussian_scores.items()
+        },
+        "circularity scores": {
+            str(key): float(value) for key, value in circularity_scores.items()
+        },
+        "composite scores": {
+            str(key): float(value) for key, value in composite_scores.items()
+        },
         "grating axis deg": float(phi_deg),
         "target polarization xy": [float(target_x), float(target_y)],
         "polarization": "local TE",
         "neff degeneracy delta": neff_delta,
     })
     print(
-        "Re-selected fiber port %s mode %d from pair %r after tilt update; local-TE scores %r."
-        % (port.get("name", port_path), selected_mode, candidates, scores)
+        "Re-selected fiber port %s mode %d from pair %r after solving candidates %r; local-TE scores %r."
+        % (port.get("name", port_path), selected_mode, selected_pair, candidates, scores)
     )
     return selection
 
@@ -5172,6 +5738,29 @@ def _apply_sweep_case(case_index):
     MONITORS = list(case["monitors"])
     GRATING_ANALYSIS = case.get("grating_analysis")
     MMI_ANALYSIS = case.get("mmi_analysis")
+    waveguide_index_estimate = dict(
+        globals().get("WAVEGUIDE_INDEX_ESTIMATE", {})
+    )
+    material_target_neff = float(
+        waveguide_index_estimate.get("target_neff", 0.0)
+    )
+    if GRATING_ANALYSIS and material_target_neff > 0.0:
+        GRATING_ANALYSIS["waveguide_target_neff"] = material_target_neff
+        GRATING_ANALYSIS["waveguide_index_estimate"] = dict(
+            waveguide_index_estimate
+        )
+    if MMI_ANALYSIS and material_target_neff > 0.0:
+        MMI_ANALYSIS["port_target_neff"] = material_target_neff
+        MMI_ANALYSIS["waveguide_index_estimate"] = dict(
+            waveguide_index_estimate
+        )
+    for item in [*PORTS, *MONITORS]:
+        if (
+            str(item.get("grating_monitor_role", ""))
+            == "waveguide_mode_expansion"
+            or "target neff strategy" in item
+        ) and material_target_neff > 0.0:
+            item["target neff"] = material_target_neff
     _restore_sweep_fiber_mode_contract()
 
     layer_builder_name = "Max Layout material stack"
@@ -5351,7 +5940,7 @@ def _apply_sweep_case(case_index):
             for port_name in mmi_port_names:
                 port = ports_by_name.get(port_name, {})
                 target_neff = float(port.get(
-                    "target neff", MMI_ANALYSIS.get("port_target_neff", 2.0)
+                    "target neff", MMI_ANALYSIS["port_target_neff"]
                 ))
                 tolerance = max(0.0, float(port.get(
                     "neff tolerance", MMI_ANALYSIS.get("port_neff_tolerance", 0.3)
@@ -6028,7 +6617,17 @@ def _finalize_sweep_results(failures):
         return ("%.*g" % (int(digits), number)) if np.isfinite(number) else str(number)
 
     def _sweep_summary_json(value):
-        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        def _reported(item):
+            if isinstance(item, dict):
+                return {
+                    str(key): _reported(child)
+                    for key, child in item.items()
+                    if str(key) != "waveguide_effective_index"
+                }
+            if isinstance(item, (list, tuple)):
+                return [_reported(child) for child in item]
+            return item
+        return json.dumps(_reported(value), sort_keys=True, separators=(",", ":"), default=str)
 
     def _sweep_summary_section(lines, title):
         if lines:
@@ -6078,7 +6677,6 @@ def _finalize_sweep_results(failures):
         "fdtd_port_offset_from_waveguide_end_um": ("Waveguide FDTD-port offset from waveguide end", "um"),
         "waveguide_monitor_span_um": ("Waveguide mode-monitor transverse span", "um"),
         "waveguide_total_power_before_mode_um": ("Total-power plane distance before waveguide mode plane", "um"),
-        "waveguide_effective_index": ("Waveguide target effective index", ""),
         "waveguide_neff_tolerance": ("Waveguide effective-index tolerance", ""),
         "waveguide_mode_search_count": ("Waveguide eigensolver modes searched", ""),
         "tolerance": ("Geometry build tolerance", "um"),
@@ -6104,7 +6702,7 @@ def _finalize_sweep_results(failures):
             ))
             found += 1
             shown.add(key)
-        ignored = {"name", "layer", "datatype"}
+        ignored = {"name", "layer", "datatype", "waveguide_effective_index"}
         for key, value in parameters.items():
             if (
                 key in shown or key in ignored or key.endswith("_layer")
@@ -6257,6 +6855,22 @@ def _finalize_sweep_results(failures):
             _sweep_summary_number(SETTINGS.get("tfln_temperature_K", 296.3)),
         ),
     ])
+    waveguide_index_estimate = dict(
+        globals().get("WAVEGUIDE_INDEX_ESTIMATE", {})
+    )
+    if waveguide_index_estimate:
+        summary_lines.append(
+            "- Automatic waveguide mode target: core n=%s | adjacent dielectric n=%s | "
+            "midpoint neff=%s at %s um | core=%s | surroundings=%s"
+            % (
+                _sweep_summary_number(waveguide_index_estimate.get("core_index")),
+                _sweep_summary_number(waveguide_index_estimate.get("surrounding_index")),
+                _sweep_summary_number(waveguide_index_estimate.get("target_neff")),
+                _sweep_summary_number(waveguide_index_estimate.get("wavelength_um")),
+                _sweep_summary_json(waveguide_index_estimate.get("core_materials", [])),
+                _sweep_summary_json(waveguide_index_estimate.get("surrounding_materials", [])),
+            )
+        )
 
     _sweep_summary_section(summary_lines, "SOURCES / PORTS / MONITORS")
     summary_lines.append("Fiber geometries: %s" % _sweep_summary_json([
@@ -6624,7 +7238,7 @@ subprocess.run(
 )
 _checkout = subprocess.run(
     [os.path.join(_lic, "LicensingSettings"), "web", "shared", "products", "checkout",
-     "--name", "Ansys HPC Pack - Shared Web", "--count", "3", "--expires", "P1D", "--mode", "user"],
+     "--name", "Ansys HPC Pack - Shared Web", "--count", "3", "--expires", "PT4H", "--mode", "user"],
     capture_output=True, text=True, timeout=180,
 )
 _checkout_text = (_checkout.stdout + _checkout.stderr).strip()
@@ -7086,7 +7700,8 @@ REMOTE_ARTIFACTS = [
 ]
 if SHOW_GEOMETRY_PREVIEW:
     REMOTE_ARTIFACTS.append(REMOTE_WORK + "/geometry_xyz_projections.png")
-REMOTE_ARTIFACTS.insert(0, REMOTE_PROJECT_FILE)
+# The solved/final FSP was already verified and fetched immediately after the
+# solve, before optional analysis.  Do not transfer that large file twice.
 if PORTS and SHOW_PORT_MODE_PREVIEW:
     REMOTE_ARTIFACTS.append(REMOTE_WORK + "/port_mode_Ex_Ey.png")
 if GRATING_ANALYSIS and SETTINGS.get("run_after_build", False):
@@ -7168,10 +7783,25 @@ def generate_lumerical_notebook(
         included,
         origin_um=configuration.get("_fixed_origin_um"),
     )
+    for component in components:
+        if str(component.get("kind", "")) not in {
+            "Grating coupler", "GC-SOI", "1x2 MMI",
+        }:
+            continue
+        params = component.setdefault("params", {})
+        if params.pop("waveguide_effective_index", None) is not None:
+            warnings.append(
+                "Ignored legacy waveguide_effective_index on %s UID %s; the notebook derives "
+                "the target from the actual dispersive core and adjacent stack materials."
+                % (component.get("kind", "component"), component.get("uid", 0))
+            )
     _promote_fiber_measurement_ports(ports, monitors, warnings)
     if not bool(configuration.get("include_ports", True)):
         ports = []
     alignment_stack = deepcopy(configuration.get("material_stack") or default_stack())
+    _apply_authoritative_grating_angles(
+        components, ports, fiber_geometries, monitors, warnings
+    )
     _synchronize_fiber_port_parameters(
         ports, fiber_geometries, monitors, warnings, alignment_stack
     )
@@ -7230,15 +7860,16 @@ def generate_lumerical_notebook(
         ]
         if matching_measurement_ports:
             fiber_measurement_ports = matching_measurement_ports
-        # Fiber HE11 is a near-degenerate polarization pair.  Never trust the
-        # legacy fixed mode-2/Ey choice: calculate both candidates remotely and
-        # select the member polarized perpendicular to the grating axis.  The
-        # exported global phi already includes component rotation.
+        # Fiber HE11 is a near-degenerate polarization pair, but the pair is
+        # not guaranteed to be returned as eigensolver modes 1 and 2.  Solve
+        # the first three modes, identify the pair nearest the fiber index,
+        # then select its Gaussian/circular member polarized perpendicular to
+        # the grating axis.  The exported global phi includes rotation.
         for fiber_mode_port in [*fiber_ports, *fiber_measurement_ports]:
             fiber_mode_port["mode"] = "user select"
             fiber_mode_port["mode number"] = 0
             fiber_mode_port["polarization"] = "local TE"
-            fiber_mode_port["candidate mode numbers"] = [1, 2]
+            fiber_mode_port["candidate mode numbers"] = [1, 2, 3]
             fiber_mode_port.setdefault("mode degeneracy tolerance", 0.01)
             fiber_mode_port.setdefault("minimum local TE fraction", 0.8)
         if not grating_polygons:
@@ -7272,6 +7903,10 @@ def generate_lumerical_notebook(
             points = np.vstack([np.asarray(item["vertices_um"], dtype=float) for item in grating_polygons])
             minimum, maximum = points.min(axis=0), points.max(axis=0)
             waveguide_power_monitor = deepcopy(waveguide_power_monitors[0])
+            waveguide_mode_monitors[0]["target neff"] = 0.0
+            waveguide_mode_monitors[0]["target neff strategy"] = (
+                "automatic midpoint of actual core and adjacent dielectric indices"
+            )
             waveguide_mode_monitor = deepcopy(waveguide_mode_monitors[0])
             grating_center = 0.5 * (minimum + maximum)
             fiber_port = min(
@@ -7336,13 +7971,16 @@ def generate_lumerical_notebook(
                         )
                         else "Tbackward"
                     ),
-                    "waveguide_target_neff": float(waveguide_mode_monitor.get("target neff", 2.5)),
+                    "waveguide_target_neff": 0.0,
+                    "waveguide_target_strategy": (
+                        "automatic midpoint of actual core and adjacent dielectric indices"
+                    ),
                     "waveguide_neff_tolerance": float(waveguide_mode_monitor.get("neff tolerance", 0.3)),
                     "fiber_port_name": fiber_port_name,
                     "fiber_source_mode": "auto local TE",
                     "fiber_polarization": "local TE",
                     "fiber_axis_orientation_deg": float(fiber_port.get("angle phi", 0.0)),
-                    "fiber_mode_candidates": [1, 2],
+                    "fiber_mode_candidates": [1, 2, 3],
                     "fiber_geometry_name": str(fiber_geometry.get("name", "fiber")),
                     "fiber_input_measurement_port_name": str(fiber_measurement_port.get("name", "")),
                     "fiber_measurement_expansion_result_name": "expansion for port monitor",
@@ -7389,7 +8027,6 @@ def generate_lumerical_notebook(
             upper_port = by_parent_name["upper_right"]
             lower_port = by_parent_name["lower_right"]
             mmi_params = mmi.get("params", {})
-            mmi_target_neff = float(mmi_params.get("waveguide_effective_index", 2.0))
             mmi_neff_tolerance = max(
                 0.0, float(mmi_params.get("waveguide_neff_tolerance", 0.3))
             )
@@ -7407,7 +8044,10 @@ def generate_lumerical_notebook(
                 # older layout file or were placed manually.
                 port["mode"] = str(port.get("mode", "fundamental TE mode"))
                 port["polarization"] = "local TE"
-                port["target neff"] = mmi_target_neff
+                port["target neff"] = 0.0
+                port["target neff strategy"] = (
+                    "automatic midpoint of actual core and adjacent dielectric indices"
+                )
                 port["neff tolerance"] = mmi_neff_tolerance
                 port["mode search count"] = mmi_mode_search_count
                 port["mmi port role"] = role_label
@@ -7480,7 +8120,10 @@ def generate_lumerical_notebook(
                         "MMI upper output",
                         "MMI lower output",
                     ],
-                    "port_target_neff": mmi_target_neff,
+                    "port_target_neff": 0.0,
+                    "port_target_strategy": (
+                        "automatic midpoint of actual core and adjacent dielectric indices"
+                    ),
                     "port_neff_tolerance": mmi_neff_tolerance,
                     "port_required_polarization": "local TE",
                     "ideal_split_percent": [50.0, 50.0],
@@ -7712,14 +8355,29 @@ def generate_lumerical_notebook(
         "        raise ValueError('resource_mode must be GPU or CPU')\n"
         "    solve_remote_checked(_solve_code, label='Max Layout 3D FDTD [' + _resource_mode + ']', timeout=21600)\n"
         "    run_remote_checked(REMOTE_SWITCH_TO_CPU_ANALYSIS, 'Switch post-processing to CPU', timeout=300)\n"
-        "    print(\"Simulation finished. The solved project will be saved once with the numerical result bundle.\")\n"
+        "    print(\"Simulation finished. The solved project will be saved in the next dedicated FSP section.\")\n"
         "else:\n"
         "    print(\"Run is disabled. The verified live model was built but not solved.\")\n"
+    )
+    final_fsp_cell = (
+        "# Save and fetch the solved model before any optional analysis can fail.\n"
+        "REMOTE_FINAL_FSP_SAVE = '''\n"
+        "save_verified_project(REMOTE_PROJECT_FILE)\n"
+        "REMOTE_FINAL_FSP_SAVED = True\n"
+        "print('Saved solved/final FSP:', REMOTE_PROJECT_FILE)\n"
+        "'''\n"
+        "run_remote_checked(REMOTE_FINAL_FSP_SAVE, 'Save solved/final project', timeout=1800)\n"
+        "PIRIS_FSP_DIR.mkdir(parents=True, exist_ok=True)\n"
+        "LOCAL_FINAL_PROJECT_FILE = PIRIS_FSP_DIR / os.path.basename(REMOTE_PROJECT_FILE)\n"
+        "FETCHED_FINAL_PROJECT_FILE = lam.fetch(REMOTE_PROJECT_FILE, str(LOCAL_FINAL_PROJECT_FILE))\n"
+        "if not LOCAL_FINAL_PROJECT_FILE.is_file() or LOCAL_FINAL_PROJECT_FILE.stat().st_size <= 0:\n"
+        "    raise RuntimeError('The solved/final .fsp could not be downloaded into the project fsp folder: ' + str(LOCAL_FINAL_PROJECT_FILE))\n"
+        "print('saved solved/final project ->', FETCHED_FINAL_PROJECT_FILE)\n"
     )
     save_results_cell = (
         "# Serialize model results while the FDTD licence and remote session are still active.\n"
         f"REMOTE_RESULTS_SAVER = {repr(_SAVE_REMOTE_RESULTS)}\n"
-        "run_remote_checked(REMOTE_RESULTS_SAVER, 'Save project and numerical result bundle', timeout=1800)\n"
+        "run_remote_checked(REMOTE_RESULTS_SAVER, 'Save numerical result bundle', timeout=1800)\n"
     )
     grating_analysis_cell = (
         "# Extract the small spectrum remotely, then plot it locally without remote Matplotlib startup or PNG transfer.\n"
@@ -7828,7 +8486,7 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
 - A conformal cladding row is a continuous full-domain gap-fill volume: it fills every etched opening and covers every waveguide/grating polygon, flare, terminal arc, and extension. Lower mesh-order device material wins wherever the volumes overlap.
 - The FDTD boundary keeps at least λ/4 clearance from ordinary device features. Background films may extend through their PMLs, but ports never create additional waveguide-to-PML geometry; only the polygons exported from the layout are simulated.
 - `LiNbO3` is created as a frequency- and temperature-dependent anisotropic sampled material using the Zelmon/Moretti model and the selected X/Y/Z crystal cut.
-- Grating-coupler exports calculate both near-degenerate fiber modes and excite only the verified local-TE mode (Ey for an unrotated grating). The passive tilted fiber port independently selects that same physical polarization and reports its power toward the grating (`|T_in|`), reflected power toward the source (`|T_out|`), physical net (`|T_in| - |T_out|`), and raw signed `Tnet` diagnostic. Orthogonal-polarization power is not added to the normalization. The reported coupling efficiency is the source-normalized selected waveguide-mode power divided by the selected-polarization forward power measured at that passive fiber port; source-normalized waveguide mode and total powers remain available separately. Power traces remain linear, while coupling efficiency is plotted side by side in both linear and dB units.
+- Grating-coupler exports solve the first three fiber modes, identify the near-degenerate Gaussian/circular HE11 pair closest to the fiber index, and excite only its verified local-TE member (Ey for an unrotated grating). The passive tilted fiber port independently verifies that same physical polarization and reports its power toward the grating (`|T_in|`), reflected power toward the source (`|T_out|`), physical net (`|T_in| - |T_out|`), and raw signed `Tnet` diagnostic. Orthogonal-polarization power is not added to the normalization. The reported coupling efficiency is the source-normalized selected waveguide-mode power divided by the selected-polarization forward power measured at that passive fiber port; source-normalized waveguide mode and total powers remain available separately. Power traces remain linear, while coupling efficiency is plotted side by side in both linear and dB units.
 - A 1×2 MMI export launches mode 1 from its input port, measures input power 2 µm before the input taper, plots both output powers relative to that measured input, and plots the normalized longitudinal |E|² distribution through the complete MMI.
 - GPU and CPU modes are selectable through `SETTINGS['resource_mode']`; GPU is the default for every 3D export.
 - The first cell exposes run, diagnostic-preview, and GPU-system-check switches. Project saving is mandatory: one inspection FSP is written before the solve and one solved/best FSP is written afterward.
@@ -7856,6 +8514,8 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
             _notebook_cell("code", review_project_cell),
             _notebook_cell("markdown", "## 9 · Run the live 3D model\n"),
             _notebook_cell("code", solve_cell),
+            _notebook_cell("markdown", "## 10 · Save and download the solved FSP\n\nThis verified project is placed in the project `fsp` folder before coupling/splitting analysis begins.\n"),
+            _notebook_cell("code", final_fsp_cell),
             *(
                 [
                     _notebook_cell("markdown", "## 10 · Grating coupling efficiency\n\nThe upper tilted fiber port is the only source. A second passive port on the same fiber axis measures forward, reflected and net modal power below it. The coupling-efficiency curve is the selected waveguide-mode power normalized by that measured forward fiber power; source-normalized waveguide powers are retained separately. Power accounting is linear, and coupling efficiency is displayed side by side in linear and dB units.\n"),

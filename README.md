@@ -185,9 +185,14 @@ Raise the thread count at **Layout → Performance / CPU Threads…**, or set
   before covering the device. A zero thickness disables that material.
   Generated 3D FDTD notebooks use GPU execution by default.
 - E-beam write-field creation and GDS, project JSON, FTEXT, and field export.
+  New generic photonic test blocks contain device GDS only; add E-beam coverage
+  after arranging the block. Complete field sets and individual fields can be
+  moved or reordered without moving the covered device geometry.
 - CPU thread control and optional OpenGL canvas acceleration.
-- Cached component geometry and layer-batched rendering for fast generation of
-  repeated arrays and large photonic-crystal structures.
+- Exact canvas/GDS polygon parity by default, with cached component geometry
+  and layer-batched rendering for repeated arrays. Exceptionally large legacy
+  layouts can opt into the older display-only approximation with
+  `MAX_LAYOUT_APPROXIMATE_PREVIEW=1`; exported GDS remains exact.
 
 ## Lumerical simulation notebooks
 
@@ -221,6 +226,18 @@ waveguides, tapers, MMIs, coplanar waveguides, gratings, groups, and complete la
 an `XY` top view, `XZ` side view, and `YZ` end view built from the exact embedded polygons,
 films, etch depths, and sidewall angles sent to Lumerical. The combined verification image is
 also saved with the results.
+
+Grating notebooks use the requested CPU-thread count while constructing
+geometry and calculating embedded modes, then switch to GPU for the 3D solve
+and back to CPU for analysis. The waveguide-mode target is calculated from the
+actual dispersive core and adjacent dielectric indices at the band center; no
+fixed SOI or TFLN effective index is imposed. Fiber ports calculate the first
+three modes, identify the near-degenerate Gaussian/circular fiber pair, and
+select the member polarized normal to the grating axis (including layout
+rotation). The parent grating's single `angle_theta` value controls the fiber,
+source, and passive measurement plane together. Both the inspection model and
+the solved model are verified and downloaded into the project's `fsp` folder;
+the solved FSP is fetched before optional response analysis can fail.
 
 The component right-click menu also provides two independent parameter-sweep
 exports. **Lumerical sweep…** keeps one persistent FDTD session on one GPU and
@@ -303,10 +320,11 @@ rather than as colored top planes only. Very thick first/last background layers 
 cropped by the chosen domain and continue through the PML.
 
 Every generated Lumerical notebook manages the complete remote licence
-lifecycle: acquire the required solver and HPC licences, build and run, save
-and fetch results, close FDTD, release the HPC packs, and close the remote
-session. Remote build, solve, analysis, and save stages are checked explicitly
-so a hidden remote traceback cannot become a misleading missing-file message.
+lifecycle: roam exactly three Shared-Web HPC Packs for a four-hour session,
+build and run, save and fetch results, close FDTD, release the HPC packs, and
+close the remote session. Remote build, solve, analysis, and save stages are
+checked explicitly so a hidden remote traceback cannot become a misleading
+missing-file message.
 
 Every completed single run, sequential sweep, multi-GPU sweep, and adjoint
 optimization also writes and fetches `summary.txt`. It records the exact source

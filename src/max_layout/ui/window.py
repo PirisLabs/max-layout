@@ -249,13 +249,13 @@ def grating_angle_theta_deg(component: dict[str, Any]) -> float:
     kind = str(component.get("kind", ""))
     if kind not in {"Grating coupler", "GC-SOI"}:
         raise ValueError("angle_theta is defined only for grating couplers")
+    # This migration writes the editable UI default or a legacy fiber_tilt_deg
+    # into the parent JSON once.  Every companion reads that one stored value.
+    migrate_grating_fiber_offset_parameter(component)
     params = component.get("params", {})
-    value = float(
-        params.get(
-            "angle_theta",
-            params.get("fiber_tilt_deg", 10.0 if kind == "GC-SOI" else 7.0),
-        )
-    )
+    if "angle_theta" not in params:
+        raise ValueError("Grating parent JSON is missing its authoritative angle_theta")
+    value = float(params["angle_theta"])
     if not math.isfinite(value) or value < 0.0 or value >= 90.0:
         raise ValueError("Grating fiber angle_theta must be at least 0 and below 90 degrees")
     return value
@@ -1670,7 +1670,7 @@ class NativeLayoutWindow(QMainWindow):
         action("reset_fields", "Reset fields", self.reset_selected_ebeam_fields, None, None, ebeam_menu)
         action("remove_field", "Remove field", self.remove_active_field, None, None, ebeam_menu)
         action("field_order", "Assign order", self.assign_active_field_order, None, ebeam_toolbar, ebeam_menu)
-        action("move_ebeam_block", "Move Entire E-beam Block…", self.position_entire_array, None, ebeam_toolbar, ebeam_menu, status_tip="Position a complete generated E-beam array or premade test block by its absolute center.")
+        action("move_ebeam_block", "Move Entire E-beam Block…", self.position_selected_ebeam_blocks, None, ebeam_toolbar, ebeam_menu, status_tip="Move the selected E-beam field group without moving its covered GDS geometry.")
         action("field_earlier", "Field Earlier", lambda: self.shift_active_field_order(-1), None, None, ebeam_menu)
         action("field_later", "Field Later", lambda: self.shift_active_field_order(1), None, None, ebeam_menu)
         ebeam_toolbar.addSeparator()
@@ -1932,9 +1932,7 @@ class NativeLayoutWindow(QMainWindow):
         geometry continue each ported waveguide through the corresponding PML.
         """
         kind = str(component.get("kind", ""))
-        default_waveguide_neff = 2.5 if kind == "GC-SOI" else 2.0
         component_params = component.get("params", {})
-        mmi_target_neff = float(component_params.get("waveguide_effective_index", 2.0))
         mmi_neff_tolerance = max(
             0.0, float(component_params.get("waveguide_neff_tolerance", 0.3))
         )
@@ -2044,11 +2042,12 @@ class NativeLayoutWindow(QMainWindow):
                         "x span": 0.0,
                         "y span": monitor_span_um,
                         "z span": 2.25,
-                        # The official Ansys 3D SOI receiver is automatic mode
-                        # 1 with the eigensolver's maximum-index search.  The
-                        # target neff below is validation, not mode selection.
+                        # Zero is the automatic sentinel.  The notebook replaces
+                        # it with the midpoint derived from the dispersive core
+                        # and adjacent stack materials at the center wavelength.
                         "mode": "fundamental mode",
-                        "target neff": float(grating_params.get("waveguide_effective_index", default_waveguide_neff)),
+                        "target neff": 0.0,
+                        "target neff strategy": "automatic material-index midpoint",
                         "neff tolerance": max(0.0, float(grating_params.get("waveguide_neff_tolerance", 0.3))),
                         "mode search count": max(1, int(grating_params.get("waveguide_mode_search_count", 20))),
                         "expansion for": power_name,
@@ -2082,7 +2081,8 @@ class NativeLayoutWindow(QMainWindow):
                     {
                         "mode": "fundamental TE mode",
                         "polarization": "local TE",
-                        "target neff": mmi_target_neff,
+                        "target neff": 0.0,
+                        "target neff strategy": "automatic material-index midpoint",
                         "neff tolerance": mmi_neff_tolerance,
                         "mode search count": mmi_mode_search_count,
                     }
@@ -2287,7 +2287,7 @@ class NativeLayoutWindow(QMainWindow):
                     "mode number": int(fiber_port["params"].get("mode number", 0)),
                     "polarization": str(fiber_port["params"].get("polarization", "local TE")),
                     "candidate mode numbers": list(
-                        fiber_port["params"].get("candidate mode numbers", [1, 2])
+                        fiber_port["params"].get("candidate mode numbers", [1, 2, 3])
                     ),
                     "mode degeneracy tolerance": float(
                         fiber_port["params"].get("mode degeneracy tolerance", 0.01)
@@ -2295,7 +2295,9 @@ class NativeLayoutWindow(QMainWindow):
                     "minimum local TE fraction": float(
                         fiber_port["params"].get("minimum local TE fraction", 0.8)
                     ),
-                    "angle theta": float(fiber_port["params"].get("angle theta", fiber_angle_deg)),
+                    # The grating parent's angle_theta is the only authority;
+                    # source, passive plane, and fiber geometry move together.
+                    "angle theta": fiber_angle_deg,
                     "angle phi": float(fiber_port["params"].get("angle phi", 0.0)),
                     "align to fiber axis": True,
                     "rotation offset_um": float(fiber_port["params"].get("rotation offset_um", 0.0)),
@@ -2316,7 +2318,6 @@ class NativeLayoutWindow(QMainWindow):
             return False
         if str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"}:
             grating_params = component.get("params", {})
-            default_waveguide_neff = 2.5 if str(component.get("kind", "")) == "GC-SOI" else 2.0
             monitor_span_um = automatic_waveguide_port_span_um(component, "waveguide_point")
             waveguide_power_name = f"uid_{parent_uid}_waveguide_total_power"
             # Older projects used a waveguide-side FDTD port. Convert it to a
@@ -2337,7 +2338,8 @@ class NativeLayoutWindow(QMainWindow):
                             "y span": monitor_span_um,
                             "z span": 2.25,
                             "mode": "fundamental mode",
-                            "target neff": float(grating_params.get("waveguide_effective_index", default_waveguide_neff)),
+                            "target neff": 0.0,
+                            "target neff strategy": "automatic material-index midpoint",
                             "neff tolerance": max(0.0, float(grating_params.get("waveguide_neff_tolerance", 0.3))),
                             "mode search count": max(1, int(grating_params.get("waveguide_mode_search_count", 20))),
                             "expansion for": waveguide_power_name,
@@ -2432,7 +2434,7 @@ class NativeLayoutWindow(QMainWindow):
                             "mode number": int(source_params.get("mode number", 0)),
                             "polarization": str(source_params.get("polarization", "local TE")),
                             "candidate mode numbers": list(
-                                source_params.get("candidate mode numbers", [1, 2])
+                                source_params.get("candidate mode numbers", [1, 2, 3])
                             ),
                             "mode degeneracy tolerance": float(
                                 source_params.get("mode degeneracy tolerance", 0.01)
@@ -2440,7 +2442,7 @@ class NativeLayoutWindow(QMainWindow):
                             "minimum local TE fraction": float(
                                 source_params.get("minimum local TE fraction", 0.8)
                             ),
-                            "angle theta": float(source_params.get("angle theta", old.get("angle theta", 7.0))),
+                            "angle theta": grating_angle_theta_deg(component),
                             "angle phi": float(source_params.get("angle phi", old.get("angle phi", 0.0))),
                             "align to fiber axis": True,
                             "rotation offset_um": float(source_params.get("rotation offset_um", 0.0)),
@@ -2460,7 +2462,7 @@ class NativeLayoutWindow(QMainWindow):
                     float(params.get("fiber_power_monitor_below_source_um", 0.1)),
                 )
                 source_params = fiber_source.get("params", {})
-                source_theta_deg = float(source_params.get("angle theta", 7.0))
+                source_theta_deg = grating_angle_theta_deg(component)
                 source_phi_rad = math.radians(
                     float(fiber_source.get("orientation_deg", 0.0))
                     + float(source_params.get("angle phi", 0.0))
@@ -2491,7 +2493,7 @@ class NativeLayoutWindow(QMainWindow):
                         "mode number": int(source_params.get("mode number", 0)),
                         "polarization": str(source_params.get("polarization", "local TE")),
                         "candidate mode numbers": list(
-                            source_params.get("candidate mode numbers", [1, 2])
+                            source_params.get("candidate mode numbers", [1, 2, 3])
                         ),
                         "mode degeneracy tolerance": float(
                             source_params.get("mode degeneracy tolerance", 0.01)
@@ -2552,12 +2554,8 @@ class NativeLayoutWindow(QMainWindow):
                                     "y span": monitor_span_um,
                                     "z span": 2.25,
                                     "mode": "fundamental mode",
-                                    "target neff": float(
-                                        component.get("params", {}).get(
-                                            "waveguide_effective_index",
-                                            2.5 if str(component.get("kind", "")) == "GC-SOI" else 2.0,
-                                        )
-                                    ),
+                                    "target neff": 0.0,
+                                    "target neff strategy": "automatic material-index midpoint",
                                     "neff tolerance": max(0.0, float(component.get("params", {}).get("waveguide_neff_tolerance", 0.3))),
                                     "mode search count": max(1, int(component.get("params", {}).get("waveguide_mode_search_count", 20))),
                                     "expansion for": f"uid_{parent_uid}_waveguide_total_power",
@@ -2572,11 +2570,8 @@ class NativeLayoutWindow(QMainWindow):
                             {
                                 "mode": "fundamental TE mode",
                                 "polarization": "local TE",
-                                "target neff": float(
-                                    component.get("params", {}).get(
-                                        "waveguide_effective_index", 2.0
-                                    )
-                                ),
+                                "target neff": 0.0,
+                                "target neff strategy": "automatic material-index midpoint",
                                 "neff tolerance": max(
                                     0.0,
                                     float(
@@ -2754,7 +2749,7 @@ class NativeLayoutWindow(QMainWindow):
                             "candidate mode numbers": list(
                                 source_port_params.get(
                                     "candidate mode numbers",
-                                    companion["params"].get("candidate mode numbers", [1, 2]),
+                                    companion["params"].get("candidate mode numbers", [1, 2, 3]),
                                 )
                             ),
                             "mode degeneracy tolerance": float(
@@ -3186,11 +3181,12 @@ class NativeLayoutWindow(QMainWindow):
                 self.add_component_scene_item(component)
             except Exception as exc:
                 self.statusBar().showMessage(f"Preview error for UID {component.get('uid')}: {exc}")
-        # Enforce geometry intersection every time a project is rebuilt or
-        # reopened.  This prevents stale/manual write fields with no covered
-        # geometry from surviving into the GUI, FTXT, or GDS exports.
+        # Auto-generated coverage follows its source until a user moves or
+        # rearranges the field set.  A manually locked layout is intentionally
+        # independent and must survive scene rebuilds and project reopen.
         for component in self.components:
             if component.get("kind")!="E-beam multipass":continue
+            if bool(component.get("params",{}).get("manual_layout_locked",False)):continue
             before=set(map(str,component.get("params",{}).get("auto_pruned_field_keys",[])));self.prune_ebeam_component(component);after=set(map(str,component.get("params",{}).get("auto_pruned_field_keys",[])))
             if after!=before:
                 item=self.items_by_uid.get(int(component["uid"]))
@@ -3372,17 +3368,17 @@ class NativeLayoutWindow(QMainWindow):
                 ),
             )
             grating_params.setdefault("waveguide_total_power_before_mode_um", 1.0)
-            grating_params.setdefault(
-                "waveguide_effective_index",
-                2.5 if component.get("kind") == "GC-SOI" else 2.0,
-            )
+            # Legacy projects serialized a guessed platform-specific neff.
+            # Remove it from the editable model: export derives the validation
+            # target from the actual dispersive stack at the center wavelength.
+            grating_params.pop("waveguide_effective_index", None)
             grating_params.setdefault("waveguide_neff_tolerance", 0.3)
             grating_params.setdefault("waveguide_mode_search_count", 20)
         if component.get("kind") == "1x2 MMI":
             # Migrate older saved MMIs to the shared three-port modal
             # validation settings without changing their physical geometry.
             mmi_params = component.setdefault("params", {})
-            mmi_params.setdefault("waveguide_effective_index", 2.0)
+            mmi_params.pop("waveguide_effective_index", None)
             mmi_params.setdefault("waveguide_neff_tolerance", 0.3)
             mmi_params.setdefault("waveguide_mode_search_count", 20)
         if component.get("kind") == "GC-SOI":
@@ -3437,6 +3433,20 @@ class NativeLayoutWindow(QMainWindow):
                 "polygons",
             }:
                 continue
+            if (
+                key == "angle theta"
+                and bool(component.get("auto_placed", False))
+                and component.get("simulation_parent_uid") is not None
+            ):
+                controlled = QLabel(
+                    f"{float(value):.9g}° — controlled by the parent grating angle_theta"
+                )
+                controlled.setToolTip(
+                    "Edit Angle theta on the parent grating coupler. The fiber geometry, "
+                    "source plane, and passive measurement plane update together."
+                )
+                self.properties_form.addRow("Angle theta (parent controlled)", controlled)
+                continue
             spec = specs.get(key)
             if spec is None:
                 if isinstance(value, bool):
@@ -3461,7 +3471,6 @@ class NativeLayoutWindow(QMainWindow):
                 else "Waveguide mode-monitor offset from end (µm)" if key == "fdtd_port_offset_from_waveguide_end_um"
                 else "Waveguide monitor span (µm)" if key == "waveguide_monitor_span_um"
                 else "Total-power monitor before mode plane (µm)" if key == "waveguide_total_power_before_mode_um"
-                else "Target waveguide effective index" if key == "waveguide_effective_index"
                 else "Allowed effective-index difference" if key == "waveguide_neff_tolerance"
                 else "Waveguide modes to search" if key == "waveguide_mode_search_count"
                 else "Apodized fill factors (one per tooth)" if key == "fill_factors"
@@ -4586,6 +4595,62 @@ class NativeLayoutWindow(QMainWindow):
         for component in members:component["x"]=float(component.get("x",0))+dx;component["y"]=float(component.get("y",0))+dy
         label=f"array {array_id}" if array_id else str(chosen.get("kind"));self.commit_interaction_snapshot(snapshot);self.rebuild_scene(select_uids=[int(component["uid"]) for component in members]);self.statusBar().showMessage(f"Positioned complete {label} at ({x:g}, {y:g}) µm, including linked E-beam coverage.",8000)
 
+    def position_selected_ebeam_blocks(self) -> None:
+        """Move only selected write-field components to an absolute center.
+
+        Coverage-source UIDs are metadata used by the explicit Update / prune
+        action.  They are deliberately not moved here, so the underlying GDS
+        devices remain exactly where the user placed them.
+        """
+        blocks = [
+            component for component in self.selected_components()
+            if component.get("kind") == "E-beam multipass"
+        ]
+        if not blocks:
+            QMessageBox.information(
+                self,
+                "Move Entire E-beam Block",
+                "Select an E-beam write-field group first.",
+            )
+            return
+        bounds = self.components_world_bounds(blocks)
+        center_x = (bounds[0] + bounds[2]) / 2.0
+        center_y = (bounds[1] + bounds[3]) / 2.0
+        x, accepted = QInputDialog.getDouble(
+            self,
+            "Move Entire E-beam Block",
+            "Target write-field center X (µm):",
+            center_x,
+            -1e9,
+            1e9,
+            6,
+        )
+        if not accepted:
+            return
+        y, accepted = QInputDialog.getDouble(
+            self,
+            "Move Entire E-beam Block",
+            "Target write-field center Y (µm):",
+            center_y,
+            -1e9,
+            1e9,
+            6,
+        )
+        if not accepted:
+            return
+        snapshot = self.snapshot()
+        dx, dy = x - center_x, y - center_y
+        for component in blocks:
+            component["x"] = float(component.get("x", 0.0)) + dx
+            component["y"] = float(component.get("y", 0.0)) + dy
+            component.setdefault("params", {})["manual_layout_locked"] = True
+        self.commit_interaction_snapshot(snapshot)
+        self.rebuild_scene(select_uids=[int(component["uid"]) for component in blocks])
+        self.statusBar().showMessage(
+            f"Moved {len(blocks)} E-beam field group(s) to ({x:g}, {y:g}) µm; source GDS stayed fixed.",
+            8000,
+        )
+
     def components_world_bounds(self, components: list[dict[str, Any]]) -> tuple[float, float, float, float]:
         rects = []
         for component in components:
@@ -4728,6 +4793,7 @@ class NativeLayoutWindow(QMainWindow):
                 "primary_axis": dialog.primary_axis.currentText(),
                 "serpentine": dialog.serpentine.isChecked(),
                 "preserve_manual_grid_position": True,
+                "manual_layout_locked": False,
                 "field_layer": EBEAM_LAYER,
                 "field_datatype": 0,
                 "beamer_wg_dose": dialog.wg_dose.value(),
@@ -4816,14 +4882,16 @@ class NativeLayoutWindow(QMainWindow):
     def finish_individual_field_move(self, uid: int, field_key: str, snapshot: str) -> None:
         component=self.component_by_uid(uid)
         if component is None:return
-        moved=self.deoverlap_ebeam_fields(component,field_key);self.prune_ebeam_component(component);self.commit_interaction_snapshot(snapshot)
-        QTimer.singleShot(0,lambda:self.rebuild_scene(select_uids=[uid]));self.statusBar().showMessage(f"Write field updated; {moved} overlap correction(s) applied and empty fields removed.",7000)
+        component.setdefault("params",{})["manual_layout_locked"]=True
+        moved=self.deoverlap_ebeam_fields(component,field_key);self.commit_interaction_snapshot(snapshot)
+        QTimer.singleShot(0,lambda:self.rebuild_scene(select_uids=[uid]));self.statusBar().showMessage(f"Write field updated; {moved} overlap correction(s) applied. Manual layout is preserved.",7000)
 
     def finish_ebeam_group_move(self, uid: int, snapshot: str) -> None:
         component=self.component_by_uid(uid)
         if component is None:return
-        self.prune_ebeam_component(component);self.commit_interaction_snapshot(snapshot)
-        QTimer.singleShot(0,lambda:self.rebuild_scene(select_uids=[uid]));self.statusBar().showMessage("Moved the complete write-field set; empty fields were removed.",7000)
+        component.setdefault("params",{})["manual_layout_locked"]=True
+        self.commit_interaction_snapshot(snapshot)
+        QTimer.singleShot(0,lambda:self.rebuild_scene(select_uids=[uid]));self.statusBar().showMessage("Moved the complete write-field set independently; source GDS stayed fixed.",7000)
 
     def update_selected_ebeam(self) -> None:
         components = [component for component in self.selected_components() if component.get("kind") == "E-beam multipass"]
@@ -4859,10 +4927,25 @@ class NativeLayoutWindow(QMainWindow):
             return
         snapshot = self.snapshot()
         for component in components:
-            component["params"]["manual_field_offsets"] = {}
-            component["params"]["manual_field_order"] = {}
-            component["params"]["removed_field_keys"] = []
-            component["params"]["auto_pruned_field_keys"] = []
+            params = component["params"]
+            params["manual_field_offsets"] = {}
+            params["manual_field_order"] = {}
+            params["removed_field_keys"] = []
+            params["auto_pruned_field_keys"] = []
+            params["manual_layout_locked"] = False
+            source_components = [
+                self.component_by_uid(int(uid))
+                for uid in component.get("coverage_source_uids", [])
+            ]
+            source_components = [source for source in source_components if source is not None]
+            if source_components:
+                source_polygons = self.ebeam_source_polygons(source_components)
+                if source_polygons:
+                    bounds = self.polygon_collection_bounds(source_polygons)
+                    component["x"] = (bounds[0] + bounds[2]) / 2.0
+                    component["y"] = (bounds[1] + bounds[3]) / 2.0
+                    params["target_width"] = bounds[2] - bounds[0]
+                    params["target_height"] = bounds[3] - bounds[1]
             self.prune_ebeam_component(component)
         self.commit_interaction_snapshot(snapshot)
         self.rebuild_scene(select_uids=[int(component["uid"]) for component in components])
