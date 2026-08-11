@@ -338,6 +338,10 @@ class GratingExcitationTypeTests(unittest.TestCase):
                 self.assertEqual(analysis["excitation_type"], "gaussian_beam")
                 self.assertEqual(analysis["source_kind"], "gaussian")
                 self.assertEqual(analysis["source_name"], gaussian_sources[0]["name"])
+                self.assertEqual(
+                    analysis["waveguide_port_modal_sign"],
+                    analysis["waveguide_total_power_sign"],
+                )
                 self.assertNotIn("fiber_port_name", analysis)
                 self.assertNotIn("fiber_source_mode", analysis)
 
@@ -350,6 +354,22 @@ class GratingExcitationTypeTests(unittest.TestCase):
                 self.assertIn('fdtd.set("waist radius w0"', source)
                 self.assertIn('fdtd.set("distance from waist"', source)
                 self.assertIn('fdtd.set("source port", "")', source)
+                self.assertIn("Gaussian source field", source)
+                self.assertIn("eS = (-sin(phi), cos(phi), 0)", source)
+                self.assertIn("plane_waist_um", source)
+                self.assertIn(
+                    "Excitation and selected receiver fields before simulation",
+                    source,
+                )
+
+                input_monitor = next(
+                    monitor for monitor in monitors
+                    if monitor.get("parent_port_name") == "fiber_input_power"
+                )
+                self.assertEqual(input_monitor["monitor_kind"], "Power monitor")
+                self.assertEqual(input_monitor["plane normal"], "Z")
+                self.assertEqual(input_monitor["z span"], 0.0)
+                self.assertEqual(input_monitor["expected propagation sign"], -1.0)
 
     def test_gaussian_multifrequency_profile_sets_samples_first_and_verifies_readback(self) -> None:
         function_node = next(

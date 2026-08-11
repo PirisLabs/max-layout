@@ -4187,6 +4187,12 @@ def _plot_coordinates(mode_profile, plane_normal, shape):
 if GRATING_ANALYSIS and str(GRATING_ANALYSIS.get("excitation_type", "fiber_mode")) == "gaussian_beam":
     profile_specs = [
         (
+            "Gaussian source field",
+            str(GRATING_ANALYSIS["source_name"]),
+            "local TE",
+            "gaussian",
+        ),
+        (
             "Waveguide receiver fundamental mode",
             str(GRATING_ANALYSIS["waveguide_port_name"]),
             "local TE",
@@ -4239,23 +4245,70 @@ else:
         squeeze=False,
     )
     object_by_name = {
-        str(item.get("name", "")): item for item in list(PORTS) + list(MONITORS)
+        str(item.get("name", "")): item
+        for item in list(PORTS) + list(MONITORS) + list(GAUSSIAN_SOURCES)
     }
     for row_index, (label, object_name, required_polarization, object_kind) in enumerate(profile_specs):
-        result_path = "FDTD::ports::" + object_name if object_kind == "port" else object_name
-        mode_profile = fdtd.getresult(result_path, "mode profiles")
         profile_object = object_by_name.get(object_name, {})
         preferred_mode_number = max(0, int(profile_object.get("mode number", 0)))
         resolved_required_polarization = str(required_polarization or "")
         local_te_required = resolved_required_polarization.strip().lower() in {
             "te", "local te", "fundamental te"
         }
-        ex_complex = _field_plane(
-            mode_profile, 0, preferred_mode_number, magnitude=False
-        )
-        ey_complex = _field_plane(
-            mode_profile, 1, preferred_mode_number, magnitude=False
-        )
+        if object_kind == "gaussian":
+            # A Gaussian source is an analytic beam object rather than an
+            # eigenmode result provider.  Render its actual scalar transverse
+            # envelope and global Ex/Ey decomposition directly from the same
+            # waist, distance, phi, and local-TE/S-polarization parameters
+            # used by addgaussian().
+            span_um = max(1e-6, float(profile_object.get("span_um", 20.0)))
+            waist_um = max(1e-6, float(profile_object.get("waist radius_um", 4.5)))
+            waist_distance_um = float(
+                profile_object.get("distance from waist_um", 0.0)
+            )
+            wavelength_um = 0.5 * (
+                float(SETTINGS.get("wavelength_start_um", 1.25))
+                + float(SETTINGS.get("wavelength_stop_um", 1.35))
+            )
+            rayleigh_um = np.pi * waist_um ** 2 / max(wavelength_um, 1e-9)
+            plane_waist_um = waist_um * np.sqrt(
+                1.0 + (waist_distance_um / max(rayleigh_um, 1e-12)) ** 2
+            )
+            coordinate_um = np.linspace(-0.5 * span_um, 0.5 * span_um, 241)
+            grid_x_um, grid_y_um = np.meshgrid(
+                coordinate_um, coordinate_um, indexing="ij"
+            )
+            scalar_field = np.exp(
+                -(grid_x_um ** 2 + grid_y_um ** 2) / plane_waist_um ** 2
+            ).astype(complex)
+            phi_rad = np.deg2rad(float(profile_object.get("angle phi", 0.0)))
+            # S polarization is local TE: E is normal to the grating/incidence
+            # plane, so eS = (-sin(phi), cos(phi), 0).
+            ex_complex = -np.sin(phi_rad) * scalar_field
+            ey_complex = np.cos(phi_rad) * scalar_field
+            mode_profile = {
+                "x": coordinate_um,
+                "y": coordinate_um,
+            }
+            profile_object = dict(profile_object)
+            profile_object["plane normal"] = "Z"
+            print(
+                "Gaussian source profile %s: w0 %.6g um, source-plane radius %.6g um, "
+                "phi %.6g deg, local TE/S polarization."
+                % (
+                    object_name, waist_um, plane_waist_um,
+                    float(profile_object.get("angle phi", 0.0)),
+                )
+            )
+        else:
+            result_path = "FDTD::ports::" + object_name if object_kind == "port" else object_name
+            mode_profile = fdtd.getresult(result_path, "mode profiles")
+            ex_complex = _field_plane(
+                mode_profile, 0, preferred_mode_number, magnitude=False
+            )
+            ey_complex = _field_plane(
+                mode_profile, 1, preferred_mode_number, magnitude=False
+            )
         ex = np.abs(ex_complex)
         ey = np.abs(ey_complex)
         if ex.shape != ey.shape:
@@ -4378,7 +4431,7 @@ else:
                 % (label, component_name, 100.0 * fraction, neff_suffix)
             )
             figure.colorbar(image, ax=axis, label="normalized field magnitude")
-    figure.suptitle("Selected input/output port modes before simulation", fontsize=14)
+    figure.suptitle("Excitation and selected receiver fields before simulation", fontsize=14)
     figure.tight_layout()
     PORT_MODE_PROFILES_FILE = os.path.join(REMOTE_WORK, "port_mode_Ex_Ey.png")
     figure.savefig(PORT_MODE_PROFILES_FILE, dpi=180, bbox_inches="tight")
@@ -5179,6 +5232,9 @@ else:
     waveguide_total_sign = float(
         GRATING_ANALYSIS.get("waveguide_total_power_sign", -1.0)
     )
+    waveguide_modal_sign = float(
+        GRATING_ANALYSIS.get("waveguide_port_modal_sign", waveguide_total_sign)
+    )
 
     def _normalized_result_key(value):
         return "".join(character.lower() for character in str(value) if character.isalnum())
@@ -5378,11 +5434,16 @@ else:
     )
     waveguide_total_power = waveguide_total_sign * waveguide_total_signed_raw
 
-    # T_out is modal power leaving through the passive waveguide receiver.  It
-    # is a power quantity, not a field amplitude, so no square or absolute
-    # value is applied.  Monitor signs are corrected explicitly from their
-    # physical propagation directions rather than hidden with abs().
-    waveguide_mode_power = np.real(np.asarray(waveguide_mode_power, dtype=float))
+    # Port-expansion T_out is a signed Poynting-flux quantity.  Its sign
+    # follows the receiver plane normal, so a left/down-facing output is
+    # negative even when all power is physically outgoing.  Apply the same
+    # geometry-derived propagation sign used by the adjacent total-power
+    # monitor; do not reject a valid outward wave solely because its normal is
+    # negative X/Y.
+    waveguide_mode_signed_raw = np.real(
+        np.asarray(waveguide_mode_power, dtype=float)
+    )
+    waveguide_mode_power = waveguide_modal_sign * waveguide_mode_signed_raw
     normalization_floor = 1e-15
     if not np.all(np.isfinite(fiber_input_power)) or float(np.min(fiber_input_power)) <= normalization_floor:
         raise RuntimeError(
@@ -5397,9 +5458,12 @@ else:
         )
     if float(np.nanmin(waveguide_mode_power)) < -1e-9:
         raise RuntimeError(
-            "Waveguide receiver %s/%s returned negative outgoing modal power (minimum %.6g). "
-            "Check the receiver direction and T_out convention."
-            % (waveguide_result_path, waveguide_modal_key, float(np.nanmin(waveguide_mode_power)))
+            "Waveguide receiver %s/%s has the wrong propagation sign after applying %.0f "
+            "(minimum %.6g). Check the receiver orientation."
+            % (
+                waveguide_result_path, waveguide_modal_key,
+                waveguide_modal_sign, float(np.nanmin(waveguide_mode_power)),
+            )
         )
     if float(np.nanmin(waveguide_total_power)) < -1e-9:
         raise RuntimeError(
@@ -5428,8 +5492,9 @@ else:
         )
     )
     print(
-        "Selected-TE output uses %s / %s field %s, waveguide mode %d (neff %.6g)."
+        "Selected-TE output uses %.0f * real(%s / %s field %s), waveguide mode %d (neff %.6g)."
         % (
+            waveguide_modal_sign,
             waveguide_result_path,
             resolved_waveguide_result,
             waveguide_modal_key,
@@ -5452,6 +5517,7 @@ else:
         "fiber_input_power_signed_raw": fiber_input_signed_raw,
         "fiber_input_power": fiber_input_power,
         "waveguide_mode_power_source_normalized": waveguide_mode_power,
+        "waveguide_mode_power_signed_raw": waveguide_mode_signed_raw,
         "waveguide_mode_power": waveguide_mode_power,
         "waveguide_total_power_signed_raw": waveguide_total_signed_raw,
         "waveguide_total_power": waveguide_total_power,
@@ -7008,6 +7074,9 @@ def _extract_sweep_result():
         waveguide_total_sign = float(
             GRATING_ANALYSIS.get("waveguide_total_power_sign", -1.0)
         )
+        waveguide_modal_sign = float(
+            GRATING_ANALYSIS.get("waveguide_port_modal_sign", waveguide_total_sign)
+        )
 
         def monitor_transmission(name):
             attempts = []
@@ -7083,7 +7152,8 @@ def _extract_sweep_result():
             wavelength_m, power_wavelength_m, waveguide_total_signed
         )
         waveguide_total_power = waveguide_total_sign * waveguide_total_signed
-        waveguide_mode_power = np.real(np.asarray(mode_power, dtype=float))
+        waveguide_mode_signed_raw = np.real(np.asarray(mode_power, dtype=float))
+        waveguide_mode_power = waveguide_modal_sign * waveguide_mode_signed_raw
         normalization_floor = 1e-15
         if (
             not np.all(np.isfinite(fiber_input_power))
@@ -7101,10 +7171,12 @@ def _extract_sweep_result():
             )
         if float(np.nanmin(waveguide_mode_power)) < -1e-9:
             raise SweepResultSchemaError(
-                "The passive waveguide receiver %r returned negative %s power: %.6g"
+                "The passive waveguide receiver %r has the wrong %s propagation sign "
+                "after applying %.0f: %.6g"
                 % (
                     waveguide_port_name,
                     waveguide_modal_key,
+                    waveguide_modal_sign,
                     float(np.nanmin(waveguide_mode_power)),
                 )
             )
@@ -7130,6 +7202,7 @@ def _extract_sweep_result():
                 "fiber_input_power_signed_raw": fiber_input_signed,
                 "fiber_input_power": fiber_input_power,
                 "waveguide_mode_power": waveguide_mode_power,
+                "waveguide_mode_power_signed_raw": waveguide_mode_signed_raw,
                 "waveguide_total_power_signed_raw": waveguide_total_signed,
                 "waveguide_total_power": waveguide_total_power,
                 "waveguide_total_transmission": waveguide_total_transmission,
@@ -9155,6 +9228,17 @@ def generate_lumerical_notebook(
                     # waveguide port and is exposed as T_out by the standard
                     # FDTD-port expansion result.
                     "waveguide_port_modal_direction": "T_out",
+                    "waveguide_port_modal_sign": (
+                        1.0
+                        if (
+                            str(waveguide_port.get("plane normal", "X")).upper() == "X"
+                            and math.cos(math.radians(float(waveguide_port.get("outward_orientation_deg", 180.0)))) >= 0.0
+                        ) or (
+                            str(waveguide_port.get("plane normal", "X")).upper() == "Y"
+                            and math.sin(math.radians(float(waveguide_port.get("outward_orientation_deg", 180.0)))) >= 0.0
+                        )
+                        else -1.0
+                    ),
                     "waveguide_total_power_sign": (
                         1.0
                         if (

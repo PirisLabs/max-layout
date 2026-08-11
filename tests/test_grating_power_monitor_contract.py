@@ -215,7 +215,8 @@ class GratingPowerMonitorContractTests(unittest.TestCase):
     def test_single_analysis_normalizes_both_waveguide_measurements_to_pin(self) -> None:
         wavelength_m = np.asarray([1.50e-6, 1.55e-6, 1.60e-6])
         input_power = np.asarray([-0.50, -0.40, -0.25])
-        modal_power = np.asarray([0.20, 0.12, 0.05])
+        modal_power_signed = np.asarray([-0.20, -0.12, -0.05])
+        modal_power = -modal_power_signed
         total_power = np.asarray([-0.30, -0.20, -0.10])
 
         class FakeFdtd:
@@ -233,7 +234,7 @@ class GratingPowerMonitorContractTests(unittest.TestCase):
                     "FDTD::ports::waveguide_receiver",
                     "::model::FDTD::ports::waveguide_receiver",
                 } and result_name == "expansion for port monitor":
-                    return {"lambda": wavelength_m, "T_out": modal_power}
+                    return {"lambda": wavelength_m, "T_out": modal_power_signed}
                 raise RuntimeError(f"unexpected result request: {path!r}, {result_name!r}")
 
         with TemporaryDirectory() as temporary_directory:
@@ -253,6 +254,7 @@ class GratingPowerMonitorContractTests(unittest.TestCase):
                     "waveguide_port_name": "waveguide_receiver",
                     "waveguide_port_expansion_result_name": "expansion for port monitor",
                     "waveguide_port_modal_direction": "T_out",
+                    "waveguide_port_modal_sign": -1.0,
                     "waveguide_power_monitor_name": "waveguide_total",
                     "fiber_input_power_sign": -1.0,
                     "waveguide_total_power_sign": -1.0,
@@ -358,7 +360,7 @@ class GratingPowerMonitorContractTests(unittest.TestCase):
                 } and result_name == "expansion for port monitor":
                     return {
                         "lambda": wavelength_m,
-                        "T_out": np.asarray([0.2, 0.05]),
+                        "T_out": np.asarray([-0.2, -0.05]),
                     }
                 raise RuntimeError(f"unexpected result request: {path!r}, {result_name!r}")
 
@@ -386,6 +388,7 @@ class GratingPowerMonitorContractTests(unittest.TestCase):
                     "waveguide_port_name": "waveguide_receiver",
                     "waveguide_port_expansion_result_name": "expansion for port monitor",
                     "waveguide_port_modal_direction": "T_out",
+                    "waveguide_port_modal_sign": -1.0,
                     "waveguide_power_monitor_name": "waveguide_total",
                     "waveguide_total_power_sign": -1.0,
                 },

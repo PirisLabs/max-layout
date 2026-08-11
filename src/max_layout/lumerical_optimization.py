@@ -743,6 +743,12 @@ def _objective_ports(
             "waveguide_port_modal_direction": str(
                 analysis.get("waveguide_port_modal_direction", "T_out")
             ),
+            "waveguide_port_modal_sign": float(
+                analysis.get(
+                    "waveguide_port_modal_sign",
+                    analysis.get("waveguide_total_power_sign", -1.0),
+                )
+            ),
             "normalization": (
                 "waveguide fundamental-TE port T_out / measured Gaussian input-monitor power"
                 if is_gaussian
@@ -2094,6 +2100,9 @@ def _alignment_port_score(fdtd_session):
         expansion_dataset,
         str(OPT_OBJECTIVE_PORTS["waveguide_port_modal_direction"]),
     )
+    modal_power = float(
+        OPT_OBJECTIVE_PORTS.get("waveguide_port_modal_sign", 1.0)
+    ) * modal_power
     input_power = np.interp(wavelength_m, input_wavelength_m, input_power)
     if np.any(input_power <= 1e-15):
         raise RuntimeError(
@@ -2695,6 +2704,9 @@ try:
             modal_dataset,
             str(OPT_OBJECTIVE_PORTS["waveguide_port_modal_direction"]),
         )
+        modal_power = float(
+            OPT_OBJECTIVE_PORTS.get("waveguide_port_modal_sign", 1.0)
+        ) * modal_power
         input_power = np.interp(
             validation_wavelength_m, input_wavelength_m, input_power
         )

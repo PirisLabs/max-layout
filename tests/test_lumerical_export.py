@@ -1988,7 +1988,8 @@ class LumericalExportTests(unittest.TestCase):
                     if result_name == "expansion for waveguide_power":
                         return {
                             "lambda": wavelength_m,
-                            "T_out": np.asarray([0.30, 0.40, 0.35]),
+                            # Raw T_out is signed by the receiver plane normal.
+                            "T_out": np.asarray([-0.30, -0.40, -0.35]),
                         }
                     raise RuntimeError("Can not find result %r" % result_name)
                 raise RuntimeError("Can not find result %r" % result_name)
@@ -2012,6 +2013,7 @@ class LumericalExportTests(unittest.TestCase):
                     "waveguide_port_name": "uid_1_waveguide_receiver",
                     "waveguide_port_expansion_result_name": "expansion for waveguide_power",
                     "waveguide_port_modal_direction": "T_out",
+                    "waveguide_port_modal_sign": -1.0,
                 },
                 "SWEEP_PORT_MODE_SELECTIONS": {
                     "uid_1_waveguide_receiver": {
@@ -2059,7 +2061,8 @@ class LumericalExportTests(unittest.TestCase):
                     if result_name == "expansion for port monitor":
                         return {
                             "lambda": wavelength_m,
-                            "T_out": np.asarray([0.25, 0.50]),
+                            # Raw T_out is signed by the receiver plane normal.
+                            "T_out": np.asarray([-0.25, -0.50]),
                         }
                     raise RuntimeError("Can not find result %r" % result_name)
                 raise RuntimeError("Can not find result %r" % result_name)
@@ -2085,6 +2088,7 @@ class LumericalExportTests(unittest.TestCase):
                     # runtime must fall back to the standard port result.
                     "waveguide_port_expansion_result_name": "missing logical result",
                     "waveguide_port_modal_direction": "T_out",
+                    "waveguide_port_modal_sign": -1.0,
                 },
                 "SWEEP_PORT_MODE_SELECTIONS": {
                     "uid_1_waveguide_receiver": {
@@ -2125,11 +2129,12 @@ class LumericalExportTests(unittest.TestCase):
                         "lambda": wavelength_m,
                         "n": np.asarray([1, 2]),
                         # Mode 1 is the wrong polarization; mode 2 is the
-                        # verified local-TE waveguide receiver mode.
+                        # verified local-TE waveguide receiver mode.  Raw T_out
+                        # is signed by the receiver plane normal.
                         "T_out": np.asarray([
-                            [1e-5, 0.30],
-                            [1e-5, 0.40],
-                            [1e-5, 0.35],
+                            [-1e-5, -0.30],
+                            [-1e-5, -0.40],
+                            [-1e-5, -0.35],
                         ]),
                     }
                 raise RuntimeError("Can not find result %r" % result_name)
@@ -2152,6 +2157,7 @@ class LumericalExportTests(unittest.TestCase):
                     "waveguide_port_name": "uid_1_waveguide_receiver",
                     "waveguide_port_expansion_result_name": "expansion for port monitor",
                     "waveguide_port_modal_direction": "T_out",
+                    "waveguide_port_modal_sign": -1.0,
                 },
                 "SWEEP_PORT_MODE_SELECTIONS": {
                     "uid_1_waveguide_receiver": {
