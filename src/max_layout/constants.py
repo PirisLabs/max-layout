@@ -419,6 +419,8 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                        'serpentine': True,
                        'preserve_manual_grid_position': True,
                        'manual_layout_locked': False,
+                       # Editor-only; sequence numbers are never fabricated
+                       # into the Beamer GDS layer.
                        'show_order': True,
                        'outline_width': 1.0,
                        'field_layer': 6,
@@ -972,6 +974,10 @@ DEFAULT_COMPONENT_VALUES["Photonic test block"] = {
     "label_layer": MARKER_LAYER,
     "label_datatype": DEFAULT_DATATYPE,
     "sweep_parameters": ["length", "width"],
+    # The selected primary parameter advances along this layout axis.  Any
+    # additional swept parameter(s) advance along the perpendicular axis.
+    "primary_sweep_parameter": "length",
+    "primary_sweep_axis": "x",
     "sweep_ranges": {
         "length": {"start": 25.0, "stop": 100.0, "step": 25.0},
         "width": {"start": 0.8, "stop": 1.6, "step": 0.2},
@@ -981,7 +987,7 @@ DEFAULT_COMPONENT_VALUES["Photonic test block"] = {
     "datatype": DEFAULT_DATATYPE,
 }
 
-CHOICE_PARAMETERS = {"reference_branch": ["upper", "lower"], "profile": ["linear", "exponential", "klopfenstein"], "input_profile": ["linear", "exponential", "klopfenstein"], "output_profile": ["linear", "exponential", "klopfenstein"], "rf_input_taper_profile": ["linear", "exponential", "klopfenstein"], "rf_output_taper_profile": ["linear", "exponential", "klopfenstein"], "taper_test_center": ["CPW", "T electrode"], "resonator_side": ["upper", "lower"], "tooth_shape": ["curved", "rectangular"], "grating_route": ["straight", "up", "down"], "gc_input_route": ["straight", "up", "down"], "gc_output_route": ["straight", "up", "down"], "gc_upper_output_route": ["straight", "up", "down"], "gc_lower_output_route": ["straight", "up", "down"], "gc_vertical_side": ["up", "down"], "input_s_bend_direction": ["up", "down"], "output_s_bend_direction": ["up", "down"], "start_corner": ["top-left", "top-right", "bottom-left", "bottom-right"], "primary_axis": ["x", "y"]}
+CHOICE_PARAMETERS = {"reference_branch": ["upper", "lower"], "profile": ["linear", "exponential", "klopfenstein"], "input_profile": ["linear", "exponential", "klopfenstein"], "output_profile": ["linear", "exponential", "klopfenstein"], "rf_input_taper_profile": ["linear", "exponential", "klopfenstein"], "rf_output_taper_profile": ["linear", "exponential", "klopfenstein"], "taper_test_center": ["CPW", "T electrode"], "resonator_side": ["upper", "lower"], "tooth_shape": ["curved", "rectangular"], "grating_route": ["straight", "up", "down"], "gc_input_route": ["straight", "up", "down"], "gc_output_route": ["straight", "up", "down"], "gc_upper_output_route": ["straight", "up", "down"], "gc_lower_output_route": ["straight", "up", "down"], "gc_vertical_side": ["up", "down"], "input_s_bend_direction": ["up", "down"], "output_s_bend_direction": ["up", "down"], "start_corner": ["top-left", "top-right", "bottom-left", "bottom-right"], "primary_axis": ["x", "y"], "primary_sweep_axis": ["x", "y"]}
 
 CHOICE_PARAMETERS["cpw_profile"] = ["linear", "exponential", "klopfenstein"]
 

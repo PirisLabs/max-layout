@@ -3199,15 +3199,37 @@ class NativeLayoutWindow(QMainWindow):
             check=QCheckBox(key.replace("_"," "));check.setChecked(key in default_selected);check.setVisible(key in common or key in default_selected);holder_layout.addWidget(check);checks[key]=check
         holder_layout.addStretch(1);scroll.setWidget(holder);layout.addWidget(scroll,1)
         show_all.toggled.connect(lambda enabled:[check.setVisible(enabled or key in common or key in default_selected) for key,check in checks.items()])
+        placement_form=QFormLayout()
+        primary_parameter_box=QComboBox();primary_parameter_box.setMinimumWidth(260)
+        axis_box=QComboBox();axis_box.addItem("X direction", "x");axis_box.addItem("Y direction", "y")
+        saved_primary=str(component["params"].get("primary_sweep_parameter", "")) if source_kind==saved_kind else ""
+        saved_axis=str(component["params"].get("primary_sweep_axis", "x")).lower() if source_kind==saved_kind else "x"
+        def refresh_primary_parameters(*_args):
+            current=str(primary_parameter_box.currentData() or saved_primary)
+            active=[key for key,check in checks.items() if check.isChecked()]
+            primary_parameter_box.blockSignals(True);primary_parameter_box.clear()
+            for key in active:primary_parameter_box.addItem(key.replace("_"," "),key)
+            if current in active:primary_parameter_box.setCurrentIndex(active.index(current))
+            primary_parameter_box.blockSignals(False)
+        for check in checks.values():check.toggled.connect(refresh_primary_parameters)
+        refresh_primary_parameters()
+        axis_box.setCurrentIndex(max(0,axis_box.findData(saved_axis)))
+        primary_parameter_box.setToolTip("This variable changes along the selected physical layout direction. Other selected variables use the perpendicular direction.")
+        axis_box.setToolTip(primary_parameter_box.toolTip())
+        placement_form.addRow("Primary changing variable",primary_parameter_box)
+        placement_form.addRow("Place that variable along",axis_box)
+        layout.addLayout(placement_form)
         select_buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);select_buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Next");select_buttons.accepted.connect(select.accept);select_buttons.rejected.connect(select.reject);layout.addWidget(select_buttons)
         if select.exec()!=QDialog.DialogCode.Accepted:return False
         selected=[key for key,check in checks.items() if check.isChecked()]
         if not selected:QMessageBox.warning(self,"Photonic test block","Select at least one parameter to scan.");return False
+        primary_sweep_parameter=str(primary_parameter_box.currentData() or selected[0])
+        primary_sweep_axis=str(axis_box.currentData() or "x")
 
         result=self.test_block_scan_dialog("photonic","Photonic test block — 3 of 3: ranges, defaults and spacing",base,keys,selected,(component["params"].get("sweep_ranges") or {}) if source_kind==saved_kind else {},float(component["params"].get("edge_spacing",300.0)))
         if result is None:return False
         sweep_ranges,base,edge_spacing=result
-        component["params"].pop("columns",None);component["params"].update({"photonic_component_kind":source_kind,"photonic_base_params":base,"device_label_prefix":label_box.text().strip() or source_kind,"label_height":label_height_box.value(),"label_offset_x":label_x_box.value(),"label_offset_y":label_y_box.value(),"sweep_parameters":selected,"sweep_ranges":sweep_ranges,"edge_spacing":edge_spacing})
+        component["params"].pop("columns",None);component["params"].update({"photonic_component_kind":source_kind,"photonic_base_params":base,"device_label_prefix":label_box.text().strip() or source_kind,"label_height":label_height_box.value(),"label_offset_x":label_x_box.value(),"label_offset_y":label_y_box.value(),"sweep_parameters":selected,"sweep_ranges":sweep_ranges,"primary_sweep_parameter":primary_sweep_parameter,"primary_sweep_axis":primary_sweep_axis,"edge_spacing":edge_spacing})
         return True
 
     def add_selected_library_component(self) -> None:
@@ -6574,7 +6596,7 @@ LABEL    = photonic_layout
 POSITION = 420, 47
 COLLECTFORLOOP = false
 DISABLED = false
-OUT_PORT[0] = 4, Mapping, 0
+OUT_PORT[0] = 5, Extract%20Layers, 0
 
 FILE_NAME = .%5Cphotonic_layout.gds
 FILE_TYPE = 1
@@ -6602,6 +6624,30 @@ QAP_START
 FileName
 QAP_END
 
+ENDNODE
+
+NODE Extract ()
+ID       = 5
+VERSION    = 2
+SHOWCOMMENT    = false
+COMMENTSIZE = 206, 40
+LABEL    = Extract%20Layers
+POSITION = 417, 105
+COLLECTFORLOOP = false
+DISABLED = false
+IN_PORT[0] = 1, photonic_layout, 0
+OUT_PORT[0] = 4, Mapping, 0
+QAP_START
+LayerSet
+QAP_END
+
+
+VERSION = 3
+LAYERSET = *
+EXTRACT_TYPE = INSTANCES
+ResultMode = Region/Instances
+DOSECLASSSHRINK = MAINTAIN
+EXTENT_MODE = DEFAULT
 ENDNODE
 
 NODE FDA ()
@@ -6734,10 +6780,10 @@ VERSION    = 2
 SHOWCOMMENT    = false
 COMMENTSIZE = 206, 40
 LABEL    = Mapping
-POSITION = 417, 125
+POSITION = 417, 165
 COLLECTFORLOOP = false
 DISABLED = false
-IN_PORT[0] = 1, photonic_layout, 0
+IN_PORT[0] = 5, Extract%20Layers, 0
 OUT_PORT[0] = 2, FDA, 0
 QAP_START
 QAP_END

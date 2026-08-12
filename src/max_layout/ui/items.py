@@ -867,7 +867,12 @@ class WriteFieldItem(QGraphicsRectItem):
         font.setBold(True)
         self.order_label.setFont(font)
         self.order_label.setPos(-width / 2 + 5, -height / 2 + 5)
-        self.order_label.setVisible(True)
+        # The sequence is internal metadata.  It can be shown in the editor
+        # when explicitly requested, but it is hidden by default and is never
+        # emitted into the Beamer fabrication layer.
+        self.order_label.setVisible(
+            bool(container.component.get("params", {}).get("show_order", False))
+        )
         self._drag_snapshot: str | None = None
         self.playback_state = "future"
         self.setToolTip(f"Write field {global_order}\n{self.field_key}")
@@ -942,6 +947,9 @@ class EbeamContainerItem(QGraphicsObject):
         self._bounds = QRectF()
         self._drag_snapshot: str | None = None
         self._drag_start_position = QPointF()
+        # Individual fields remain independently selectable, while moving the
+        # container/handle provides the convenient drag-all-together action.
+        # This editor grouping never merges the exported GDS rectangles.
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
@@ -953,8 +961,8 @@ class EbeamContainerItem(QGraphicsObject):
         return self._bounds.adjusted(-8, -8, 8, 8)
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
-        # The complete Ebeam boundary remains visible even when the component
-        # is not selected, so generated coverage can always be inspected.
+        # This is an editor-only selection boundary.  It does not create a
+        # grouped or unioned polygon in GDS.
         pen = QPen(QColor("#ffffff") if self.isSelected() else color_for_layer(EBEAM_LAYER, 255), 0)
         pen.setCosmetic(True)
         pen.setWidthF(2.4 if self.isSelected() else 1.8)

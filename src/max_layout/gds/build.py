@@ -13,7 +13,7 @@ import numpy as np
 from ..backend import backend
 from ..constants import DEFAULT_COMPONENT_VALUES, DEFAULT_DATATYPE, EBEAM_LAYER, GC_COMPOSITE_KINDS, GC_LAYER, MARKER_COMPONENT_KINDS, MARKER_LAYER, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, SIMULATION_COMPONENT_KINDS
 from ..gds.couplers import add_parent_focusing_gc, add_routed_parent_gc, add_soi_grating_coupler, add_three_euler_inward_gc
-from ..gds.ebeam import add_ebeam_field_outline, add_ebeam_parameter_text, add_write_field_number, multipass_field_layout
+from ..gds.ebeam import add_ebeam_field_outline, add_ebeam_parameter_text, multipass_field_layout
 from ..gds.primitives import add_rect, copy_cell_polygons_to_top
 from ..geometry.euler import grating_route_bend_angle, mmi_gc_fanout_local_points
 from ..geometry.landmarks import cpw_bend_landmarks, feedline_landmarks, loopback_landmarks, resonator_x_positions, ring_two_feedline_landmarks, segmented_electrode_landmarks
@@ -350,16 +350,37 @@ def test_block_device_placements(component: dict[str, Any]) -> list[tuple[int, l
         if combination_count > 500:
             raise ValueError(f"{family} test block creates {combination_count} devices; reduce the scan to 500 or fewer.")
         if value_lists:
-            horizontal_index=next((index for index,key in enumerate(selected) if _is_length_scan_parameter(key)),0)
-            horizontal_values=value_lists[horizontal_index]
-            row_indices=[index for index in range(len(selected)) if index!=horizontal_index]
-            row_combinations=list(itertools.product(*(value_lists[index] for index in row_indices))) if row_indices else [tuple()]
+            requested_primary = str(p.get("primary_sweep_parameter", ""))
+            primary_index = (
+                selected.index(requested_primary)
+                if requested_primary in selected
+                else next(
+                    (index for index,key in enumerate(selected) if _is_length_scan_parameter(key)),
+                    0,
+                )
+            )
+            primary_values=value_lists[primary_index]
+            secondary_indices=[index for index in range(len(selected)) if index!=primary_index]
+            secondary_combinations=list(itertools.product(*(value_lists[index] for index in secondary_indices))) if secondary_indices else [tuple()]
             combinations=[]
-            for row_values in row_combinations:
-                row_mapping=dict(zip(row_indices,row_values))
-                for horizontal_value in horizontal_values:
-                    combinations.append(tuple(horizontal_value if index==horizontal_index else row_mapping[index] for index in range(len(selected))))
-            grid_columns=len(horizontal_values)
+            primary_axis=str(p.get("primary_sweep_axis", "x")).strip().lower()
+            if primary_axis not in {"x", "y"}:
+                raise ValueError(f"{family} test block primary sweep axis must be X or Y.")
+            if primary_axis == "x":
+                for secondary_values in secondary_combinations:
+                    secondary_mapping=dict(zip(secondary_indices,secondary_values))
+                    for primary_value in primary_values:
+                        combinations.append(tuple(primary_value if index==primary_index else secondary_mapping[index] for index in range(len(selected))))
+                grid_columns=len(primary_values)
+            else:
+                # Row-major placement means the outer loop advances along Y.
+                # Put the primary variable outside and all secondary Cartesian
+                # combinations across X.
+                for primary_value in primary_values:
+                    for secondary_values in secondary_combinations:
+                        secondary_mapping=dict(zip(secondary_indices,secondary_values))
+                        combinations.append(tuple(primary_value if index==primary_index else secondary_mapping[index] for index in range(len(selected))))
+                grid_columns=max(1,len(secondary_combinations))
         else:
             combinations=[tuple()];grid_columns=1
         # A single swept parameter otherwise lays every device out in one row, which for
@@ -462,7 +483,6 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
                                            center[1]+(row-(spans[1]-1)/2.0)*field_size],float)
                     world_center=tuple(np.asarray(start)+rot(tuple(local_center),orientation));field_number+=1
                     add_ebeam_field_outline(top,world_center,orientation,field_size)
-                    add_write_field_number(top,field_number,world_center,orientation,field_size,float(p.get("parameter_text_height",12.0)))
         return
 
     if kind == "Straight":
@@ -833,7 +853,7 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
                 for ix in range(nx):
                     center_local=grid_center+np.array([(ix-(nx-1)/2)*field,(iy-(ny-1)/2)*field]);rect=gdstk.rectangle(tuple(center_local-field/2),tuple(center_local+field/2));intersection=gdstk.boolean([rect],device_polygons,"and",precision=1e-6)
                     if not intersection:continue
-                    field_order+=1;field_center=tuple(np.asarray(row_start)+rot(center_local,orientation));add_ebeam_field_outline(top,field_center,orientation,field);add_write_field_number(top,field_order,field_center,orientation,field)
+                    field_order+=1;field_center=tuple(np.asarray(row_start)+rot(center_local,orientation));add_ebeam_field_outline(top,field_center,orientation,field)
         if np.all(np.isfinite(block_min)):
             first_mmi=float(p.get("mmi_length_start",27));last_mmi=first_mmi+(count-1)*float(p.get("mmi_length_step",1));label=f"VERTICAL MZI BLOCK  MMI={first_mmi:g}-{last_mmi:g}  L={float(p.get('mzi_total_length',10000)):g}"
             if kind in {"Vertical-GC MZI + CPW test block","Straight-GC MZI + CPW RF bends test block"}:label+=f"  CPW TAP={float(p.get('cpw_taper_length',500)):g} CLR={0 if straight_cpw_rf_bends else 10}"
@@ -851,7 +871,7 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             if bool(p.get("include_ebeam_fields",True)):
                 field=float(p.get("ebeam_field_size",520));clearance=float(p.get("ebeam_edge_clearance",10));gc_extent=float(p.get("gc_taper_L",22))+float(p.get("gc_wg_length",20))+int(p.get("gc_N",30))*float(p.get("gc_pitch",.75));device_span=total+2*gc_straight+2*gc_extent;field_count=max(1,math.ceil((device_span+2*clearance)/field));coverage_width=field_count*field;coverage_center=total/2
                 for field_index in range(field_count):
-                    local_x=coverage_center+(field_index-(field_count-1)/2)*field;field_center=tuple(np.asarray(row_start)+rot((local_x,0),orientation));add_ebeam_field_outline(top,field_center,orientation,field);add_write_field_number(top,index*field_count+field_index+1,field_center,orientation,field);add_ebeam_parameter_text(top,f"MZI{index+1} L={total:g}",field_center,orientation,field,float(p.get("parameter_text_height",10)))
+                    local_x=coverage_center+(field_index-(field_count-1)/2)*field;field_center=tuple(np.asarray(row_start)+rot((local_x,0),orientation));add_ebeam_field_outline(top,field_center,orientation,field);add_ebeam_parameter_text(top,f"MZI{index+1} L={total:g}",field_center,orientation,field,float(p.get("parameter_text_height",10)))
         return
     if kind in {"MZI", "MZI vertical GC"}:
         common = dict(
@@ -1277,9 +1297,10 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             local_rect(xa,xb,q["lower_ground_inner"],q["signal_lower"],ox_layer,ox_dt)
         return
     if kind == "E-beam multipass":
-        # Export each active EPBG write field as one simple filled A x A
-        # rectangle on layer 6 (Ebeam).  The GUI may display outlines and order
-        # numbers, but the GDS contains exactly one rectangle per active field.
+        # Export every active EPBG write field as its own simple filled A x A
+        # rectangle on layer 6 (Ebeam).  Keep the rectangles independent: do
+        # not boolean/group them and do not print write-order numbers into the
+        # fabrication layer.  The editor may still display the internal order.
         layout = multipass_field_layout(p)
         field_size = float(layout["field_size"])
         half = field_size / 2.0
@@ -1306,8 +1327,6 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
                 EBEAM_LAYER,
                 DEFAULT_DATATYPE,
             )
-            if bool(p.get("show_order",True)):
-                field_center=tuple(np.asarray(start)+rot(((x0+x1)/2,(y0+y1)/2),orientation));add_write_field_number(top,int(field.get("order",1)),field_center,orientation,max(x1-x0,y1-y0))
         return
     if kind == "Chip outline":
         width=float(p["width"]); height=float(p["height"]); line_width=float(p["line_width"])

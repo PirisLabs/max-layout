@@ -37,15 +37,6 @@ def add_ebeam_parameter_text(top: gdstk.Cell, text: str, center: tuple[float,flo
         top.add(gdstk.Polygon(transform_points(local,center,orientation),layer=MARKER_LAYER,datatype=DEFAULT_DATATYPE))
 
 
-def add_write_field_number(top: gdstk.Cell, number: int, center: tuple[float,float], orientation: float, field_size: float, height: float = 12.0) -> None:
-    """Put the write-field order near the upper-left corner on E-beam layer 6."""
-    polygons=list(gdstk.text(str(int(number)),float(height),(0,0),layer=EBEAM_LAYER,datatype=DEFAULT_DATATYPE))
-    if not polygons:return
-    points=np.vstack([np.asarray(poly.points,float) for poly in polygons]);minimum=points.min(axis=0);anchor=np.array([-field_size/2+height,field_size/2-2*height],float)
-    for polygon in polygons:
-        local=np.asarray(polygon.points,float)-minimum+anchor;top.add(gdstk.Polygon(transform_points(local,center,orientation),layer=EBEAM_LAYER,datatype=DEFAULT_DATATYPE))
-
-
 def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
     """Calculate centered, ordered, and optionally hand-adjusted square write fields."""
 

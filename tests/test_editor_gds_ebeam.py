@@ -12,7 +12,9 @@ from max_layout.gds.build import (
     _canonicalize_component_layers,
     component_geometry_arrays,
     resolve_and_build,
+    test_block_device_placements as photonic_test_block_placements,
 )
+from max_layout.gds.ebeam import multipass_field_layout
 from max_layout.ui import items as canvas_items
 from max_layout.ui.window import NativeLayoutWindow
 
@@ -87,6 +89,46 @@ class EditorGdsParityTests(unittest.TestCase):
 
 
 class PhotonicTestBlockEbeamTests(unittest.TestCase):
+    def test_primary_sweep_variable_can_advance_along_x_or_y(self) -> None:
+        block = component("Photonic test block", 1)
+        block["params"].update(
+            {
+                "photonic_component_kind": "Straight",
+                "photonic_base_params": deepcopy(DEFAULT_COMPONENT_VALUES["Straight"]),
+                "sweep_parameters": ["length"],
+                "sweep_ranges": {"length": {"values": [20.0, 30.0, 40.0]}},
+                "primary_sweep_parameter": "length",
+                "edge_spacing": 25.0,
+            }
+        )
+
+        def placement_centers(axis: str) -> list[tuple[float, float]]:
+            block["params"]["primary_sweep_axis"] = axis
+            centers = []
+            for _index, polygons, shift in photonic_test_block_placements(block):
+                points = np.vstack([np.asarray(polygon.points, dtype=float) for polygon in polygons])
+                low, high = points.min(axis=0) + shift, points.max(axis=0) + shift
+                centers.append(tuple((low + high) / 2.0))
+            return centers
+
+        x_centers = placement_centers("x")
+        y_centers = placement_centers("y")
+        self.assertGreater(np.ptp([center[0] for center in x_centers]), 0.0)
+        self.assertAlmostEqual(np.ptp([center[1] for center in x_centers]), 0.0)
+        self.assertAlmostEqual(np.ptp([center[0] for center in y_centers]), 0.0)
+        self.assertGreater(np.ptp([center[1] for center in y_centers]), 0.0)
+
+    def test_beamer_ftext_extracts_all_layers_before_mapping(self) -> None:
+        flow = NativeLayoutWindow.beamer_flow_template(None, "", 1.8, 1.8, 1.8)
+        import_index = flow.index("NODE Import ()")
+        extract_index = flow.index("NODE Extract ()")
+        mapping_index = flow.index("NODE Mapping ()")
+        self.assertLess(import_index, extract_index)
+        self.assertLess(extract_index, mapping_index)
+        self.assertIn("LAYERSET = *", flow[extract_index:mapping_index])
+        self.assertIn("OUT_PORT[0] = 5, Extract%20Layers, 0", flow)
+        self.assertIn("IN_PORT[0] = 5, Extract%20Layers, 0", flow[mapping_index:])
+
     def test_new_block_has_no_automatic_write_fields(self) -> None:
         self.assertFalse(
             DEFAULT_COMPONENT_VALUES["Photonic test block"]["include_ebeam_fields"]
@@ -111,6 +153,32 @@ class PhotonicTestBlockEbeamTests(unittest.TestCase):
 
 
 class IndependentEbeamMovementTests(unittest.TestCase):
+    def test_ebeam_gds_has_independent_fields_without_printed_numbers(self) -> None:
+        field = component("E-beam multipass", 2)
+        field["params"].update(
+            {
+                "field_size": 100.0,
+                "target_width": 250.0,
+                "target_height": 100.0,
+                # Old projects may retain this value.  It must no longer add
+                # polygon text to the fabrication layer.
+                "show_order": True,
+            }
+        )
+
+        polygons, _labels = component_geometry_arrays(field)
+        ebeam_polygons = [
+            np.asarray(points, dtype=float)
+            for points, layer, _datatype in polygons
+            if int(layer) == EBEAM_LAYER
+        ]
+        expected_fields = len(multipass_field_layout(field["params"])["fields"])
+
+        # One separate 4-corner rectangle per field: no Boolean group and no
+        # extra polygons forming printed field-order digits.
+        self.assertEqual(len(ebeam_polygons), expected_fields)
+        self.assertTrue(all(len(points) == 4 for points in ebeam_polygons))
+
     def test_exported_field_group_moves_without_source_gds(self) -> None:
         source = component("Straight", 1, x=25.0, y=-10.0)
         field = component("E-beam multipass", 2, x=25.0, y=-10.0)
