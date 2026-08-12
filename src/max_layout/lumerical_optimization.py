@@ -916,6 +916,10 @@ def _fiber_pose_contract(
                     "base_z_um": float(source_z_um),
                     "center_um": list(map(float, source.get("center", (0.0, 0.0)))),
                     "span_um": source_span_um,
+                    "input_monitor_span_scale": max(
+                        1.0,
+                        float(source.get("input monitor span scale", 1.2)),
+                    ),
                     "polarization_angle_deg": 90.0,
                 },
                 "ports": [],
@@ -1691,7 +1695,9 @@ def _fiber_pose_updates(alignment_parameters, shape_parameters=None):
                     "expected_propagation_sign": float(
                         monitor.get("expected_propagation_sign", -1.0)
                     ),
-                    "projected_span_um": max(
+                    "projected_span_um": float(
+                        source_contract.get("input_monitor_span_scale", 1.2)
+                    ) * max(
                         float(source_contract.get("span_um", 20.0)),
                         float(source_contract.get("span_um", 20.0))
                         / max(np.cos(np.deg2rad(theta_deg)), 1e-3),

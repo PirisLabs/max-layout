@@ -727,6 +727,10 @@ def _repair_missing_grating_gaussian_sources(
                 "frequency points": max(
                     1, int(params.get("gaussian_multifrequency_points", 5))
                 ),
+                "input monitor span scale": max(
+                    1.0,
+                    float(params.get("gaussian_input_monitor_span_scale", 1.2)),
+                ),
                 "z reference": str(input_monitor.get("z reference", "top of stack")),
                 "distance_um": float(input_monitor.get("distance_um", 0.0))
                 + below_source_um,
@@ -1015,7 +1019,9 @@ def _synchronize_gaussian_source_parameters(
             monitor_center = source_center - lateral_um * np.asarray(
                 [math.cos(phi_rad), math.sin(phi_rad)]
             )
-            projected_span_um = span_um / max(
+            projected_span_um = max(
+                1.0, float(source.get("input monitor span scale", 1.2))
+            ) * span_um / max(
                 math.cos(math.radians(theta_deg)), 1e-3
             )
             monitor.update(
@@ -4824,6 +4830,8 @@ _SUMMARY_MAJOR_PARAMETERS = (
     ("gaussian_distance_from_waist_um", "Gaussian distance from waist", "um"),
     ("gaussian_source_span_um", "Gaussian source span", "um"),
     ("gaussian_multifrequency_points", "Gaussian multifrequency profile points", ""),
+    ("gaussian_source_depth_in_cladding_um", "Gaussian source depth inside SiO2 cladding", "um"),
+    ("gaussian_input_monitor_span_scale", "Gaussian input-power monitor span scale", "x"),
     ("fiber_tox_offset_um", "Fiber bottom offset above SiO2 cladding", "um"),
     ("fiber_core_diameter_um", "Fiber core diameter", "um"),
     ("fiber_core_index", "Fiber core refractive index", ""),
@@ -7599,6 +7607,7 @@ def _finalize_sweep_results(failures):
         "fiber_cladding_index": ("Fiber cladding refractive index", ""),
         "fiber_length_um": ("Fiber length", "um"),
         "fiber_power_monitor_below_source_um": ("Horizontal fiber-input monitor distance below source", "um"),
+        "gaussian_input_monitor_span_scale": ("Gaussian input-power monitor span scale", "x"),
         "fdtd_port_offset_from_waveguide_end_um": ("Waveguide FDTD-port offset from waveguide end", "um"),
         "waveguide_monitor_span_um": ("Waveguide receiver-port transverse span", "um"),
         "waveguide_total_power_before_mode_um": ("Total-power plane distance before receiver port", "um"),

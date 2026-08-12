@@ -144,6 +144,10 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                      'gaussian_distance_from_waist_um': 0.0,
                      'gaussian_source_span_um': 20.0,
                      'gaussian_multifrequency_points': 5,
+                     # Gaussian-only source plane measured downward from the
+                     # SiO2-cladding/air interface.
+                     'gaussian_source_depth_in_cladding_um': 0.1,
+                     'gaussian_input_monitor_span_scale': 1.2,
                      'fiber_power_monitor_below_source_um': 0.1,
                      'fdtd_port_offset_from_waveguide_end_um': 2.0,
                      # Automatic TFLN waveguide planes use at least 3 um and
@@ -800,6 +804,8 @@ DEFAULT_COMPONENT_VALUES["GC-SOI"] = {
     "gaussian_distance_from_waist_um": 0.0,
     "gaussian_source_span_um": 20.0,
     "gaussian_multifrequency_points": 5,
+    "gaussian_source_depth_in_cladding_um": 0.1,
+    "gaussian_input_monitor_span_scale": 1.2,
     "fiber_tox_offset_um": 0.65,
     "fiber_core_diameter_um": 9.0,
     "fiber_core_index": 1.44427,

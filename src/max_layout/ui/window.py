@@ -247,6 +247,8 @@ def migrate_grating_fiber_offset_parameter(component: dict[str, Any]) -> bool:
         "gaussian_distance_from_waist_um": 0.0,
         "gaussian_source_span_um": 20.0,
         "gaussian_multifrequency_points": 5,
+        "gaussian_source_depth_in_cladding_um": 0.1,
+        "gaussian_input_monitor_span_scale": 1.2,
     }
     for key, default in gaussian_defaults.items():
         if key not in params:
@@ -366,6 +368,12 @@ def _automatic_grating_excitation_companions(
             tox_offset_um * math.cos(math.radians(theta_deg)) - 0.35
         )
         source_z_reference = "top of SiO2 cladding"
+    if excitation_type == "gaussian_beam":
+        source_z_reference = "top of SiO2 cladding"
+        source_distance_um = -max(
+            0.0,
+            float(params.get("gaussian_source_depth_in_cladding_um", 0.1)),
+        )
 
     built: list[dict[str, Any]] = []
     if excitation_type == "fiber_mode":
@@ -445,6 +453,10 @@ def _automatic_grating_excitation_companions(
                 "frequency points": max(
                     1, int(params.get("gaussian_multifrequency_points", 5))
                 ),
+                "input monitor span scale": max(
+                    1.0,
+                    float(params.get("gaussian_input_monitor_span_scale", 1.2)),
+                ),
                 # Shared placement fields keep the preview and exporter on
                 # the same stack-relative source plane as the fiber option.
                 "z reference": source_z_reference,
@@ -461,7 +473,12 @@ def _automatic_grating_excitation_companions(
         float(source["params"].get("angle phi", 0.0))
     )
     lateral_um = below_source_um * math.tan(math.radians(theta_deg))
-    projected_span_um = source_span_um / max(
+    monitor_span_scale = (
+        max(1.0, float(params.get("gaussian_input_monitor_span_scale", 1.2)))
+        if excitation_type == "gaussian_beam"
+        else 1.0
+    )
+    projected_span_um = monitor_span_scale * source_span_um / max(
         math.cos(math.radians(theta_deg)), 1e-3
     )
     input_power = window.make_component(
@@ -2812,6 +2829,12 @@ class NativeLayoutWindow(QMainWindow):
                     tox_offset_um = float(params.get("fiber_tox_offset_um", 0.65))
                     source_distance_um = tox_offset_um * math.cos(math.radians(theta_deg)) - 0.35
                     source_z_reference = "top of SiO2 cladding"
+                if grating_excitation_type(component) == "gaussian_beam":
+                    source_z_reference = "top of SiO2 cladding"
+                    source_distance_um = -max(
+                        0.0,
+                        float(params.get("gaussian_source_depth_in_cladding_um", 0.1)),
+                    )
                 if companion.get("kind") == "Fiber geometry":
                     # Migrate automatic fibers created before the SiO2-specific
                     # vertical reference was introduced. Manual fibers retain
@@ -2880,6 +2903,10 @@ class NativeLayoutWindow(QMainWindow):
                                 1,
                                 int(params.get("gaussian_multifrequency_points", 5)),
                             ),
+                            "input monitor span scale": max(
+                                1.0,
+                                float(params.get("gaussian_input_monitor_span_scale", 1.2)),
+                            ),
                         }
                     )
                 elif companion.get("kind") == "Power monitor":
@@ -2896,7 +2923,12 @@ class NativeLayoutWindow(QMainWindow):
                         None,
                     )
                     source_port_params = source_port.get("params", {}) if source_port is not None else {}
-                    span_um = float(source_port_params.get("span_um", 20.0)) / max(
+                    monitor_span_scale = (
+                        max(1.0, float(params.get("gaussian_input_monitor_span_scale", 1.2)))
+                        if grating_excitation_type(component) == "gaussian_beam"
+                        else 1.0
+                    )
+                    span_um = monitor_span_scale * float(source_port_params.get("span_um", 20.0)) / max(
                         math.cos(math.radians(theta_deg)), 1e-3
                     )
                     companion["params"].update(
@@ -3644,6 +3676,8 @@ class NativeLayoutWindow(QMainWindow):
                 else "Gaussian distance from waist (µm)" if key == "gaussian_distance_from_waist_um"
                 else "Gaussian source span (µm)" if key == "gaussian_source_span_um"
                 else "Gaussian multifrequency points" if key == "gaussian_multifrequency_points"
+                else "Gaussian source depth inside SiO₂ (µm)" if key == "gaussian_source_depth_in_cladding_um"
+                else "Gaussian input-monitor span scale" if key == "gaussian_input_monitor_span_scale"
                 else "Horizontal input-power monitor below source (µm)" if key == "fiber_power_monitor_below_source_um"
                 else "Waveguide mode-monitor offset from end (µm)" if key == "fdtd_port_offset_from_waveguide_end_um"
                 else "Waveguide monitor span (µm)" if key == "waveguide_monitor_span_um"
@@ -7327,6 +7361,8 @@ ENDFLOW
             "excitation_type", "fiber_offset", "angle_theta",
             "gaussian_waist_radius_um", "gaussian_distance_from_waist_um",
             "gaussian_source_span_um", "gaussian_multifrequency_points",
+            "gaussian_source_depth_in_cladding_um",
+            "gaussian_input_monitor_span_scale",
             "fiber_power_monitor_below_source_um",
             "gc_pitch", "gc_fill_factor", "gc_fill_factors", "gc_N", "gc_alpha_t", "gc_taper_L", "gc_wg_length",
         )

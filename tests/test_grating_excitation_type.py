@@ -124,6 +124,14 @@ class GratingExcitationTypeTests(unittest.TestCase):
                     DEFAULT_COMPONENT_VALUES[kind]["gaussian_source_span_um"], 20.0
                 )
                 self.assertEqual(
+                    DEFAULT_COMPONENT_VALUES[kind]["gaussian_source_depth_in_cladding_um"],
+                    0.1,
+                )
+                self.assertEqual(
+                    DEFAULT_COMPONENT_VALUES[kind]["gaussian_input_monitor_span_scale"],
+                    1.2,
+                )
+                self.assertEqual(
                     COMPONENT_SPECS[kind]["excitation_type"],
                     [
                         "choice",
@@ -135,6 +143,8 @@ class GratingExcitationTypeTests(unittest.TestCase):
                     "gaussian_waist_radius_um",
                     "gaussian_distance_from_waist_um",
                     "gaussian_source_span_um",
+                    "gaussian_source_depth_in_cladding_um",
+                    "gaussian_input_monitor_span_scale",
                 ):
                     self.assertEqual(COMPONENT_SPECS[kind][numeric_name][0], "float")
                 saved = json.loads(json.dumps({
@@ -210,6 +220,8 @@ class GratingExcitationTypeTests(unittest.TestCase):
                 self.assertEqual(source_params["polarization angle"], 90.0)
                 self.assertEqual(source_params["angle theta"], grating["params"]["angle_theta"])
                 self.assertEqual(source_params["angle phi"], 0.0)
+                self.assertEqual(source_params["z reference"], "top of SiO2 cladding")
+                self.assertAlmostEqual(source_params["distance_um"], -0.1)
                 for required in (
                     "waist radius_um",
                     "distance from waist_um",
@@ -227,6 +239,13 @@ class GratingExcitationTypeTests(unittest.TestCase):
                 )
                 self.assertEqual(input_power["params"]["plane normal"], "Z")
                 self.assertEqual(input_power["params"]["expected propagation sign"], -1.0)
+                self.assertAlmostEqual(input_power["params"]["distance_um"], -0.2)
+                self.assertGreater(input_power["params"]["x span"], source_params["span_um"])
+                self.assertAlmostEqual(
+                    input_power["params"]["x span"],
+                    1.2 * source_params["span_um"]
+                    / math.cos(math.radians(source_params["angle theta"])),
+                )
                 self.assertEqual(total_output["params"]["monitor geometry"], "surface")
 
     def test_gaussian_angle_offset_and_local_te_stay_synchronized(self) -> None:
