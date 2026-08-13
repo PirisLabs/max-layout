@@ -414,13 +414,35 @@ def test_block_device_placements(component: dict[str, Any]) -> list[tuple[int, l
             templates.append((index, temp_cell.get_polygons(apply_repetitions=True, include_paths=True), np.asarray(bbox[0], float), np.asarray(bbox[1], float)))
         if not templates:
             return []
-        edge_spacing = float(p.get("edge_spacing", 300.0))
-        if edge_spacing < 0.0:
-            raise ValueError(f"{family} test block edge spacing cannot be negative.")
-        cell_centers,_,_=scan_parameter_grid_layout([(low,high) for _,_,low,high in templates],edge_spacing,grid_columns)
+        fixed_pitch = "device_x_spacing" in p and "device_y_spacing" in p
+        if fixed_pitch:
+            device_x_spacing=float(p["device_x_spacing"]);device_y_spacing=float(p["device_y_spacing"])
+            if device_x_spacing < 0.0 or device_y_spacing < 0.0:
+                raise ValueError(f"{family} test block fixed X/Y spacing cannot be negative.")
+            columns=max(1,min(int(grid_columns),len(templates)));row_count=int(math.ceil(len(templates)/columns))
+            if columns > 1 and device_x_spacing <= 0.0:
+                raise ValueError(f"{family} test block fixed X spacing must be positive when it has multiple columns.")
+            if row_count > 1 and device_y_spacing <= 0.0:
+                raise ValueError(f"{family} test block fixed Y spacing must be positive when it has multiple rows.")
+            # The child is built at (0, 0), so these shifts are exact anchor
+            # locations.  Labels and parameter-dependent geometry bounds do
+            # not perturb the requested pitch.
+            cell_centers=[]
+            for position in range(len(templates)):
+                row,column=divmod(position,columns)
+                cell_centers.append(np.array([
+                    (column-(columns-1)/2.0)*device_x_spacing,
+                    ((row_count-1)/2.0-row)*device_y_spacing,
+                ],float))
+        else:
+            edge_spacing = float(p.get("edge_spacing", 300.0))
+            if edge_spacing < 0.0:
+                raise ValueError(f"{family} test block edge spacing cannot be negative.")
+            cell_centers,_,_=scan_parameter_grid_layout([(low,high) for _,_,low,high in templates],edge_spacing,grid_columns)
         placements = []
         for cell_center, (index, polygons, low, high) in zip(cell_centers, templates):
-            placements.append((index, polygons, cell_center - (low + high) / 2.0))
+            shift=cell_center if fixed_pitch else cell_center-(low+high)/2.0
+            placements.append((index, polygons, shift))
         return placements
 
 def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) -> None:

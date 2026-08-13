@@ -37,6 +37,144 @@ def add_ebeam_parameter_text(top: gdstk.Cell, text: str, center: tuple[float,flo
         top.add(gdstk.Polygon(transform_points(local,center,orientation),layer=MARKER_LAYER,datatype=DEFAULT_DATATYPE))
 
 
+def geometry_field_coverage(
+    fields: list[dict[str, Any]],
+    source_polygons: list[gdstk.Polygon],
+    component_center: tuple[float, float] = (0.0, 0.0),
+    orientation_deg: float = 0.0,
+    *,
+    precision: float = 1e-6,
+) -> tuple[set[str], dict[str, list[str]]]:
+    """Return occupied fields and their true source-geometry connectivity.
+
+    The write-field grid alone is ambiguous for a meander: two fields can
+    touch even though the device travels between them only by going around a
+    different row.  This helper clips the *unioned source geometry* to each
+    touching pair of fields and adds an edge only when one clipped geometry
+    component actually occupies both fields.  The resulting graph lets field
+    numbering follow the fabricated path instead of a spatial serpentine.
+
+    ``source_polygons`` are world-space GDS polygons.  Field rectangles are
+    local to the E-beam component, so the source polygons are transformed back
+    into that local coordinate system before Boolean operations.
+    """
+
+    if not fields or not source_polygons:
+        return set(), {
+            str(field.get("field_key", "")): []
+            for field in fields
+            if str(field.get("field_key", ""))
+        }
+
+    center_x, center_y = map(float, component_center)
+    theta = math.radians(float(orientation_deg))
+    cosine, sine = math.cos(theta), math.sin(theta)
+
+    local_sources: list[gdstk.Polygon] = []
+    for polygon in source_polygons:
+        points = np.asarray(polygon.points, dtype=float)
+        dx = points[:, 0] - center_x
+        dy = points[:, 1] - center_y
+        local_points = np.column_stack((
+            dx * cosine + dy * sine,
+            -dx * sine + dy * cosine,
+        ))
+        local_sources.append(gdstk.Polygon(local_points))
+    merged_sources = gdstk.boolean(
+        local_sources, [], "or", precision=float(precision)
+    )
+    if not merged_sources:
+        return set(), {
+            str(field.get("field_key", "")): []
+            for field in fields
+            if str(field.get("field_key", ""))
+        }
+
+    rectangles: dict[str, tuple[tuple[float, float, float, float], gdstk.Polygon]] = {}
+    for field in fields:
+        key = str(field.get("field_key", ""))
+        rect = field.get("rect")
+        if not key or not isinstance(rect, (list, tuple)) or len(rect) != 4:
+            continue
+        x0, y0, x1, y1 = map(float, rect)
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        rectangles[key] = (
+            (x0, y0, x1, y1),
+            gdstk.rectangle((x0, y0), (x1, y1)),
+        )
+
+    occupied: set[str] = set()
+    for key, (_bounds, rectangle) in rectangles.items():
+        if gdstk.boolean(
+            merged_sources, [rectangle], "and", precision=float(precision)
+        ):
+            occupied.add(key)
+
+    adjacency: dict[str, set[str]] = {key: set() for key in occupied}
+    occupied_keys = sorted(occupied)
+    tolerance = max(float(precision) * 2.0, 1e-9)
+    for index, key_a in enumerate(occupied_keys):
+        bounds_a, rectangle_a = rectangles[key_a]
+        ax0, ay0, ax1, ay1 = bounds_a
+        for key_b in occupied_keys[index + 1:]:
+            bounds_b, rectangle_b = rectangles[key_b]
+            bx0, by0, bx1, by1 = bounds_b
+            x_gap = max(0.0, max(ax0, bx0) - min(ax1, bx1))
+            y_gap = max(0.0, max(ay0, by0) - min(ay1, by1))
+            if x_gap > tolerance or y_gap > tolerance:
+                continue
+
+            x_overlap = min(ax1, bx1) - max(ax0, bx0)
+            y_overlap = min(ay1, by1) - max(ay0, by0)
+            if x_overlap <= tolerance and y_overlap <= tolerance:
+                # A single shared corner does not establish write-path
+                # continuity.  This explicitly prevents diagonal jumps.
+                continue
+
+            # Restrict the geometry to this pair of fields.  A clipped
+            # component must have non-zero area in *both* rectangles; paths
+            # that reconnect only through a third field therefore do not
+            # create a false shortcut edge.
+            pair_window = gdstk.rectangle(
+                (min(ax0, bx0), min(ay0, by0)),
+                (max(ax1, bx1), max(ay1, by1)),
+            )
+            clipped = gdstk.boolean(
+                merged_sources,
+                [pair_window],
+                "and",
+                precision=float(precision),
+            )
+            connected = False
+            for geometry_piece in clipped:
+                in_a = gdstk.boolean(
+                    [geometry_piece], [rectangle_a], "and",
+                    precision=float(precision),
+                )
+                if not in_a:
+                    continue
+                in_b = gdstk.boolean(
+                    [geometry_piece], [rectangle_b], "and",
+                    precision=float(precision),
+                )
+                if in_b:
+                    connected = True
+                    break
+            if connected:
+                adjacency[key_a].add(key_b)
+                adjacency[key_b].add(key_a)
+
+    # Include occupied endpoints with an explicit empty list.  Consumers can
+    # distinguish a real geometry endpoint/island from legacy data that has no
+    # connectivity graph at all.
+    return occupied, {
+        key: sorted(adjacency.get(key, set())) for key in sorted(occupied)
+    }
+
+
 def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
     """Calculate centered, ordered, and optionally hand-adjusted square write fields."""
 
@@ -124,16 +262,36 @@ def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
         # the shortest physical jump instead of retaining the import order.
         # This makes the remaining sequence follow an arbitrarily oriented or
         # irregular device without assuming it begins at a particular corner.
-        first_explicit_key = requested_first_key({
+        active_explicit_keys = {
             str(field["field_key"]) for field in fields
-        })
+        }
+        explicit_prefix: list[str] = []
+        if fields:
+            requested_by_order: dict[int, str] = {}
+            for raw_key, raw_value in manual_order.items():
+                key = str(raw_key)
+                if key not in active_explicit_keys:
+                    continue
+                try:
+                    requested = int(round(float(raw_value)))
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= requested <= len(fields):
+                    requested_by_order.setdefault(requested, key)
+            while len(explicit_prefix) + 1 in requested_by_order:
+                explicit_prefix.append(
+                    requested_by_order[len(explicit_prefix) + 1]
+                )
+        first_explicit_key = (
+            explicit_prefix[0] if explicit_prefix else None
+        )
         if fields and first_explicit_key is not None:
             by_explicit_key = {
                 str(field["field_key"]): field for field in fields
             }
-            route = [by_explicit_key[first_explicit_key]]
+            route = [by_explicit_key[key] for key in explicit_prefix]
             remaining = {
-                key for key in by_explicit_key if key != first_explicit_key
+                key for key in by_explicit_key if key not in explicit_prefix
             }
             while remaining:
                 current = route[-1]
@@ -317,11 +475,11 @@ def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
             for ix in inner:
                 add_field(ix, iy)
 
-    # Renumber only active fields after pruning and manual movement.  Fields
-    # that are orthogonal neighbors in the write-field grid are kept adjacent
-    # whenever an adjacent path exists.  A shortest-distance jump is used only
-    # between disconnected occupied regions or when a pruned shape has no
-    # Hamiltonian adjacent path.
+    # Renumber only active fields after pruning and manual movement.  When the
+    # editor has recorded source-geometry connectivity, follow only that graph.
+    # Legacy layouts without a graph retain the orthogonal-grid fallback.  A
+    # shortest-distance jump is used only between genuinely disconnected
+    # geometry islands or when a branch has no Hamiltonian path.
     if ordered:
         by_key = {
             (int(field["column"]), int(field["row"])): field
@@ -334,8 +492,45 @@ def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
                 + (float(a["center"][1]) - float(b["center"][1])) ** 2
             )
 
+        field_key_to_grid_key = {
+            str(field["field_key"]): key for key, field in by_key.items()
+        }
+        raw_adjacency = params.get("geometry_field_adjacency", {})
+        geometry_adjacency = (
+            raw_adjacency if isinstance(raw_adjacency, dict) else {}
+        )
+        raw_physical_adjacency = params.get("field_adjacency", {})
+        physical_adjacency = (
+            raw_physical_adjacency
+            if isinstance(raw_physical_adjacency, dict)
+            else {}
+        )
+
+        def configured_neighbors(
+            key: tuple[int, int], adjacency: dict[str, Any]
+        ) -> set[tuple[int, int]]:
+            field_key = str(by_key[key]["field_key"])
+            raw_values = adjacency.get(field_key, [])
+            if not isinstance(raw_values, (list, tuple, set)):
+                return set()
+            return {
+                field_key_to_grid_key[str(value)]
+                for value in raw_values
+                if str(value) in field_key_to_grid_key
+            }
+
         def neighbor_keys(key: tuple[int, int], allowed: set[tuple[int, int]]) -> list[tuple[int, int]]:
+            field_key = str(by_key[key]["field_key"])
+            if field_key in geometry_adjacency:
+                stored = configured_neighbors(key, geometry_adjacency)
+                return [candidate for candidate in stored if candidate in allowed]
+            if field_key in physical_adjacency:
+                stored = configured_neighbors(key, physical_adjacency)
+                return [candidate for candidate in stored if candidate in allowed]
             column, row = key
+            # Backward-compatible fallback for projects saved before exact
+            # geometry connectivity was recorded.  Avoid diagonal shortcuts:
+            # they are the most common cause of visible numbering jumps.
             candidates = [
                 (column - 1, row),
                 (column + 1, row),
@@ -343,6 +538,30 @@ def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
                 (column, row + 1),
             ]
             return [candidate for candidate in candidates if candidate in allowed]
+
+        requested_key_by_order: dict[int, tuple[int, int]] = {}
+        for raw_key, raw_value in manual_order.items():
+            grid_key = field_key_to_grid_key.get(str(raw_key))
+            if grid_key is None:
+                continue
+            try:
+                requested = int(round(float(raw_value)))
+            except (TypeError, ValueError):
+                continue
+            requested_key_by_order.setdefault(requested, grid_key)
+
+        consecutive_prefix: list[tuple[int, int]] = []
+        while len(consecutive_prefix) + 1 in requested_key_by_order:
+            consecutive_prefix.append(
+                requested_key_by_order[len(consecutive_prefix) + 1]
+            )
+
+        def is_geometry_neighbor(
+            current_key: tuple[int, int], candidate: tuple[int, int]
+        ) -> bool:
+            return candidate in configured_neighbors(
+                current_key, geometry_adjacency
+            )
 
         all_keys = set(by_key)
         active_x = [float(field["center"][0]) for field in ordered]
@@ -424,8 +643,11 @@ def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
                 if not unused:
                     return True
                 candidates = neighbor_keys(current_key, unused)
+                expected_key = requested_key_by_order.get(len(path) + 1)
                 candidates.sort(
                     key=lambda key: (
+                        0 if key == expected_key else 1,
+                        0 if is_geometry_neighbor(current_key, key) else 1,
                         len(neighbor_keys(key, unused - {key})),
                         field_distance_sq(by_key[current_key], by_key[key]),
                         abs(int(by_key[key]["row"]) - int(by_key[current_key]["row"]))
@@ -474,7 +696,29 @@ def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
             index for index, component in enumerate(components) if first_key in component
         )
         ordered_components = [components.pop(first_component_index)]
-        route_keys = component_path(ordered_components[0], first_key)
+        first_component = ordered_components[0]
+        valid_prefix = (
+            consecutive_prefix
+            if consecutive_prefix
+            and consecutive_prefix[0] == first_key
+            and all(key in first_component for key in consecutive_prefix)
+            and all(
+                second in neighbor_keys(first, first_component)
+                for first, second in zip(
+                    consecutive_prefix, consecutive_prefix[1:]
+                )
+            )
+            else [first_key]
+        )
+        if len(valid_prefix) > 1:
+            # Reserve the explicit direction prefix and solve the remaining
+            # geometry from its last field.  This is how field 2 disambiguates
+            # an equal left/right branch after choosing a top-center field 1.
+            tail_component = first_component - set(valid_prefix[:-1])
+            tail = component_path(tail_component, valid_prefix[-1])
+            route_keys = valid_prefix[:-1] + tail
+        else:
+            route_keys = component_path(first_component, first_key)
 
         while components:
             current_key = route_keys[-1]

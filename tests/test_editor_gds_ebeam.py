@@ -5,6 +5,7 @@ import json
 import unittest
 from unittest.mock import patch
 
+import gdstk
 import numpy as np
 
 from max_layout.constants import DEFAULT_COMPONENT_VALUES, EBEAM_LAYER
@@ -14,7 +15,7 @@ from max_layout.gds.build import (
     resolve_and_build,
     test_block_device_placements as photonic_test_block_placements,
 )
-from max_layout.gds.ebeam import multipass_field_layout
+from max_layout.gds.ebeam import geometry_field_coverage, multipass_field_layout
 from max_layout.ui import items as canvas_items
 from max_layout.ui.window import NativeLayoutWindow
 
@@ -89,6 +90,74 @@ class EditorGdsParityTests(unittest.TestCase):
 
 
 class PhotonicTestBlockEbeamTests(unittest.TestCase):
+    def test_new_photonic_block_has_fixed_xy_device_pitch_defaults(self) -> None:
+        defaults = DEFAULT_COMPONENT_VALUES["Photonic test block"]
+        self.assertEqual(defaults["device_x_spacing"], 300.0)
+        self.assertEqual(defaults["device_y_spacing"], 300.0)
+
+    def test_photonic_test_block_uses_exact_xy_anchor_spacing(self) -> None:
+        block = component("Photonic test block", 1)
+        block["params"].update(
+            {
+                "photonic_component_kind": "Straight",
+                "photonic_base_params": deepcopy(DEFAULT_COMPONENT_VALUES["Straight"]),
+                "sweep_parameters": ["length", "width"],
+                "sweep_ranges": {
+                    "length": {"values": [20.0, 80.0]},
+                    "width": {"values": [0.8, 2.0]},
+                },
+                "primary_sweep_parameter": "length",
+                "primary_sweep_axis": "x",
+                "device_x_spacing": 240.0,
+                "device_y_spacing": 135.0,
+                # Varying label and device bounds must not alter the pitch.
+                "device_label_prefix": "VARIABLE-SIZE-DEVICE",
+                "label_height": 17.0,
+            }
+        )
+
+        shifts = np.asarray(
+            [shift for _index, _polygons, shift in photonic_test_block_placements(block)],
+            dtype=float,
+        )
+        np.testing.assert_allclose(shifts[:, 0], [-120.0, 120.0, -120.0, 120.0])
+        np.testing.assert_allclose(shifts[:, 1], [67.5, 67.5, -67.5, -67.5])
+
+    def test_photonic_test_block_without_fixed_spacing_keeps_legacy_edge_gap(self) -> None:
+        block = component("Photonic test block", 1)
+        block["params"].pop("device_x_spacing")
+        block["params"].pop("device_y_spacing")
+        block["params"].update(
+            {
+                "photonic_component_kind": "Straight",
+                "photonic_base_params": deepcopy(DEFAULT_COMPONENT_VALUES["Straight"]),
+                "sweep_parameters": ["length"],
+                "sweep_ranges": {"length": {"values": [20.0, 80.0]}},
+                "primary_sweep_parameter": "length",
+                "primary_sweep_axis": "x",
+                "edge_spacing": 37.0,
+            }
+        )
+
+        bounds = []
+        for _index, polygons, shift in photonic_test_block_placements(block):
+            points = np.vstack([np.asarray(polygon.points, dtype=float) for polygon in polygons])
+            bounds.append((points.min(axis=0) + shift, points.max(axis=0) + shift))
+        self.assertAlmostEqual(bounds[1][0][0] - bounds[0][1][0], 37.0)
+
+    def test_fixed_spacing_rejects_nonpositive_pitch_on_populated_axis(self) -> None:
+        block = component("Photonic test block", 1)
+        block["params"].update(
+            {
+                "sweep_parameters": ["length"],
+                "sweep_ranges": {"length": {"values": [20.0, 30.0]}},
+                "primary_sweep_axis": "x",
+                "device_x_spacing": 0.0,
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "fixed X spacing must be positive"):
+            photonic_test_block_placements(block)
+
     def test_primary_sweep_variable_can_advance_along_x_or_y(self) -> None:
         block = component("Photonic test block", 1)
         block["params"].update(
@@ -318,6 +387,46 @@ class IndependentEbeamMovementTests(unittest.TestCase):
             dc = abs(int(previous["column"]) - int(current["column"]))
             dr = abs(int(previous["row"]) - int(current["row"]))
             self.assertEqual(dc + dr, 1)
+
+    def test_top_center_meander_follows_exact_source_geometry(self) -> None:
+        params = dict(DEFAULT_COMPONENT_VALUES["E-beam multipass"])
+        params.update(
+            {
+                "field_size": 100.0,
+                "edge_clearance": 0.0,
+                "target_width": 500.0,
+                "target_height": 300.0,
+                "start_corner": "top-left",
+                "primary_axis": "x",
+                "serpentine": True,
+                "manual_field_order": {"c3_r1": 1},
+            }
+        )
+        fields = multipass_field_layout(params)["fields"]
+        by_key = {str(field["field_key"]): field for field in fields}
+        expected = [
+            "c3_r1", "c2_r1", "c1_r1", "c1_r2", "c1_r3",
+            "c2_r3", "c2_r2", "c3_r2", "c3_r3", "c4_r3",
+            "c5_r3", "c5_r2", "c4_r2", "c4_r1", "c5_r1",
+        ]
+        # Every field is occupied, so ordinary grid occupancy is ambiguous.
+        # Only the narrow source path identifies the intended left/right
+        # meander from the user-selected top-center field 1.
+        source = gdstk.FlexPath(
+            [by_key[key]["center"] for key in expected],
+            8.0,
+            ends="round",
+        ).to_polygons()
+        occupied, adjacency = geometry_field_coverage(fields, source)
+        self.assertEqual(occupied, set(expected))
+        params["geometry_field_adjacency"] = adjacency
+        self.assertEqual(
+            [
+                str(field["field_key"])
+                for field in multipass_field_layout(params)["fields"]
+            ],
+            expected,
+        )
 
     def test_user_selected_first_explicit_field_orders_by_geometry(self) -> None:
         params = dict(DEFAULT_COMPONENT_VALUES["E-beam multipass"])

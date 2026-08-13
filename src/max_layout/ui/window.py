@@ -25,7 +25,7 @@ from PySide6.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, 
 
 from ..constants import CHOICE_PARAMETERS, COMPONENT_SPECS, DEFAULT_COMPONENT_VALUES, EBEAM_LAYER, GC_LAYER, LAYER_NAME_MAP, LEGACY_PHOTONIC_TEST_BLOCK_KINDS, MARKER_COMPONENT_KINDS, MARKER_LAYER, NATIVE_APP_VERSION, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, SIMULATION_COMPONENT_KINDS, SIMULATION_LAYER, component_display_name
 from ..gds.build import _add_component_geometry_to_cell, _canonicalize_component_layers, component_geometry_arrays, library_bbox_and_center, recenter_components_at_origin, resolve_and_build, rotate_components_layout, test_block_device_placements
-from ..gds.ebeam import multipass_field_layout
+from ..gds.ebeam import geometry_field_coverage, multipass_field_layout
 from ..geometry.shapes import mmi_total_length
 from ..geometry.rf_taper import synchronize_rf_taper_points
 from ..geometry.transforms import scene_to_world_point, transform_points, transformed_local_points, world_to_scene_point
@@ -3062,12 +3062,13 @@ class NativeLayoutWindow(QMainWindow):
         for key,box in integers.items():p[key]=box.value()
         return True
 
-    def test_block_scan_dialog(self, family: str, title: str, base: dict[str, Any], keys: list[str], selected: list[str], saved_ranges: dict[str, Any], edge_spacing: float, explicit_defaults: dict[str, str] | None = None):
+    def test_block_scan_dialog(self, family: str, title: str, base: dict[str, Any], keys: list[str], selected: list[str], saved_ranges: dict[str, Any], edge_spacing: float, explicit_defaults: dict[str, str] | None = None, device_x_spacing: float | None = None, device_y_spacing: float | None = None):
         """Scan ranges plus fixed defaults for one test block.
 
         Shared by the final step of both wizards and by the right-click editor.  Returns
-        ``(sweep_ranges, base_with_defaults_applied, edge_spacing)``, or None when the dialog is
-        cancelled or the entries do not validate.
+        ``(sweep_ranges, base_with_defaults_applied, edge_spacing, fixed_x, fixed_y)``, or None
+        when the dialog is cancelled or the entries do not validate.  ``fixed_x`` and ``fixed_y``
+        are None for the older adaptive edge-spacing layout.
         """
         fixed_keys=[key for key in keys if key not in set(selected)]
         ranges_dialog=QDialog(self);ranges_dialog.setWindowTitle(title);ranges_dialog.resize(1420,min(940,max(500,290+60*(len(selected)+min(len(fixed_keys),8)))));ranges_dialog.setMinimumWidth(1180);ranges_layout=QVBoxLayout(ranges_dialog)
@@ -3092,8 +3093,17 @@ class NativeLayoutWindow(QMainWindow):
                 elif not saved and key in (explicit_defaults or {}):explicit.setText((explicit_defaults or {})[key])
                 table.setCellWidget(row,4,explicit);editors[key]=("numeric",widgets,isinstance(value,int),explicit)
         ranges_layout.addWidget(table)
-        packing_hint=QLabel("The length-like scan parameter forms columns. Every combination of gap, width, and other selected values forms rows. True device and label bounds determine the compact row and column spacing.");packing_hint.setWordWrap(True);ranges_layout.addWidget(packing_hint)
-        options=QFormLayout();edge_box=QDoubleSpinBox();edge_box.setRange(0,1e7);edge_box.setDecimals(3);edge_box.setValue(float(edge_spacing));edge_box.setMinimumSize(230,40);options.addRow("Minimum edge-to-edge spacing (µm)",edge_box);ranges_layout.addLayout(options)
+        fixed_pitch=device_x_spacing is not None and device_y_spacing is not None
+        packing_hint=QLabel("The primary variable follows the selected X or Y direction. Device anchors use the exact X/Y pitches below; changing geometry size or label text does not move the grid." if fixed_pitch else "The length-like scan parameter forms columns. Every combination of gap, width, and other selected values forms rows. True device and label bounds determine the compact row and column spacing.");packing_hint.setWordWrap(True);ranges_layout.addWidget(packing_hint)
+        options=QFormLayout();edge_box=QDoubleSpinBox();edge_box.setRange(0,1e7);edge_box.setDecimals(3);edge_box.setValue(float(edge_spacing));edge_box.setMinimumSize(230,40)
+        fixed_x_box=None;fixed_y_box=None
+        if fixed_pitch:
+            fixed_x_box=QDoubleSpinBox();fixed_x_box.setRange(.001,1e7);fixed_x_box.setDecimals(3);fixed_x_box.setValue(float(device_x_spacing));fixed_x_box.setMinimumSize(230,40);fixed_x_box.setToolTip("Exact center/anchor distance between adjacent test devices in X.")
+            fixed_y_box=QDoubleSpinBox();fixed_y_box.setRange(.001,1e7);fixed_y_box.setDecimals(3);fixed_y_box.setValue(float(device_y_spacing));fixed_y_box.setMinimumSize(230,40);fixed_y_box.setToolTip("Exact center/anchor distance between adjacent test devices in Y.")
+            options.addRow("Fixed device X spacing (µm)",fixed_x_box);options.addRow("Fixed device Y spacing (µm)",fixed_y_box)
+        else:
+            options.addRow("Minimum edge-to-edge spacing (µm)",edge_box)
+        ranges_layout.addLayout(options)
         range_buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);range_buttons.accepted.connect(ranges_dialog.accept);range_buttons.rejected.connect(ranges_dialog.reject);ranges_layout.addWidget(range_buttons)
         if ranges_dialog.exec()!=QDialog.DialogCode.Accepted:return None
         sweep_ranges={};combination_count=1;updated=safe_json_copy(base)
@@ -3122,7 +3132,7 @@ class NativeLayoutWindow(QMainWindow):
             for key,spec in fixed_editors.items():updated[key]=read_fixed_default(spec)
         except Exception as exc:
             QMessageBox.critical(self,f"Invalid {family} scan",str(exc));return None
-        return sweep_ranges,updated,float(edge_box.value())
+        return sweep_ranges,updated,float(edge_box.value()),(float(fixed_x_box.value()) if fixed_x_box is not None else None),(float(fixed_y_box.value()) if fixed_y_box is not None else None)
 
     def edit_test_block_scan(self, component: dict[str, Any]) -> None:
         """Right-click entry point: re-open the ranges-and-defaults table for an existing block."""
@@ -3138,11 +3148,13 @@ class NativeLayoutWindow(QMainWindow):
         selected=[str(key) for key in (params.get("sweep_parameters") or []) if str(key) in keys]
         if not selected:
             QMessageBox.warning(self,"Edit scan","This block has no scan parameters recorded. Re-create it to choose which parameters to scan.");return
-        result=self.test_block_scan_dialog(family,f"{component.get('kind')} — ranges, defaults and spacing ({component_display_name(source_kind)})",base,keys,selected,params.get("sweep_ranges") or {},float(params.get("edge_spacing",300.0)))
+        result=self.test_block_scan_dialog(family,f"{component.get('kind')} — ranges, defaults and spacing ({component_display_name(source_kind)})",base,keys,selected,params.get("sweep_ranges") or {},float(params.get("edge_spacing",300.0)),device_x_spacing=(float(params.get("device_x_spacing",300.0)) if not is_rf else None),device_y_spacing=(float(params.get("device_y_spacing",300.0)) if not is_rf else None))
         if result is None:return
-        sweep_ranges,updated_base,edge_spacing=result
+        sweep_ranges,updated_base,edge_spacing,device_x_spacing,device_y_spacing=result
         snapshot=self.snapshot()
         params[base_key]=updated_base;params["sweep_ranges"]=sweep_ranges;params["edge_spacing"]=edge_spacing
+        if not is_rf:
+            params["device_x_spacing"]=device_x_spacing;params["device_y_spacing"]=device_y_spacing
         self.commit_interaction_snapshot(snapshot);self.rebuild_scene();self.show_component_properties(component);self.statusBar().showMessage(f"Updated {component.get('kind')} scan ranges and defaults.",8000)
 
     def configure_rf_test_block(self, component: dict[str, Any]) -> bool:
@@ -3217,7 +3229,7 @@ class NativeLayoutWindow(QMainWindow):
         }
         result=self.test_block_scan_dialog("RF","RF test block — 3 of 3: ranges, defaults and spacing",base,keys,selected,(component["params"].get("sweep_ranges") or {}) if source_kind==saved_kind else {},float(component["params"].get("edge_spacing",300.0)),rf_explicit_defaults.get(source_kind,{}))
         if result is None:return False
-        sweep_ranges,base,edge_spacing=result
+        sweep_ranges,base,edge_spacing,_device_x_spacing,_device_y_spacing=result
         component["params"].pop("columns",None);component["params"].update({"rf_component_kind":source_kind,"rf_base_params":base,"device_label_prefix":label_box.text().strip() or source_kind,"label_height":label_height_box.value(),"label_offset_x":label_x_box.value(),"label_offset_y":label_y_box.value(),"taper_test_structure":source_kind in {"Tapered CPW","Symmetric CPW taper"},"taper_test_center":taper_center_box.currentText(),"probe_cpw_length":probe_cpw_box.value(),"input_transition_length":input_transition_box.value(),"output_transition_length":output_transition_box.value(),"t_electrode_transition_length":t_transition_box.value(),"sweep_parameters":selected,"sweep_ranges":sweep_ranges,"edge_spacing":edge_spacing})
         return True
 
@@ -3303,10 +3315,10 @@ class NativeLayoutWindow(QMainWindow):
         primary_sweep_parameter=str(primary_parameter_box.currentData() or selected[0])
         primary_sweep_axis=str(axis_box.currentData() or "x")
 
-        result=self.test_block_scan_dialog("photonic","Photonic test block — 3 of 3: ranges, defaults and spacing",base,keys,selected,(component["params"].get("sweep_ranges") or {}) if source_kind==saved_kind else {},float(component["params"].get("edge_spacing",300.0)))
+        result=self.test_block_scan_dialog("photonic","Photonic test block — 3 of 3: ranges, defaults and spacing",base,keys,selected,(component["params"].get("sweep_ranges") or {}) if source_kind==saved_kind else {},float(component["params"].get("edge_spacing",300.0)),device_x_spacing=float(component["params"].get("device_x_spacing",300.0)),device_y_spacing=float(component["params"].get("device_y_spacing",300.0)))
         if result is None:return False
-        sweep_ranges,base,edge_spacing=result
-        component["params"].pop("columns",None);component["params"].update({"photonic_component_kind":source_kind,"photonic_base_params":base,"device_label_prefix":label_box.text().strip() or source_kind,"label_height":label_height_box.value(),"label_offset_x":label_x_box.value(),"label_offset_y":label_y_box.value(),"sweep_parameters":selected,"sweep_ranges":sweep_ranges,"primary_sweep_parameter":primary_sweep_parameter,"primary_sweep_axis":primary_sweep_axis,"edge_spacing":edge_spacing})
+        sweep_ranges,base,edge_spacing,device_x_spacing,device_y_spacing=result
+        component["params"].pop("columns",None);component["params"].update({"photonic_component_kind":source_kind,"photonic_base_params":base,"device_label_prefix":label_box.text().strip() or source_kind,"label_height":label_height_box.value(),"label_offset_x":label_x_box.value(),"label_offset_y":label_y_box.value(),"sweep_parameters":selected,"sweep_ranges":sweep_ranges,"primary_sweep_parameter":primary_sweep_parameter,"primary_sweep_axis":primary_sweep_axis,"device_x_spacing":device_x_spacing,"device_y_spacing":device_y_spacing,"edge_spacing":edge_spacing})
         return True
 
     def add_selected_library_component(self) -> None:
@@ -3669,11 +3681,16 @@ class NativeLayoutWindow(QMainWindow):
         for key, value in component.get("params", {}).items():
             if component.get("kind") in {"RF test block","Photonic test block"} and key=="columns":
                 continue
+            if component.get("kind")=="Photonic test block" and key=="edge_spacing" and all(spacing_key in component.get("params",{}) for spacing_key in ("device_x_spacing","device_y_spacing")):
+                # New photonic blocks use exact X/Y anchor pitches.  Retain
+                # edge_spacing in JSON only as the legacy-layout fallback.
+                continue
             if key in {
                 "manual_field_offsets",
                 "manual_field_order",
                 "removed_field_keys",
                 "auto_pruned_field_keys",
+                "geometry_field_adjacency",
                 "explicit_fields",
                 "sweep_parameters",
                 "sweep_ranges",
@@ -4730,7 +4747,7 @@ class NativeLayoutWindow(QMainWindow):
                 key
                 for component in selected
                 for key in component.get("params", {})
-                if key not in {"manual_field_offsets", "manual_field_order", "removed_field_keys", "auto_pruned_field_keys", "explicit_fields"}
+                if key not in {"manual_field_offsets", "manual_field_order", "removed_field_keys", "auto_pruned_field_keys", "geometry_field_adjacency", "explicit_fields"}
                 and isinstance(component["params"][key], (int, float))
             }
         )
@@ -5078,37 +5095,46 @@ class NativeLayoutWindow(QMainWindow):
             path.addRect(source_item.sceneBoundingRect())
             return path
 
-    def prune_ebeam_component(self, component: dict[str, Any]) -> None:
+    def refresh_ebeam_geometry_adjacency(
+        self,
+        component: dict[str, Any],
+        *,
+        prune_empty: bool,
+    ) -> None:
+        """Refresh the physical write path, optionally pruning empty fields."""
         params = component["params"]
-        params["auto_pruned_field_keys"] = []
+        if prune_empty:
+            params["auto_pruned_field_keys"] = []
+        params["geometry_field_adjacency"] = {}
         layout = multipass_field_layout(params)
         source_uids=[int(uid) for uid in component.get("coverage_source_uids",[])]
         if not source_uids:return
         source_components=[self.component_by_uid(uid) for uid in source_uids];source_components=[source for source in source_components if source is not None]
-        source_polygons=self.ebeam_source_polygons(source_components);source_boxes=[]
-        for polygon in source_polygons:
-            box=polygon.bounding_box();source_boxes.append((polygon,float(box[0][0]),float(box[0][1]),float(box[1][0]),float(box[1][1])))
-        pruned: list[str] = []
-        for field in layout["fields"]:
-            rect_data = field.get("rect")
-            if isinstance(rect_data, (list, tuple)) and len(rect_data) == 4:
-                x0, y0, x1, y1 = map(float, rect_data)
-            else:
-                cx, cy = map(float, field.get("center", (0.0, 0.0)))
-                width = float(field.get("width", layout.get("field_size", params.get("field_size", 520.0))))
-                height = float(field.get("height", layout.get("field_size", params.get("field_size", 520.0))))
-                x0, y0, x1, y1 = (
-                    cx - width / 2.0,
-                    cy - height / 2.0,
-                    cx + width / 2.0,
-                    cy + height / 2.0,
-                )
-                field["width"] = width
-                field["height"] = height
-                field["rect"] = (x0, y0, x1, y1)
-            corners=transform_points(np.array([[x0,y0],[x1,y0],[x1,y1],[x0,y1]],float),(float(component["x"]),float(component["y"])),float(component.get("orientation_deg",0)));field_polygon=gdstk.Polygon(corners);fb=field_polygon.bounding_box();fx0,fy0=float(fb[0][0]),float(fb[0][1]);fx1,fy1=float(fb[1][0]),float(fb[1][1]);candidates=[polygon for polygon,bx0,by0,bx1,by1 in source_boxes if min(fx1,bx1)>max(fx0,bx0)+1e-9 and min(fy1,by1)>max(fy0,by0)+1e-9]
-            if not candidates or not gdstk.boolean([field_polygon],candidates,"and",precision=1e-6):pruned.append(str(field["field_key"]))
-        params["auto_pruned_field_keys"] = pruned
+        source_polygons = self.ebeam_source_polygons(source_components)
+        occupied, adjacency = geometry_field_coverage(
+            layout["fields"],
+            source_polygons,
+            (float(component["x"]), float(component["y"])),
+            float(component.get("orientation_deg", 0.0)),
+        )
+        if prune_empty:
+            params["auto_pruned_field_keys"] = sorted(
+                str(field["field_key"])
+                for field in layout["fields"]
+                if str(field["field_key"]) not in occupied
+            )
+        else:
+            # A manually moved field remains user-owned even if it no longer
+            # intersects the source.  Keep it as an explicit disconnected
+            # graph island instead of silently pruning or grid-connecting it.
+            for field in layout["fields"]:
+                adjacency.setdefault(str(field["field_key"]), [])
+        params["geometry_field_adjacency"] = adjacency
+
+    def prune_ebeam_component(self, component: dict[str, Any]) -> None:
+        self.refresh_ebeam_geometry_adjacency(
+            component, prune_empty=True
+        )
 
     def deoverlap_ebeam_fields(self, component: dict[str, Any], preferred_key: str) -> int:
         """Move a manually dragged field by the minimum amount needed to abut its neighbors."""
@@ -5139,13 +5165,16 @@ class NativeLayoutWindow(QMainWindow):
         component=self.component_by_uid(uid)
         if component is None:return
         component.setdefault("params",{})["manual_layout_locked"]=True
-        moved=self.deoverlap_ebeam_fields(component,field_key);self.commit_interaction_snapshot(snapshot)
+        moved=self.deoverlap_ebeam_fields(component,field_key)
+        self.refresh_ebeam_geometry_adjacency(component, prune_empty=False)
+        self.commit_interaction_snapshot(snapshot)
         QTimer.singleShot(0,lambda:self.rebuild_scene(select_uids=[uid]));self.statusBar().showMessage(f"Write field updated; {moved} overlap correction(s) applied. Manual layout is preserved.",7000)
 
     def finish_ebeam_group_move(self, uid: int, snapshot: str) -> None:
         component=self.component_by_uid(uid)
         if component is None:return
         component.setdefault("params",{})["manual_layout_locked"]=True
+        self.refresh_ebeam_geometry_adjacency(component, prune_empty=False)
         self.commit_interaction_snapshot(snapshot)
         QTimer.singleShot(0,lambda:self.rebuild_scene(select_uids=[uid]));self.statusBar().showMessage("Moved the complete write-field set independently; source GDS stayed fixed.",7000)
 
@@ -5216,6 +5245,7 @@ class NativeLayoutWindow(QMainWindow):
         removed = set(map(str, component["params"].get("removed_field_keys", [])))
         removed.add(str(self.active_field[1]))
         component["params"]["removed_field_keys"] = sorted(removed)
+        self.refresh_ebeam_geometry_adjacency(component, prune_empty=False)
         self.active_field = None
         self.commit_interaction_snapshot(snapshot)
         self.rebuild_scene(select_uids=[int(component["uid"])])
@@ -5280,6 +5310,14 @@ class NativeLayoutWindow(QMainWindow):
         if not accepted:
             return
         snapshot = self.snapshot()
+        component = self.component_by_uid(int(self.active_field[0]))
+        if component is not None:
+            # Re-read the exact current source geometry at the moment the
+            # user chooses a new sequence anchor.  This also upgrades legacy
+            # projects that do not yet carry a saved connectivity graph.
+            self.refresh_ebeam_geometry_adjacency(
+                component, prune_empty=False
+            )
         self.set_field_global_order(self.active_field[0], self.active_field[1], desired)
         self.commit_interaction_snapshot(snapshot)
         self.rebuild_scene(select_uids=[int(self.active_field[0])])
@@ -7502,7 +7540,7 @@ ENDFLOW
             add("T-segmented electrode", segmented_keys)
             add("E-beam write fields", field_keys)
         else:
-            add(kind or "Device", tuple(key for key in p.keys() if key not in {"polygons","manual_field_offsets","manual_field_order","explicit_fields"}))
+            add(kind or "Device", tuple(key for key in p.keys() if key not in {"polygons","manual_field_offsets","manual_field_order","geometry_field_adjacency","explicit_fields"}))
         return groups
 
     def show_contextual_component_properties(
@@ -7524,7 +7562,7 @@ ENDFLOW
         self.properties_form.addRow(hint)
         specs = COMPONENT_SPECS.get(component.get("kind"), {})
         for key in keys:
-            if key in {"polygons","manual_field_offsets","manual_field_order","explicit_fields"}:continue
+            if key in {"polygons","manual_field_offsets","manual_field_order","geometry_field_adjacency","explicit_fields"}:continue
             if key not in component.get("params", {}):
                 continue
             value = component["params"][key]
@@ -7585,7 +7623,7 @@ ENDFLOW
         widgets: dict[str, tuple[QWidget, str]] = {}
         specs = COMPONENT_SPECS.get(component.get("kind"), {})
         for key in keys:
-            if key in {"polygons","manual_field_offsets","manual_field_order","explicit_fields"}:continue
+            if key in {"polygons","manual_field_offsets","manual_field_order","geometry_field_adjacency","explicit_fields"}:continue
             value = component.get("params", {}).get(key)
             spec = specs.get(key)
             if spec is None:

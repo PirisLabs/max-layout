@@ -988,6 +988,11 @@ DEFAULT_COMPONENT_VALUES["Photonic test block"] = {
         "length": {"start": 25.0, "stop": 100.0, "step": 25.0},
         "width": {"start": 0.8, "stop": 1.6, "step": 0.2},
     },
+    # Exact device-anchor pitch for newly created photonic scan blocks.  The
+    # older adaptive ``edge_spacing`` layout remains the compatibility path
+    # for project JSON that does not contain these two keys.
+    "device_x_spacing": 300.0,
+    "device_y_spacing": 300.0,
     "edge_spacing": 300.0,
     "layer": PHOTONIC_LAYER,
     "datatype": DEFAULT_DATATYPE,
