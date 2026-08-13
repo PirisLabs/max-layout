@@ -8,6 +8,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 import copy
+import hashlib
 import json
 import math
 import os
@@ -1938,11 +1939,54 @@ class NativeLayoutWindow(QMainWindow):
         self.redo_stack.clear()
 
     def commit_interaction_snapshot(self, before: str) -> None:
+        self.refresh_ebeam_for_changed_sources(before)
         after = self.snapshot()
         if before != after:
             self.undo_stack.append(before)
             self.undo_stack = self.undo_stack[-60:]
             self.redo_stack.clear()
+
+    def refresh_ebeam_for_changed_sources(self, before: str) -> None:
+        """Refresh unlocked coverage only when one of its source components changed."""
+        try:
+            previous_payload = json.loads(before)
+            previous_components = previous_payload.get("components", [])
+        except Exception:
+            return
+        previous_by_uid = {
+            int(component.get("uid", -1)): component
+            for component in previous_components
+            if component.get("kind") != "E-beam multipass"
+        }
+        current_by_uid = {
+            int(component.get("uid", -1)): component
+            for component in self.components
+            if component.get("kind") != "E-beam multipass"
+        }
+        changed_uids = {
+            uid
+            for uid in set(previous_by_uid) | set(current_by_uid)
+            if previous_by_uid.get(uid) != current_by_uid.get(uid)
+        }
+        if not changed_uids:
+            return
+        for coverage in self.components:
+            if coverage.get("kind") != "E-beam multipass":
+                continue
+            params = coverage.setdefault("params", {})
+            if bool(params.get("manual_layout_locked", False)):
+                continue
+            source_uids = {
+                int(uid) for uid in coverage.get("coverage_source_uids", [])
+            }
+            if source_uids & changed_uids:
+                self.prune_ebeam_component(coverage)
+                coverage_uid = int(coverage.get("uid", -1))
+                coverage_item = self.items_by_uid.get(coverage_uid)
+                if coverage_item is not None:
+                    self.refresh_ebeam_scene_item(
+                        coverage_uid, selected=coverage_item.isSelected()
+                    )
 
     def undo(self) -> None:
         if not self.undo_stack:
@@ -3409,6 +3453,20 @@ class NativeLayoutWindow(QMainWindow):
         self.refresh_project_tree()
         self.on_scene_selection_changed()
 
+    def refresh_ebeam_scene_item(self, uid: int, selected: bool = True) -> None:
+        """Refresh one write-field container without rebuilding unrelated geometry."""
+        item = self.items_by_uid.get(int(uid))
+        if not isinstance(item, EbeamContainerItem):
+            self.refresh_component_scene_item(uid, selected=selected)
+            self.refresh_field_numbers()
+            return
+        item.sync_transform()
+        item.rebuild_fields()
+        item.setSelected(bool(selected))
+        self.refresh_field_numbers()
+        self.refresh_project_tree()
+        self.on_scene_selection_changed()
+
     def rebuild_scene(
         self,
         preserve_selection: bool = False,
@@ -3428,16 +3486,9 @@ class NativeLayoutWindow(QMainWindow):
                 self.add_component_scene_item(component)
             except Exception as exc:
                 self.statusBar().showMessage(f"Preview error for UID {component.get('uid')}: {exc}")
-        # Auto-generated coverage follows its source until a user moves or
-        # rearranges the field set.  A manually locked layout is intentionally
-        # independent and must survive scene rebuilds and project reopen.
-        for component in self.components:
-            if component.get("kind")!="E-beam multipass":continue
-            if bool(component.get("params",{}).get("manual_layout_locked",False)):continue
-            before=set(map(str,component.get("params",{}).get("auto_pruned_field_keys",[])));self.prune_ebeam_component(component);after=set(map(str,component.get("params",{}).get("auto_pruned_field_keys",[])))
-            if after!=before:
-                item=self.items_by_uid.get(int(component["uid"]))
-                if isinstance(item,EbeamContainerItem):item.rebuild_fields()
+        # Exact E-beam polygon connectivity is deliberately not recomputed
+        # here.  Ordinary redraws reuse the graph saved on the component;
+        # source edits and explicit field operations refresh it once.
         for uid in selected:
             if uid in self.items_by_uid:
                 self.items_by_uid[uid].setSelected(True)
@@ -3836,8 +3887,17 @@ class NativeLayoutWindow(QMainWindow):
                         field_item.setPos(local_scene)
                         desired = int(self.read_parameter_widget(*self.parameter_widgets["active_field_order"]))
                         self.set_field_global_order(int(component["uid"]), self.active_field[1], desired)
+            if component.get("kind") == "E-beam multipass":
+                self.refresh_ebeam_geometry_adjacency(
+                    component,
+                    prune_empty=not bool(
+                        component["params"].get("manual_layout_locked", False)
+                    ),
+                )
             self.commit_interaction_snapshot(snapshot)
-            if component.get("kind") == "E-beam multipass" or companions_changed:
+            if component.get("kind") == "E-beam multipass":
+                self.refresh_ebeam_scene_item(int(component["uid"]), selected=True)
+            elif companions_changed:
                 self.rebuild_scene(preserve_selection=True)
             else:
                 self.refresh_component_scene_item(int(component["uid"]), selected=True)
@@ -5081,9 +5141,8 @@ class NativeLayoutWindow(QMainWindow):
         )
         component["coverage_source_uids"] = [int(source["uid"]) for source in sources]
         self.components.append(component)
+        self.prune_ebeam_component(component, source_polygons=source_polygons)
         self.commit_interaction_snapshot(snapshot)
-        self.rebuild_scene(select_uids=[int(component["uid"])])
-        self.prune_ebeam_component(component)
         self.rebuild_scene(select_uids=[int(component["uid"])])
         self.statusBar().showMessage("Created E-beam coverage and removed fields with no geometry overlap.")
 
@@ -5100,17 +5159,39 @@ class NativeLayoutWindow(QMainWindow):
         component: dict[str, Any],
         *,
         prune_empty: bool,
+        source_polygons: list[gdstk.Polygon] | None = None,
     ) -> None:
         """Refresh the physical write path, optionally pruning empty fields."""
         params = component["params"]
+        fingerprint = self.ebeam_geometry_fingerprint(component, prune_empty=prune_empty)
+        cache = getattr(self, "_ebeam_geometry_cache", None)
+        if cache is None:
+            cache = {}
+            self._ebeam_geometry_cache = cache
+        cache_key = (int(component.get("uid", -1)), bool(prune_empty))
+        if (
+            cache.get(cache_key) == fingerprint
+            and isinstance(params.get("geometry_field_adjacency"), dict)
+        ):
+            return
         if prune_empty:
             params["auto_pruned_field_keys"] = []
         params["geometry_field_adjacency"] = {}
         layout = multipass_field_layout(params)
         source_uids=[int(uid) for uid in component.get("coverage_source_uids",[])]
-        if not source_uids:return
-        source_components=[self.component_by_uid(uid) for uid in source_uids];source_components=[source for source in source_components if source is not None]
-        source_polygons = self.ebeam_source_polygons(source_components)
+        if not source_uids:
+            cache[cache_key] = fingerprint
+            return
+        if source_polygons is None:
+            source_components=[self.component_by_uid(uid) for uid in source_uids];source_components=[source for source in source_components if source is not None]
+            source_polygons = self.ebeam_source_polygons(source_components)
+        if not source_polygons:
+            if prune_empty:
+                params["auto_pruned_field_keys"] = sorted(
+                    str(field["field_key"]) for field in layout["fields"]
+                )
+            cache[cache_key] = fingerprint
+            return
         occupied, adjacency = geometry_field_coverage(
             layout["fields"],
             source_polygons,
@@ -5130,10 +5211,60 @@ class NativeLayoutWindow(QMainWindow):
             for field in layout["fields"]:
                 adjacency.setdefault(str(field["field_key"]), [])
         params["geometry_field_adjacency"] = adjacency
+        cache[cache_key] = fingerprint
 
-    def prune_ebeam_component(self, component: dict[str, Any]) -> None:
+    def ebeam_geometry_fingerprint(
+        self,
+        component: dict[str, Any],
+        *,
+        prune_empty: bool,
+    ) -> str:
+        """Return a stable cache key for source and write-field geometry only."""
+        source_params = component.get("params", {})
+        geometry_keys = (
+            "field_size",
+            "edge_clearance",
+            "target_width",
+            "target_height",
+            "overlap_x_enabled",
+            "overlap_y_enabled",
+            "overlap_x_percent",
+            "overlap_y_percent",
+            "manual_field_offsets",
+            "explicit_fields",
+        )
+        params = {
+            key: safe_json_copy(source_params[key])
+            for key in geometry_keys
+            if key in source_params
+        }
+        sources = [
+            safe_json_copy(source)
+            for uid in component.get("coverage_source_uids", [])
+            if (source := self.component_by_uid(int(uid))) is not None
+        ]
+        payload = {
+            "coverage": {
+                "x": float(component.get("x", 0.0)),
+                "y": float(component.get("y", 0.0)),
+                "orientation_deg": float(component.get("orientation_deg", 0.0)),
+                "params": params,
+                "prune_empty": bool(prune_empty),
+            },
+            "sources": sources,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def prune_ebeam_component(
+        self,
+        component: dict[str, Any],
+        source_polygons: list[gdstk.Polygon] | None = None,
+    ) -> None:
         self.refresh_ebeam_geometry_adjacency(
-            component, prune_empty=True
+            component,
+            prune_empty=True,
+            source_polygons=source_polygons,
         )
 
     def deoverlap_ebeam_fields(self, component: dict[str, Any], preferred_key: str) -> int:
@@ -5168,7 +5299,7 @@ class NativeLayoutWindow(QMainWindow):
         moved=self.deoverlap_ebeam_fields(component,field_key)
         self.refresh_ebeam_geometry_adjacency(component, prune_empty=False)
         self.commit_interaction_snapshot(snapshot)
-        QTimer.singleShot(0,lambda:self.rebuild_scene(select_uids=[uid]));self.statusBar().showMessage(f"Write field updated; {moved} overlap correction(s) applied. Manual layout is preserved.",7000)
+        QTimer.singleShot(0,lambda:self.refresh_ebeam_scene_item(uid, selected=True));self.statusBar().showMessage(f"Write field updated; {moved} overlap correction(s) applied. Manual layout is preserved.",7000)
 
     def finish_ebeam_group_move(self, uid: int, snapshot: str) -> None:
         component=self.component_by_uid(uid)
@@ -5176,7 +5307,7 @@ class NativeLayoutWindow(QMainWindow):
         component.setdefault("params",{})["manual_layout_locked"]=True
         self.refresh_ebeam_geometry_adjacency(component, prune_empty=False)
         self.commit_interaction_snapshot(snapshot)
-        QTimer.singleShot(0,lambda:self.rebuild_scene(select_uids=[uid]));self.statusBar().showMessage("Moved the complete write-field set independently; source GDS stayed fixed.",7000)
+        QTimer.singleShot(0,lambda:self.refresh_ebeam_scene_item(uid, selected=True));self.statusBar().showMessage("Moved the complete write-field set independently; source GDS stayed fixed.",7000)
 
     def update_selected_ebeam(self) -> None:
         components = [component for component in self.selected_components() if component.get("kind") == "E-beam multipass"]
@@ -5185,6 +5316,7 @@ class NativeLayoutWindow(QMainWindow):
             return
         snapshot = self.snapshot()
         for component in components:
+            source_polygons: list[gdstk.Polygon] = []
             source_components = [
                 self.component_by_uid(int(uid))
                 for uid in component.get("coverage_source_uids", [])
@@ -5201,9 +5333,13 @@ class NativeLayoutWindow(QMainWindow):
                 if not bool(params.get("preserve_manual_grid_position", True)):
                     component["x"] = (bounds[0] + bounds[2]) / 2
                     component["y"] = (bounds[1] + bounds[3]) / 2
-            self.prune_ebeam_component(component)
+            self.prune_ebeam_component(
+                component,
+                source_polygons=source_polygons if source_components else None,
+            )
         self.commit_interaction_snapshot(snapshot)
-        self.rebuild_scene(select_uids=[int(component["uid"]) for component in components])
+        for component in components:
+            self.refresh_ebeam_scene_item(int(component["uid"]), selected=True)
         self.statusBar().showMessage("Updated fields, preserved manual positions, and removed fields with no geometry overlap.")
 
     def reset_selected_ebeam_fields(self) -> None:
@@ -5212,6 +5348,7 @@ class NativeLayoutWindow(QMainWindow):
             return
         snapshot = self.snapshot()
         for component in components:
+            source_polygons: list[gdstk.Polygon] = []
             params = component["params"]
             params["manual_field_offsets"] = {}
             params["manual_field_order"] = {}
@@ -5231,9 +5368,13 @@ class NativeLayoutWindow(QMainWindow):
                     component["y"] = (bounds[1] + bounds[3]) / 2.0
                     params["target_width"] = bounds[2] - bounds[0]
                     params["target_height"] = bounds[3] - bounds[1]
-            self.prune_ebeam_component(component)
+            self.prune_ebeam_component(
+                component,
+                source_polygons=source_polygons if source_components else None,
+            )
         self.commit_interaction_snapshot(snapshot)
-        self.rebuild_scene(select_uids=[int(component["uid"]) for component in components])
+        for component in components:
+            self.refresh_ebeam_scene_item(int(component["uid"]), selected=True)
 
     def remove_active_field(self) -> None:
         if not self.active_field:
@@ -5245,10 +5386,9 @@ class NativeLayoutWindow(QMainWindow):
         removed = set(map(str, component["params"].get("removed_field_keys", [])))
         removed.add(str(self.active_field[1]))
         component["params"]["removed_field_keys"] = sorted(removed)
-        self.refresh_ebeam_geometry_adjacency(component, prune_empty=False)
         self.active_field = None
         self.commit_interaction_snapshot(snapshot)
-        self.rebuild_scene(select_uids=[int(component["uid"])])
+        self.refresh_ebeam_scene_item(int(component["uid"]), selected=True)
 
     def field_order_state(self) -> tuple[dict[tuple[int, str], int], dict[int, tuple[int, int]]]:
         mapping: dict[tuple[int, str], int] = {}
@@ -5311,16 +5451,17 @@ class NativeLayoutWindow(QMainWindow):
             return
         snapshot = self.snapshot()
         component = self.component_by_uid(int(self.active_field[0]))
-        if component is not None:
-            # Re-read the exact current source geometry at the moment the
-            # user chooses a new sequence anchor.  This also upgrades legacy
-            # projects that do not yet carry a saved connectivity graph.
+        if component is not None and not isinstance(
+            component.get("params", {}).get("geometry_field_adjacency"), dict
+        ):
+            # Upgrade a legacy project once.  Normal order changes reuse the
+            # saved graph and never rebuild source polygons.
             self.refresh_ebeam_geometry_adjacency(
                 component, prune_empty=False
             )
         self.set_field_global_order(self.active_field[0], self.active_field[1], desired)
         self.commit_interaction_snapshot(snapshot)
-        self.rebuild_scene(select_uids=[int(self.active_field[0])])
+        self.refresh_ebeam_scene_item(int(self.active_field[0]), selected=True)
         if desired == start:
             self.statusBar().showMessage(
                 "New first write field selected; all remaining fields were renumbered to follow the geometry.",
@@ -5392,7 +5533,7 @@ class NativeLayoutWindow(QMainWindow):
         snapshot = self.snapshot()
         self.set_field_global_order(uid, field_key, desired)
         self.commit_interaction_snapshot(snapshot)
-        self.rebuild_scene(select_uids=[uid])
+        self.refresh_ebeam_scene_item(uid, selected=True)
         self.active_field = (uid, field_key)
         self.statusBar().showMessage(f"Moved write field to global order {desired}.")
 

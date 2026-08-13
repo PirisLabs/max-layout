@@ -860,17 +860,15 @@ class WriteFieldItem(QGraphicsRectItem):
         pen.setCosmetic(True)
         self.setPen(pen)
         self.setBrush(QBrush(color_for_layer(EBEAM_LAYER, 24)))
-        self.order_label = QGraphicsSimpleTextItem(str(global_order), self)
-        self.order_label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-        self.order_label.setBrush(QBrush(QColor("#ffffff")))
-        font = QFont()
-        font.setBold(True)
-        self.order_label.setFont(font)
-        self.order_label.setPos(-width / 2 + 5, -height / 2 + 5)
-        # The sequence is internal metadata.  It can be shown in the editor
-        # when explicitly requested, but it is hidden by default and is never
-        # emitted into the Beamer fabrication layer.
-        self.order_label.setVisible(
+        self._global_order = int(global_order)
+        self._label_position = QPointF(-width / 2 + 5, -height / 2 + 5)
+        self.order_label: QGraphicsSimpleTextItem | None = None
+        # A hidden QGraphicsSimpleTextItem is still a comparatively expensive
+        # scene object.  Large write-field sets used to create thousands of
+        # them even when their numbers were hidden, slowing every scene walk
+        # and redraw.  Construct labels lazily only when the user asks to see
+        # the ordering; they remain editor-only and are never written to GDS.
+        self.set_order_label_visible(
             bool(container.component.get("params", {}).get("show_order", False))
         )
         self._drag_snapshot: str | None = None
@@ -894,8 +892,37 @@ class WriteFieldItem(QGraphicsRectItem):
             self.setBrush(QBrush(color_for_layer(EBEAM_LAYER, 28)))
         self.setPen(pen)
 
+    def set_order_label_visible(self, visible: bool) -> None:
+        """Create the editor label only while write-field numbers are visible."""
+        if visible:
+            if self.order_label is None:
+                label = QGraphicsSimpleTextItem(str(self._global_order), self)
+                label.setFlag(
+                    QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations,
+                    True,
+                )
+                label.setBrush(QBrush(QColor("#ffffff")))
+                font = QFont()
+                font.setBold(True)
+                label.setFont(font)
+                label.setPos(self._label_position)
+                self.order_label = label
+            self.order_label.setVisible(True)
+            return
+        if self.order_label is not None:
+            label = self.order_label
+            self.order_label = None
+            label.setParentItem(None)
+            if label.scene() is not None:
+                label.scene().removeItem(label)
+
     def set_global_order(self, order: int) -> None:
-        self.order_label.setText(str(order))
+        self._global_order = int(order)
+        self.set_order_label_visible(
+            bool(self.container.component.get("params", {}).get("show_order", False))
+        )
+        if self.order_label is not None:
+            self.order_label.setText(str(order))
         self.setToolTip(f"Write field {order}\n{self.field_key}")
 
     def itemChange(self, change, value):

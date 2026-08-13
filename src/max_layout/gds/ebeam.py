@@ -90,6 +90,39 @@ def geometry_field_coverage(
             if str(field.get("field_key", ""))
         }
 
+    # A source component can contain hundreds or thousands of mutually distant
+    # polygons.  Passing that complete list into every field Boolean makes the
+    # clipping cost grow with ``field count * complete component complexity``.
+    # Keep the exact Boolean decisions, but first reject polygons whose bounding
+    # boxes cannot possibly touch the requested window.  This inexpensive
+    # spatial prefilter is especially important for dense photonic test blocks.
+    source_bounds: list[tuple[float, float, float, float]] = []
+    for polygon in merged_sources:
+        bounding_box = np.asarray(polygon.bounding_box(), dtype=float)
+        source_bounds.append((
+            float(bounding_box[0, 0]),
+            float(bounding_box[0, 1]),
+            float(bounding_box[1, 0]),
+            float(bounding_box[1, 1]),
+        ))
+
+    spatial_tolerance = max(float(precision) * 2.0, 1e-9)
+
+    def sources_near(
+        bounds: tuple[float, float, float, float],
+    ) -> list[gdstk.Polygon]:
+        x0, y0, x1, y1 = bounds
+        return [
+            polygon
+            for polygon, (px0, py0, px1, py1) in zip(
+                merged_sources, source_bounds
+            )
+            if px1 >= x0 - spatial_tolerance
+            and px0 <= x1 + spatial_tolerance
+            and py1 >= y0 - spatial_tolerance
+            and py0 <= y1 + spatial_tolerance
+        ]
+
     rectangles: dict[str, tuple[tuple[float, float, float, float], gdstk.Polygon]] = {}
     for field in fields:
         key = str(field.get("field_key", ""))
@@ -107,15 +140,16 @@ def geometry_field_coverage(
         )
 
     occupied: set[str] = set()
-    for key, (_bounds, rectangle) in rectangles.items():
-        if gdstk.boolean(
-            merged_sources, [rectangle], "and", precision=float(precision)
+    for key, (bounds, rectangle) in rectangles.items():
+        nearby_sources = sources_near(bounds)
+        if nearby_sources and gdstk.boolean(
+            nearby_sources, [rectangle], "and", precision=float(precision)
         ):
             occupied.add(key)
 
     adjacency: dict[str, set[str]] = {key: set() for key in occupied}
     occupied_keys = sorted(occupied)
-    tolerance = max(float(precision) * 2.0, 1e-9)
+    tolerance = spatial_tolerance
     for index, key_a in enumerate(occupied_keys):
         bounds_a, rectangle_a = rectangles[key_a]
         ax0, ay0, ax1, ay1 = bounds_a
@@ -138,12 +172,18 @@ def geometry_field_coverage(
             # component must have non-zero area in *both* rectangles; paths
             # that reconnect only through a third field therefore do not
             # create a false shortcut edge.
-            pair_window = gdstk.rectangle(
-                (min(ax0, bx0), min(ay0, by0)),
-                (max(ax1, bx1), max(ay1, by1)),
+            pair_bounds = (
+                min(ax0, bx0), min(ay0, by0),
+                max(ax1, bx1), max(ay1, by1),
             )
+            pair_window = gdstk.rectangle(
+                pair_bounds[:2], pair_bounds[2:]
+            )
+            nearby_sources = sources_near(pair_bounds)
+            if not nearby_sources:
+                continue
             clipped = gdstk.boolean(
-                merged_sources,
+                nearby_sources,
                 [pair_window],
                 "and",
                 precision=float(precision),
@@ -556,13 +596,6 @@ def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
                 requested_key_by_order[len(consecutive_prefix) + 1]
             )
 
-        def is_geometry_neighbor(
-            current_key: tuple[int, int], candidate: tuple[int, int]
-        ) -> bool:
-            return candidate in configured_neighbors(
-                current_key, geometry_adjacency
-            )
-
         all_keys = set(by_key)
         active_x = [float(field["center"][0]) for field in ordered]
         active_y = [float(field["center"][1]) for field in ordered]
@@ -610,80 +643,34 @@ def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
             component: set[tuple[int, int]],
             start_key: tuple[int, int],
         ) -> list[tuple[int, int]]:
+            """Walk one geometry island without combinatorial backtracking.
+
+            Real device meanders normally form a degree-one/two path, so the
+            minimum-unused-degree rule follows them exactly.  Branched or solid
+            occupied regions use the same deterministic rule and make a shortest
+            spatial jump only if a branch cannot be covered without revisiting a
+            field.  Runtime is linear for path-like geometry and near-linear for
+            the small-degree write-field graphs used by the editor.
+            """
             if len(component) <= 1:
                 return [start_key]
-
-            path = [start_key]
-            unused = set(component)
-            unused.remove(start_key)
-            search_steps = 0
-            max_search_steps = 300000 if len(component) <= 90 else 30000
-
-            def remaining_is_reachable(current_key: tuple[int, int]) -> bool:
-                if not unused:
-                    return True
-                entrances = neighbor_keys(current_key, unused)
-                if not entrances:
-                    return False
-                reached = {entrances[0]}
-                stack = [entrances[0]]
-                while stack:
-                    key = stack.pop()
-                    for neighbor in neighbor_keys(key, unused):
-                        if neighbor not in reached:
-                            reached.add(neighbor)
-                            stack.append(neighbor)
-                return reached == unused
-
-            def dfs(current_key: tuple[int, int]) -> bool:
-                nonlocal search_steps
-                search_steps += 1
-                if search_steps > max_search_steps:
-                    return False
-                if not unused:
-                    return True
-                candidates = neighbor_keys(current_key, unused)
-                expected_key = requested_key_by_order.get(len(path) + 1)
-                candidates.sort(
-                    key=lambda key: (
-                        0 if key == expected_key else 1,
-                        0 if is_geometry_neighbor(current_key, key) else 1,
-                        len(neighbor_keys(key, unused - {key})),
-                        field_distance_sq(by_key[current_key], by_key[key]),
-                        abs(int(by_key[key]["row"]) - int(by_key[current_key]["row"]))
-                        if primary_axis == "x"
-                        else abs(int(by_key[key]["column"]) - int(by_key[current_key]["column"])),
-                        int(by_key[key]["row"]),
-                        int(by_key[key]["column"]),
-                    )
-                )
-                for candidate in candidates:
-                    unused.remove(candidate)
-                    path.append(candidate)
-                    if remaining_is_reachable(candidate) and dfs(candidate):
-                        return True
-                    path.pop()
-                    unused.add(candidate)
-                return False
-
-            if dfs(start_key):
-                return path
-
-            # Fallback for a connected occupied shape that has no all-adjacent
-            # Hamiltonian path: stay adjacent while possible, then make only
-            # the minimum-distance jump needed to continue.
             route = [start_key]
             remaining = set(component)
             remaining.remove(start_key)
             while remaining:
                 current_key = route[-1]
                 adjacent = neighbor_keys(current_key, remaining)
-                pool = adjacent if adjacent else list(remaining)
+                expected_key = requested_key_by_order.get(len(route) + 1)
+                pool = adjacent if adjacent else remaining
                 next_key = min(
                     pool,
                     key=lambda key: (
-                        field_distance_sq(by_key[current_key], by_key[key]),
+                        0 if key == expected_key else 1,
                         len(neighbor_keys(key, remaining - {key})),
+                        field_distance_sq(by_key[current_key], by_key[key]),
+                        abs(int(by_key[key]["row"]) - int(by_key[current_key]["row"]))
+                        if primary_axis == "x"
+                        else abs(int(by_key[key]["column"]) - int(by_key[current_key]["column"])),
                         int(by_key[key]["row"]),
                         int(by_key[key]["column"]),
                     ),

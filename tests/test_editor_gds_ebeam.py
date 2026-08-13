@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import time
 import unittest
 from unittest.mock import patch
 
@@ -346,7 +347,7 @@ class IndependentEbeamMovementTests(unittest.TestCase):
             def component_by_uid(self, _uid):
                 return None
 
-            def prune_ebeam_component(self, _component):
+            def prune_ebeam_component(self, _component, **_kwargs):
                 pass
 
             def commit_interaction_snapshot(self, _snapshot):
@@ -354,6 +355,9 @@ class IndependentEbeamMovementTests(unittest.TestCase):
 
             def rebuild_scene(self, select_uids=None):
                 self.selected = list(select_uids or [])
+
+            def refresh_ebeam_scene_item(self, uid, selected=True):
+                self.selected = [int(uid)] if selected else []
 
         fake = FakeWindow()
         NativeLayoutWindow.reset_selected_ebeam_fields(fake)
@@ -363,6 +367,81 @@ class IndependentEbeamMovementTests(unittest.TestCase):
         self.assertEqual(field["params"]["removed_field_keys"], [])
         self.assertEqual(field["params"]["auto_pruned_field_keys"], [])
         self.assertEqual(fake.selected, [2])
+
+    def test_ordinary_scene_rebuild_reuses_saved_ebeam_graph(self) -> None:
+        field = component("E-beam multipass", 2)
+        field["params"]["geometry_field_adjacency"] = {
+            "c1_r1": ["c2_r1"],
+            "c2_r1": ["c1_r1"],
+        }
+
+        class Scene:
+            def selectedItems(self):
+                return []
+
+            def clear(self):
+                pass
+
+        class FakeWindow:
+            def __init__(self) -> None:
+                self.scene = Scene()
+                self.components = [field]
+                self.items_by_uid = {}
+                self.layer_visibility = {}
+                self.show_ports_enabled = True
+
+            def add_component_scene_item(self, _component):
+                pass
+
+            def prune_ebeam_component(self, _component):
+                raise AssertionError("ordinary redraw must not rebuild geometry")
+
+            def refresh_field_numbers(self):
+                pass
+
+            def refresh_project_tree(self):
+                pass
+
+            def on_scene_selection_changed(self):
+                pass
+
+        NativeLayoutWindow.rebuild_scene(FakeWindow())
+        self.assertEqual(
+            field["params"]["geometry_field_adjacency"]["c1_r1"],
+            ["c2_r1"],
+        )
+
+    def test_exact_ebeam_geometry_refresh_is_cached(self) -> None:
+        source = component("Straight", 1)
+        field = component("E-beam multipass", 2)
+        field["coverage_source_uids"] = [1]
+        polygons = [gdstk.rectangle((-20.0, -20.0), (20.0, 20.0))]
+
+        class FakeWindow:
+            def __init__(self):
+                self._ebeam_geometry_cache = {}
+
+            def component_by_uid(self, uid):
+                return source if int(uid) == 1 else field if int(uid) == 2 else None
+
+            def ebeam_source_polygons(self, _sources):
+                return polygons
+
+            ebeam_geometry_fingerprint = NativeLayoutWindow.ebeam_geometry_fingerprint
+
+        fake = FakeWindow()
+        with patch(
+            "max_layout.ui.window.geometry_field_coverage",
+            return_value=({"c1_r1"}, {"c1_r1": []}),
+        ) as coverage:
+            NativeLayoutWindow.refresh_ebeam_geometry_adjacency(
+                fake, field, prune_empty=True
+            )
+            NativeLayoutWindow.refresh_ebeam_geometry_adjacency(
+                fake, field, prune_empty=True
+            )
+        self.assertEqual(coverage.call_count, 1)
+        self.assertNotIn("_geometry_cache_fingerprint", field["params"])
 
     def test_user_selected_top_center_field_anchors_geometry_order(self) -> None:
         params = dict(DEFAULT_COMPONENT_VALUES["E-beam multipass"])
@@ -427,6 +506,68 @@ class IndependentEbeamMovementTests(unittest.TestCase):
             ],
             expected,
         )
+
+    def test_geometry_coverage_prefilters_distant_polygons_before_boolean(self) -> None:
+        fields = [{
+            "field_key": "center",
+            "rect": (-50.0, -50.0, 50.0, 50.0),
+        }]
+        source = [gdstk.rectangle((-5.0, -5.0), (5.0, 5.0))]
+        source.extend(
+            gdstk.rectangle((1000.0 * index, 1000.0),
+                            (1000.0 * index + 10.0, 1010.0))
+            for index in range(1, 101)
+        )
+        real_boolean = gdstk.boolean
+        intersection_operand_sizes: list[int] = []
+
+        def tracked_boolean(first, second, operation, *args, **kwargs):
+            if operation == "and":
+                intersection_operand_sizes.append(len(first))
+            return real_boolean(first, second, operation, *args, **kwargs)
+
+        with patch(
+            "max_layout.gds.ebeam.gdstk.boolean",
+            side_effect=tracked_boolean,
+        ):
+            occupied, adjacency = geometry_field_coverage(fields, source)
+
+        self.assertEqual(occupied, {"center"})
+        self.assertEqual(adjacency, {"center": []})
+        self.assertEqual(intersection_operand_sizes, [1])
+
+    def test_long_geometry_path_routes_iteratively_without_recursion(self) -> None:
+        count = 2500
+        params = dict(DEFAULT_COMPONENT_VALUES["E-beam multipass"])
+        params.update(
+            {
+                "field_size": 100.0,
+                "edge_clearance": 0.0,
+                "target_width": count * 100.0,
+                "target_height": 100.0,
+                "manual_field_order": {"c1_r1": 1, "c2_r1": 2},
+                "geometry_field_adjacency": {
+                    f"c{column}_r1": [
+                        f"c{neighbor}_r1"
+                        for neighbor in (column - 1, column + 1)
+                        if 1 <= neighbor <= count
+                    ]
+                    for column in range(1, count + 1)
+                },
+            }
+        )
+
+        started = time.perf_counter()
+        fields = multipass_field_layout(params)["fields"]
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(len(fields), count)
+        self.assertEqual(fields[0]["field_key"], "c1_r1")
+        self.assertEqual(fields[1]["field_key"], "c2_r1")
+        self.assertEqual(fields[-1]["field_key"], f"c{count}_r1")
+        # Generous guard against accidentally restoring combinatorial search;
+        # ordinary CI machines complete this iterative path far below 1 second.
+        self.assertLess(elapsed, 5.0)
 
     def test_user_selected_first_explicit_field_orders_by_geometry(self) -> None:
         params = dict(DEFAULT_COMPONENT_VALUES["E-beam multipass"])
