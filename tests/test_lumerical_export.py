@@ -1447,8 +1447,8 @@ class LumericalExportTests(unittest.TestCase):
             normalize_lumerical_sweep_spec(
                 grating,
                 [
-                    {"parameter": "pitch", "values": np.linspace(0.6, 0.8, 11)},
-                    {"parameter": "duty_cycle", "values": np.linspace(0.3, 0.5, 10)},
+                    {"parameter": "pitch", "values": np.linspace(0.6, 0.8, 21)},
+                    {"parameter": "duty_cycle", "values": np.linspace(0.3, 0.5, 15)},
                 ],
             )
 
@@ -3457,7 +3457,7 @@ class LumericalExportTests(unittest.TestCase):
 
         checkout_source = sources[checkout]
         release_source = sources[checkin]
-        self.assertIn('max(0, 3 - _existing_count)', checkout_source)
+        self.assertIn('max(0, HPC_PACK_COUNT - _existing_count)', checkout_source)
         self.assertIn('--expires "{HPC_PACK_EXPIRY}"', checkout_source)
         self.assertIn('HPC_PACK_EXPIRY = "PT%dM" % HPC_PACK_DURATION_MINUTES', checkout_source)
         self.assertIn('--licenseModel "Shared Web" --mode user', checkout_source)
@@ -3503,6 +3503,7 @@ class LumericalExportTests(unittest.TestCase):
         self.assertIn("SHOW_PORT_MODE_PREVIEW = True", first_source)
         self.assertIn("RUN_GPU_SYSTEM_CHECK = False", first_source)
         self.assertIn("HPC_PACK_DURATION_MINUTES = 30", first_source)
+        self.assertIn("HPC_PACK_COUNT = 3", first_source)
 
         all_source = "\n".join(
             "".join(cell.get("source", [])) for cell in notebook["cells"]

@@ -295,6 +295,77 @@ class IndependentEbeamMovementTests(unittest.TestCase):
         self.assertEqual(field["params"]["auto_pruned_field_keys"], [])
         self.assertEqual(fake.selected, [2])
 
+    def test_user_selected_top_center_field_anchors_geometry_order(self) -> None:
+        params = dict(DEFAULT_COMPONENT_VALUES["E-beam multipass"])
+        params.update(
+            {
+                "field_size": 100.0,
+                "edge_clearance": 0.0,
+                "target_width": 500.0,
+                "target_height": 300.0,
+                "start_corner": "top-left",
+                "primary_axis": "x",
+                "serpentine": True,
+                # A device can begin at the top center rather than a corner.
+                "manual_field_order": {"c3_r1": 1},
+            }
+        )
+        fields = multipass_field_layout(params)["fields"]
+        self.assertEqual(fields[0]["field_key"], "c3_r1")
+        # The automatic continuation follows touching fields through the
+        # geometry; it must not jump back to the configured top-left corner.
+        for previous, current in zip(fields, fields[1:]):
+            dc = abs(int(previous["column"]) - int(current["column"]))
+            dr = abs(int(previous["row"]) - int(current["row"]))
+            self.assertEqual(dc + dr, 1)
+
+    def test_user_selected_first_explicit_field_orders_by_geometry(self) -> None:
+        params = dict(DEFAULT_COMPONENT_VALUES["E-beam multipass"])
+        params.update(
+            {
+                "explicit_fields": [
+                    {"field_key": "left", "bounds": [-150, -50, -50, 50]},
+                    {"field_key": "far", "bounds": [150, -50, 250, 50]},
+                    {"field_key": "center", "bounds": [-50, -50, 50, 50]},
+                    {"field_key": "right", "bounds": [50, -50, 150, 50]},
+                ],
+                "manual_field_order": {"center": 1},
+            }
+        )
+        fields = multipass_field_layout(params)["fields"]
+        self.assertEqual(
+            [field["field_key"] for field in fields],
+            ["center", "left", "right", "far"],
+        )
+
+    def test_assigning_new_first_field_clears_old_fixed_slots(self) -> None:
+        field = component("E-beam multipass", 2)
+        field["params"].update(
+            {
+                "field_size": 100.0,
+                "edge_clearance": 0.0,
+                "target_width": 300.0,
+                "target_height": 200.0,
+                "manual_field_order": {"c1_r1": 1, "c2_r2": 4},
+            }
+        )
+
+        class FakeWindow:
+            def component_by_uid(self, uid):
+                return field if int(uid) == 2 else None
+
+            def field_order_state(self):
+                return {}, {2: (1, 6)}
+
+        NativeLayoutWindow.set_field_global_order(
+            FakeWindow(), 2, "c2_r1", 1
+        )
+        self.assertEqual(field["params"]["manual_field_order"], {"c2_r1": 1})
+        self.assertEqual(
+            multipass_field_layout(field["params"])["fields"][0]["field_key"],
+            "c2_r1",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

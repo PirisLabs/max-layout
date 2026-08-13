@@ -2397,6 +2397,51 @@ class NativeLayoutWindow(QMainWindow):
         parent_uid = int(component.get("uid", 0))
         is_grating = str(component.get("kind", "")) in {"Grating coupler", "GC-SOI"}
         if is_grating:
+            # Parent-owned source/measurement roles are singletons.  Projects
+            # saved while switching between fiber and Gaussian excitation can
+            # contain two copies of the automatic Pin plane; retain the
+            # canonical automatic copy and remove only exact duplicate roles.
+            def _grating_companion_role(candidate: dict[str, Any]) -> str | None:
+                if int(candidate.get("simulation_parent_uid", -1)) != parent_uid:
+                    return None
+                kind = str(candidate.get("kind", ""))
+                parent_port = str(candidate.get("simulation_parent_port", ""))
+                if kind == "Power monitor" and parent_port == "fiber_input_power":
+                    return "fiber_input_power"
+                if kind == "Power monitor" and str(candidate.get("grating_monitor_role", "")) == "waveguide_total_power":
+                    return "waveguide_total_power"
+                if kind == "FDTD port" and parent_port == "waveguide_point":
+                    return "waveguide_receiver"
+                if kind == "Gaussian source" and parent_port != "fiber_input_power":
+                    return "gaussian_source"
+                if kind == "Fiber-axis FDTD port" and parent_port != "fiber_input_power":
+                    return "fiber_source"
+                if kind == "Fiber geometry":
+                    return "fiber_geometry"
+                return None
+
+            role_groups: dict[str, list[dict[str, Any]]] = {}
+            for candidate in self.components:
+                role = _grating_companion_role(candidate)
+                if role is not None:
+                    role_groups.setdefault(role, []).append(candidate)
+            duplicate_uids: set[int] = set()
+            for role_items in role_groups.values():
+                if len(role_items) <= 1:
+                    continue
+                ordered = sorted(
+                    role_items,
+                    key=lambda item: (
+                        not bool(item.get("auto_placed", False)),
+                        int(item.get("uid", 0)),
+                    ),
+                )
+                duplicate_uids.update(int(item.get("uid", -1)) for item in ordered[1:])
+            if duplicate_uids:
+                self.components[:] = [
+                    candidate for candidate in self.components
+                    if int(candidate.get("uid", -1)) not in duplicate_uids
+                ]
             desired_excitation = grating_excitation_type(component)
             incompatible_kinds = (
                 {"Gaussian source"}
@@ -5204,6 +5249,14 @@ class NativeLayoutWindow(QMainWindow):
             raise ValueError(f"This array cell accepts field numbers {start} through {end}.")
         desired_local = desired_global - start + 1
         orders = dict(component["params"].get("manual_field_order", {}))
+        if desired_local == 1:
+            # Choosing a new first field means "restart the write path here".
+            # Discard stale fixed slots so every other field is automatically
+            # renumbered along the geometry-aware adjacent/minimum-jump route.
+            component["params"]["manual_field_order"] = {
+                str(field_key): 1
+            }
+            return
         for key, value in list(orders.items()):
             if str(key) != str(field_key) and int(round(float(value))) == desired_local:
                 orders.pop(key, None)
@@ -5230,6 +5283,11 @@ class NativeLayoutWindow(QMainWindow):
         self.set_field_global_order(self.active_field[0], self.active_field[1], desired)
         self.commit_interaction_snapshot(snapshot)
         self.rebuild_scene(select_uids=[int(self.active_field[0])])
+        if desired == start:
+            self.statusBar().showMessage(
+                "New first write field selected; all remaining fields were renumbered to follow the geometry.",
+                8000,
+            )
 
     def refresh_field_numbers(self) -> None:
         mapping, _ = self.field_order_state()
@@ -5669,6 +5727,13 @@ class NativeLayoutWindow(QMainWindow):
                 (component for component in self.components if int(component.get("uid", -1)) == int(parent_uid)),
                 clicked_component,
             ) if parent_uid is not None else clicked_component
+        if (
+            settings_component is not None
+            and str(settings_component.get("kind", "")) in {"Grating coupler", "GC-SOI"}
+        ):
+            # Repair stale duplicate automatic source/monitor companions
+            # before the scope dialog snapshots the export topology.
+            self.synchronize_automatic_simulation_companions(settings_component)
         saved = settings_component.get("lumerical_export_settings", {}) if settings_component else {}
         if settings_component and settings_component.get("kind") == "1x2 MMI":
             saved = mmi_lumerical_export_settings(saved)
@@ -5785,6 +5850,9 @@ class NativeLayoutWindow(QMainWindow):
             # canonical project-JSON name, including layouts made by older
             # versions of the editor.
             migrate_grating_fiber_offset_parameter(target_component)
+            synchronizer = getattr(self, "synchronize_automatic_simulation_companions", None)
+            if callable(synchronizer):
+                synchronizer(target_component)
 
         sweep_dialog = LumericalSweepDialog(
             target_component,
@@ -5973,6 +6041,9 @@ class NativeLayoutWindow(QMainWindow):
             return
         if target_component.get("kind") in {"Grating coupler", "GC-SOI"}:
             migrate_grating_fiber_offset_parameter(target_component)
+            synchronizer = getattr(self, "synchronize_automatic_simulation_companions", None)
+            if callable(synchronizer):
+                synchronizer(target_component)
 
         sweep_dialog = LumericalMultigpuSweepDialog(
             target_component,

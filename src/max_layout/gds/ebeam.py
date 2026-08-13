@@ -40,6 +40,24 @@ def add_ebeam_parameter_text(top: gdstk.Cell, text: str, center: tuple[float,flo
 def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
     """Calculate centered, ordered, and optionally hand-adjusted square write fields."""
 
+    raw_manual_order = params.get("manual_field_order", {})
+    manual_order = raw_manual_order if isinstance(raw_manual_order, dict) else {}
+
+    def requested_first_key(active_keys: set[str]) -> str | None:
+        """Return the user-selected first active field, if one was assigned."""
+        candidates: list[str] = []
+        for raw_key, raw_value in manual_order.items():
+            key = str(raw_key)
+            if key not in active_keys:
+                continue
+            try:
+                requested = int(round(float(raw_value)))
+            except (TypeError, ValueError):
+                continue
+            if requested == 1:
+                candidates.append(key)
+        return min(candidates) if candidates else None
+
     explicit_fields = params.get("explicit_fields")
     if isinstance(explicit_fields, list) and explicit_fields:
         raw_offsets = params.get("manual_field_offsets", {})
@@ -101,8 +119,37 @@ def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
                 "region_name": str(entry.get("region_name") or f"R{index}"),
             })
 
-        manual_order_raw = params.get("manual_field_order", {})
-        manual_order = manual_order_raw if isinstance(manual_order_raw, dict) else {}
+        # Imported/explicit fields do not have grid row/column connectivity.
+        # When the user chooses field 1, walk outward from that exact field by
+        # the shortest physical jump instead of retaining the import order.
+        # This makes the remaining sequence follow an arbitrarily oriented or
+        # irregular device without assuming it begins at a particular corner.
+        first_explicit_key = requested_first_key({
+            str(field["field_key"]) for field in fields
+        })
+        if fields and first_explicit_key is not None:
+            by_explicit_key = {
+                str(field["field_key"]): field for field in fields
+            }
+            route = [by_explicit_key[first_explicit_key]]
+            remaining = {
+                key for key in by_explicit_key if key != first_explicit_key
+            }
+            while remaining:
+                current = route[-1]
+                cx, cy = map(float, current["center"])
+                next_key = min(
+                    remaining,
+                    key=lambda key: (
+                        (float(by_explicit_key[key]["center"][0]) - cx) ** 2
+                        + (float(by_explicit_key[key]["center"][1]) - cy) ** 2,
+                        str(key),
+                    ),
+                )
+                route.append(by_explicit_key[next_key])
+                remaining.remove(next_key)
+            fields = route
+
         if fields and manual_order:
             count = len(fields)
             active_by_key = {str(field["field_key"]): field for field in fields}
@@ -300,17 +347,28 @@ def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
         all_keys = set(by_key)
         active_x = [float(field["center"][0]) for field in ordered]
         active_y = [float(field["center"][1]) for field in ordered]
-        corner_x = min(active_x) if start_corner.endswith("left") else max(active_x)
-        corner_y = max(active_y) if start_corner.startswith("top") else min(active_y)
-        first_key = min(
-            all_keys,
-            key=lambda key: (
-                (float(by_key[key]["center"][0]) - corner_x) ** 2
-                + (float(by_key[key]["center"][1]) - corner_y) ** 2,
-                int(by_key[key]["row"]),
-                int(by_key[key]["column"]),
+        manual_first = requested_first_key({
+            str(field["field_key"]) for field in ordered
+        })
+        first_key = next(
+            (
+                key for key, field in by_key.items()
+                if str(field["field_key"]) == manual_first
             ),
+            None,
         )
+        if first_key is None:
+            corner_x = min(active_x) if start_corner.endswith("left") else max(active_x)
+            corner_y = max(active_y) if start_corner.startswith("top") else min(active_y)
+            first_key = min(
+                all_keys,
+                key=lambda key: (
+                    (float(by_key[key]["center"][0]) - corner_x) ** 2
+                    + (float(by_key[key]["center"][1]) - corner_y) ** 2,
+                    int(by_key[key]["row"]),
+                    int(by_key[key]["column"]),
+                ),
+            )
 
         # Split the occupied write fields into orthogonally connected islands.
         components: list[set[tuple[int, int]]] = []
@@ -441,8 +499,6 @@ def multipass_field_layout(params: dict[str, Any]) -> dict[str, Any]:
 
     # Apply explicit user-assigned order numbers as fixed slots, then fill
     # every remaining slot using the automatic adjacent/minimum-travel route.
-    raw_manual_order = params.get("manual_field_order", {})
-    manual_order = raw_manual_order if isinstance(raw_manual_order, dict) else {}
     if ordered and manual_order:
         count = len(ordered)
         active_by_key = {str(field["field_key"]): field for field in ordered}

@@ -1452,7 +1452,9 @@ def _quick_options(configuration: dict[str, Any], workflow: str) -> str:
         "# QUICK RF RUN OPTIONS — edit these before any other cell.\n"
         f"RUN_SIMULATION = {bool(configuration.get('run_after_build', True))!r}\n"
         f"HPC_PACK_DURATION_MINUTES = {int(configuration.get('hpc_pack_duration_minutes', 30))!r}\n"
+        f"HPC_PACK_COUNT = {int(configuration.get('hpc_pack_count', 3))!r}\n"
         "# Edit HPC_PACK_DURATION_MINUTES before the licence-acquisition cell.\n"
+        "# HPC_PACK_COUNT is overridden from 3 to 4 by the H100 launcher unless edited.\n"
         f"print('RF workflow: {workflow.upper()} | project extension: {extension}')\n"
         "print('Inspection and final project saving are always enabled.')\n\n"
         + _PIRIS_PATHS_CELL

@@ -331,6 +331,42 @@ class GratingExcitationTypeTests(unittest.TestCase):
             2,
         )
 
+    def test_duplicate_input_power_monitor_is_repaired_before_export(self) -> None:
+        factory, grating = _gaussian_setup("GC-SOI")
+        original = next(
+            item for item in factory.components
+            if item["kind"] == "Power monitor"
+            and item.get("simulation_parent_port") == "fiber_input_power"
+        )
+        duplicate = deepcopy(original)
+        duplicate["uid"] = max(item["uid"] for item in factory.components) + 1
+        duplicate["auto_placed"] = False
+        factory.components.append(duplicate)
+
+        self.assertTrue(factory.synchronize_automatic_simulation_companions(grating))
+        input_planes = [
+            item for item in factory.components
+            if item["kind"] == "Power monitor"
+            and item.get("simulation_parent_uid") == grating["uid"]
+            and item.get("simulation_parent_port") == "fiber_input_power"
+        ]
+        self.assertEqual([item["uid"] for item in input_planes], [original["uid"]])
+
+        # The exporter independently repairs a stale copy as a safety net.
+        stale_components = deepcopy(factory.components)
+        stale_duplicate = deepcopy(input_planes[0])
+        stale_duplicate["uid"] = max(item["uid"] for item in stale_components) + 1
+        stale_components.append(stale_duplicate)
+        notebook, warnings = generate_lumerical_notebook(
+            stale_components, _configuration("GC-SOI")
+        )
+        exported_input_planes = [
+            monitor for monitor in _assignment(notebook, "MONITORS")
+            if monitor.get("parent_port_name") == "fiber_input_power"
+        ]
+        self.assertEqual(len(exported_input_planes), 1)
+        self.assertTrue(any("duplicate automatic incident" in warning for warning in warnings))
+
     def test_single_notebook_exports_gaussian_source_without_fiber_mode_objects(self) -> None:
         for kind in ("Grating coupler", "GC-SOI"):
             with self.subTest(kind=kind):

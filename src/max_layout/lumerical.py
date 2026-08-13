@@ -39,7 +39,7 @@ MATERIAL_CHOICES = (
 )
 
 
-LUMERICAL_SWEEP_MAX_RUNS = 100
+LUMERICAL_SWEEP_MAX_RUNS = 300
 LUMERICAL_SWEEP_WARNING_RUNS = 25
 
 _SWEEP_PARAMETER_LABELS = {
@@ -581,6 +581,34 @@ def _collect_export_data(
                 f"UID {component.get('uid')}: legacy embedded simulation ports were ignored; "
                 "place ports explicitly from the Ports & monitors library."
             )
+
+    # Old editor builds could leave two parent-owned copies of the automatic
+    # incident-power plane after switching source families.  Their semantic
+    # role is a singleton, so retain one deterministic copy and do not build a
+    # second overlapping DFT monitor in the notebook.
+    duplicate_monitor_ids: set[int] = set()
+    for parent_uid in grating_excitation_by_uid:
+        matching = [
+            monitor for monitor in monitors
+            if int(monitor.get("parent_component_uid", -1)) == parent_uid
+            and str(monitor.get("monitor_kind", "")) == "Power monitor"
+            and str(monitor.get("parent_port_name", "")) == "fiber_input_power"
+        ]
+        if len(matching) <= 1:
+            continue
+        ordered = sorted(matching, key=lambda monitor: int(monitor.get("component_uid", 0)))
+        duplicate_monitor_ids.update(
+            int(monitor.get("component_uid", -1)) for monitor in ordered[1:]
+        )
+        warnings.append(
+            "Grating UID %s: removed %d duplicate automatic incident input-power monitor(s)."
+            % (parent_uid, len(ordered) - 1)
+        )
+    if duplicate_monitor_ids:
+        monitors = [
+            monitor for monitor in monitors
+            if int(monitor.get("component_uid", -1)) not in duplicate_monitor_ids
+        ]
 
     if geometry:
         all_points = np.vstack([np.asarray(item["vertices_um"], dtype=float) for item in geometry])
@@ -1200,7 +1228,9 @@ def _quick_run_options_cell(configuration: dict[str, Any], *, workflow: str) -> 
         f"SHOW_PORT_MODE_PREVIEW = {bool(configuration.get('show_port_mode_preview', True))!r}\n"
         f"RUN_GPU_SYSTEM_CHECK = {bool(configuration.get('run_gpu_system_check', False))!r}\n"
         f"HPC_PACK_DURATION_MINUTES = {int(configuration.get('hpc_pack_duration_minutes', 30))!r}\n"
+        f"HPC_PACK_COUNT = {int(configuration.get('hpc_pack_count', 3))!r}\n"
         "# HPC_PACK_DURATION_MINUTES controls the roaming checkout below; edit it before section 2.\n"
+        "# HPC_PACK_COUNT is the requested total. The H100 launcher overrides its default to 4.\n"
         "# One pre-solve inspection FSP and one solved/best FSP are always stored.\n"
         "# ==============================================================================\n"
         "print('Project-file saving is always enabled: inspection plus solved/best FSP.')\n\n"
@@ -1264,7 +1294,22 @@ sys.path.insert(0, os.path.expanduser("~/Desktop/lumerical"))
 from lambda_remote import Lambda, _SSH, HOST
 
 _remote_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", PIRIS_SESSION_DIR.name).strip("._") or "max_layout"
-REMOTE_WORK = "/lambda/nfs/piris-lumerical/projects/max_layout/" + _remote_slug
+_remote_root = os.environ.get("PIRIS_LUMERICAL_REMOTE_WORK_ROOT", "").strip()
+if not _remote_root:
+    _root_probe = subprocess.run(
+        _SSH + [HOST,
+            "if test -d /lambda/nfs/piris-lumerical -a -w /lambda/nfs/piris-lumerical; "
+            "then printf %s /lambda/nfs/piris-lumerical/projects/max_layout; "
+            "else printf %s /home/ubuntu/.piris-launch/work/max_layout; fi"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if _root_probe.returncode != 0 or not _root_probe.stdout.strip():
+        raise RuntimeError(
+            "Could not determine a writable Lumerical work directory: "
+            + (_root_probe.stdout + _root_probe.stderr)[-700:]
+        )
+    _remote_root = _root_probe.stdout.strip().splitlines()[-1]
+REMOTE_WORK = _remote_root.rstrip("/") + "/" + _remote_slug
 lam = Lambda(work=REMOTE_WORK)
 print("Remote work:", REMOTE_WORK)
 
@@ -1590,11 +1635,21 @@ def solve_remote_checked(
 
 
 _LICENSE_CHECKOUT_CELL = r'''import json
+import os
 import subprocess
 from lambda_remote import _SSH, HOST
 
 LIC = "/opt/lumerical/v261/licensingclient/linx64"
 HPC_PACK_NAME = "Ansys HPC Pack - Shared Web"
+try:
+    HPC_PACK_COUNT = int(HPC_PACK_COUNT)
+except (NameError, TypeError, ValueError):
+    raise ValueError("Set HPC_PACK_COUNT in cell 1 to a positive whole number") from None
+_launcher_pack_count = int(os.environ.get("PIRIS_HPC_PACK_COUNT", "0") or 0)
+if _launcher_pack_count > 0 and HPC_PACK_COUNT == 3:
+    HPC_PACK_COUNT = _launcher_pack_count
+if HPC_PACK_COUNT <= 0:
+    raise ValueError("HPC_PACK_COUNT must be greater than zero")
 try:
     HPC_PACK_DURATION_MINUTES = int(HPC_PACK_DURATION_MINUTES)
 except (NameError, TypeError, ValueError):
@@ -1651,11 +1706,11 @@ def _hpc_pack_count(usage, label):
 
 # 1. seed the Ansys web sign-in from the shared token (no-op if already seeded)
 r = subprocess.run(_SSH + [HOST,
-    'test -s ~/.ansys/ansysid/token.json && echo "sign-in already seeded" && exit 0; '
-    'test -s ~/remote-token.json || { echo "ERROR: ~/remote-token.json missing on the node"; exit 1; }; '
-    f'ANSYS_LICENSING_WEB=1 {LIC}/ansyscl -WebLoginInput ~/remote-token.json && '
-    f'{LIC}/LicensingSettings web shared enable --mode user >/dev/null 2>&1; '
-    'echo "sign-in seeded from ~/remote-token.json"'],
+    'if test -s ~/.ansys/ansysid/token.json; then echo "sign-in already seeded"; '
+    'else test -s ~/remote-token.json || { echo "ERROR: ~/remote-token.json missing on the node"; exit 1; }; '
+    f'ANSYS_LICENSING_WEB=1 {LIC}/ansyscl -WebLoginInput ~/remote-token.json || exit 1; '
+    'echo "sign-in seeded from ~/remote-token.json"; fi; '
+    f'{LIC}/LicensingSettings web shared enable --mode user >/dev/null 2>&1'],
     capture_output=True, text=True, timeout=180)
 print((r.stdout + r.stderr).strip())
 if r.returncode != 0:
@@ -1674,8 +1729,8 @@ if _before.returncode != 0:
     raise RuntimeError("Pre-check of roaming HPC Packs failed: " + _before_out[-700:])
 _existing_count = _hpc_pack_count(_ansys_in_use(_before_out, "HPC Pack pre-check"), "HPC Pack pre-check")
 
-# 3. Bring the local roaming total to three, using the editable expiry from cell 1.
-_needed_count = max(0, 3 - _existing_count)
+# 3. Bring the local roaming total to the requested count, using cell-1 settings.
+_needed_count = max(0, HPC_PACK_COUNT - _existing_count)
 if _needed_count:
     r = subprocess.run(_SSH + [HOST,
         f'{LIC}/LicensingSettings web shared products checkout '
@@ -1687,7 +1742,7 @@ if _needed_count:
         raise RuntimeError("HPC Pack checkout command failed: " + out[-700:])
     _ansys_json_object(out, "HPC Pack checkout")
 else:
-    print("HPC Packs: existing local roaming reservation already satisfies 3 packs")
+    print("HPC Packs: existing local roaming reservation already satisfies %d packs" % HPC_PACK_COUNT)
 
 _after = subprocess.run(
     _SSH + [HOST, _in_use_command], capture_output=True, text=True, timeout=180
@@ -1696,8 +1751,8 @@ _after_out = (_after.stdout + _after.stderr).strip()
 if _after.returncode != 0:
     raise RuntimeError("Post-check of roaming HPC Packs failed: " + _after_out[-700:])
 _verified_count = _hpc_pack_count(_ansys_in_use(_after_out, "HPC Pack post-check"), "HPC Pack post-check")
-if _verified_count < 3:
-    raise RuntimeError("HPC Pack checkout was not verified: %d of 3 packs are visible" % _verified_count)
+if _verified_count < HPC_PACK_COUNT:
+    raise RuntimeError("HPC Pack checkout was not verified: %d of %d packs are visible" % (_verified_count, HPC_PACK_COUNT))
 print("HPC Packs: %d roaming packs verified on this host (requested expiry %s)" % (_verified_count, HPC_PACK_EXPIRY))
 '''
 
@@ -9513,6 +9568,12 @@ def generate_lumerical_notebook(
         "antisymmetry_boundary": str(configuration.get("antisymmetry_boundary", "")).strip().lower(),
         "run_after_build": bool(configuration.get("run_after_build", False)),
         "run_gpu_system_check": bool(configuration.get("run_gpu_system_check", False)),
+        "show_geometry_preview": bool(configuration.get("show_geometry_preview", True)),
+        "show_port_mode_preview": bool(configuration.get("show_port_mode_preview", True)),
+        "hpc_pack_duration_minutes": max(
+            1, int(configuration.get("hpc_pack_duration_minutes", 30))
+        ),
+        "hpc_pack_count": max(1, int(configuration.get("hpc_pack_count", 3))),
         "save_inspection_fsp": True,
         "save_final_fsp": True,
         "project_file": project_file,
@@ -9801,7 +9862,7 @@ This notebook contains **{len(geometry)} embedded polygons**, **{len(ports)} sta
 **Included objects:** {exported_component_text}
 {empty_geometry_warning}
 
-The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect to Lambda, seed Ansys Shared Web, roam exactly three HPC Packs, build/run in that licensed session, save and fetch results, close FDTD, return the three packs, and finally close SSH. Lumerical is not required on the local Mac.
+The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect to Lambda, seed Ansys Shared Web, roam the configurable HPC Pack count, build/run in that licensed session, save and fetch results, close FDTD, return the roamed packs, and finally close SSH. Lumerical is not required on the local Mac.
 
 - Every exported simulation is a **3D FDTD simulation**. A saved 2D preference is ignored; GPU is the default compute resource and is selected explicitly at solve time.
 - First-cell switches render **XY, XZ, and YZ geometry projections** and selected-port **|Ex|/|Ey| fields**. They default on and remain editable; neither changes the simulated model. Required rotation-aware local-TE selection and effective-index checks still run during construction.
@@ -9832,7 +9893,7 @@ The notebook follows the same licence lifecycle as `TFLN_GC_1310.ipynb`: connect
             _notebook_cell("markdown", intro),
             _notebook_cell("markdown", "## 1 · Connect to Lambda\n"),
             _notebook_cell("code", _LAMBDA_CONNECT_CELL),
-            _notebook_cell("markdown", "## 2 · Acquire Ansys Shared Web licences\n\nSeed the headless sign-in and roam exactly three Shared Web HPC Packs for the number of minutes selected by `HPC_PACK_DURATION_MINUTES` in cell 1.\n"),
+            _notebook_cell("markdown", "## 2 · Acquire Ansys Shared Web licences\n\nSeed the headless sign-in and roam `HPC_PACK_COUNT` Shared Web HPC Packs for the number of minutes selected by `HPC_PACK_DURATION_MINUTES` in cell 1. The H100 launcher defaults this to four.\n"),
             _notebook_cell("code", _LICENSE_CHECKOUT_CELL),
             _notebook_cell("markdown", "## 3 · Embedded layout, stack, ports, and monitors\n"),
             _notebook_cell("code", payload_cell),
