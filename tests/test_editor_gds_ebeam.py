@@ -199,6 +199,13 @@ class PhotonicTestBlockEbeamTests(unittest.TestCase):
         self.assertIn("OUT_PORT[0] = 5, Extract%20Layers, 0", flow)
         self.assertIn("IN_PORT[0] = 5, Extract%20Layers, 0", flow[mapping_index:])
 
+    def test_beamer_ftext_follows_waveguide_geometry_for_subfields(self) -> None:
+        flow = NativeLayoutWindow.beamer_flow_template(None, "", 1.8, 1.8, 1.8)
+        self.assertIn("FEATURE_ORDERING_TYPE = FollowGeometry", flow)
+        self.assertNotIn("FEATURE_ORDERING_TYPE = NoCompaction", flow)
+        self.assertIn("MULTIPASS_LAYER = WG", flow)
+        self.assertNotIn("MULTIPASS_LAYER = *", flow)
+
     def test_new_block_has_no_automatic_write_fields(self) -> None:
         self.assertFalse(
             DEFAULT_COMPONENT_VALUES["Photonic test block"]["include_ebeam_fields"]

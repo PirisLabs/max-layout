@@ -25,6 +25,7 @@ from PySide6.QtGui import QAction, QCloseEvent, QImageReader, QKeySequence, QPai
 from PySide6.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGraphicsItem, QGraphicsScene, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSpinBox, QStatusBar, QTabWidget, QTableWidget, QTableWidgetItem, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
 from ..constants import CHOICE_PARAMETERS, COMPONENT_SPECS, DEFAULT_COMPONENT_VALUES, EBEAM_LAYER, GC_LAYER, LAYER_NAME_MAP, LEGACY_PHOTONIC_TEST_BLOCK_KINDS, MARKER_COMPONENT_KINDS, MARKER_LAYER, NATIVE_APP_VERSION, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, SIMULATION_COMPONENT_KINDS, SIMULATION_LAYER, component_display_name
+from ..beamer import beamer_cjob_template, beamer_frame_size_um, beamer_gpf_name
 from ..gds.build import _add_component_geometry_to_cell, _canonicalize_component_layers, component_geometry_arrays, library_bbox_and_center, recenter_components_at_origin, resolve_and_build, rotate_components_layout, test_block_device_placements
 from ..gds.ebeam import geometry_field_coverage, multipass_field_layout
 from ..geometry.shapes import mmi_total_length
@@ -1722,7 +1723,7 @@ class NativeLayoutWindow(QMainWindow):
             status_tip="Export a 3D GPU shape-adjoint notebook for a grating coupler or symmetric 1x2 MMI.",
         )
         action("export_field", "Export Field TXT", self.export_field_txt, None, None, file_menu)
-        action("export_ftext", "Export BEAMER FTEXT", self.export_beamer_ftext, None, file_toolbar, file_menu)
+        action("export_ftext", "Export BEAMER FTEXT + CJOB", self.export_beamer_ftext, None, file_toolbar, file_menu)
         action("import_field", "Import Field TXT", self.import_field_txt, None, None, file_menu)
         action("image_to_gds", "Import Image → GDS…", self.import_image_as_gds, None, file_toolbar, file_menu, status_tip="Vectorize a photograph or drawing into scalable GDS polygons.")
 
@@ -6825,7 +6826,7 @@ class NativeLayoutWindow(QMainWindow):
             return
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Export BEAMER FTEXT",
+            "Export BEAMER FTEXT + CJOB",
             str(Path.home() / "photonic_layout.ftxt"),
             "BEAMER FTEXT (*.ftxt);;Text (*.txt)",
         )
@@ -6854,8 +6855,29 @@ class NativeLayoutWindow(QMainWindow):
             gc_dose,
             marker_dose,
         )
-        Path(path).write_text(flow)
-        self.statusBar().showMessage(f"Exported BEAMER FTEXT with {len(records)} regions: {path}")
+        output_path = Path(path)
+        output_path.write_text(flow, encoding="utf-8")
+        frame_size_um = beamer_frame_size_um(
+            self.components,
+            records,
+            fallback=(
+                float(DEFAULT_COMPONENT_VALUES["Chip outline"]["width"]),
+                float(DEFAULT_COMPONENT_VALUES["Chip outline"]["height"]),
+            ),
+        )
+        cjob_path = output_path.with_suffix(".cjob")
+        cjob_path.write_text(
+            beamer_cjob_template(
+                beamer_gpf_name(flow),
+                frame_size_um,
+                exposure_name=output_path.stem,
+            ),
+            encoding="utf-8",
+        )
+        self.statusBar().showMessage(
+            f"Exported BEAMER FTEXT ({len(records)} regions) and CJOB: "
+            f"{output_path}, {cjob_path}"
+        )
 
     def beamer_flow_template(
         self,
@@ -7013,7 +7035,7 @@ COMPACTION_REGION_SIZE = 4.525000
 SUBFIELD_OVERLAP_X = 0.100000
 SUBFIELD_OVERLAP_Y = 0.100000
 REGION_TRAVERSAL_MODE = MeanderX
-FEATURE_ORDERING_TYPE = NoCompaction
+FEATURE_ORDERING_TYPE = FollowGeometry
 FEATURE_ORDERING_START_POSITION_TYPE = Automatic
 SORTED_ORDER_LAYER = *
 DOSE_ORDERING_TYPE = AscendingDose
@@ -7055,7 +7077,7 @@ MAINFIELD_OFFSET_ABSOLUTE = false
 SUBFIELD_OFFSET_X = 0.000000
 SUBFIELD_OFFSET_Y = 0.000000
 SUBFIELD_OFFSET_ABSOLUTE = false
-MULTIPASS_LAYER = *
+MULTIPASS_LAYER = WG
 ENDNODE
 
 NODE Mapping ()
