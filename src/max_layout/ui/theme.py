@@ -126,10 +126,21 @@ LAYER_COLORS = {
     4: QColor("#2563eb"),
     5: QColor("#55efc4"),
     6: QColor("#fef08a"),
+    8: QColor("#a78bfa"),
+    9: QColor("#fb7185"),
+    10: QColor("#4ade80"),
+    11: QColor("#a78bfa"),
+    12: QColor("#22d3ee"),
 }
 
 
 def color_for_layer(layer: int, alpha: int = 150) -> QColor:
-    color = QColor(LAYER_COLORS.get(int(layer), QColor("#b2bec3")))
+    layer_number = int(layer)
+    color = QColor(
+        LAYER_COLORS.get(
+            layer_number,
+            QColor.fromHsv((layer_number * 47 + 29) % 360, 175, 235),
+        )
+    )
     color.setAlpha(alpha)
     return color

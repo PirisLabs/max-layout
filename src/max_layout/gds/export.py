@@ -8,6 +8,7 @@ import json
 import pprint
 
 from .. import __version__
+from ..constants import LAYER_NAME_MAP, edge_coupler_layer_name_map, edge_coupler_total_count
 from ..gds.build import library_bbox_and_center, resolve_and_build
 from ..runtime import package_archive_b64
 
@@ -21,6 +22,9 @@ def generate_python_export(components: list[dict[str, Any]]) -> str:
     # file that meant embedding that file; now it means embedding a zipapp of
     # the whole package, which Python imports directly off sys.path.
     embedded_archive_b64 = package_archive_b64()
+    edge_coupler_count = edge_coupler_total_count(components)
+    exported_layer_name_map = dict(LAYER_NAME_MAP)
+    exported_layer_name_map.update(edge_coupler_layer_name_map(edge_coupler_count))
     return f'''from __future__ import annotations
 
 import base64
@@ -33,7 +37,7 @@ OUTPUT_GDS_FILE = Path(__file__).with_name("generated_layout.gds")
 CENTER_LAYOUT_AT_ORIGIN = False
 CURRENT_GEOMETRY_CENTER_UM = {center!r}
 CURRENT_BOUNDING_BOX_UM = {bbox!r}
-LAYER_NAME_MAP = {{1: "WG", 2: "GC", 3: "Marker", 4: "RF", 5: "Probe", 6: "Ebeam"}}
+LAYER_NAME_MAP = {exported_layer_name_map!r}
 COMPONENTS = {component_literal}
 
 EMBEDDED_EDITOR_PYZ_B64 = {embedded_archive_b64!r}

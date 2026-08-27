@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 import math
+from functools import lru_cache
 
 import numpy as np
 
@@ -221,22 +222,84 @@ def _signed_direction(value: Any, default: str = "up") -> float:
     return -1.0 if text in {"down", "lower", "negative", "-", "-1"} else 1.0
 
 
+def smoothstep_s_bend_minimum_radius(length: float, offset: float, samples: int = 4001) -> float:
+    """Minimum centerline radius of the fifth-order smoothstep S-bend."""
+    length = float(length)
+    displacement = abs(float(offset))
+    if length <= 0.0:
+        raise ValueError("S-bend length must be positive.")
+    if displacement <= 1e-15:
+        return math.inf
+    u = np.linspace(0.0, 1.0, max(101, int(samples)))
+    first = 30.0 * u**2 - 60.0 * u**3 + 30.0 * u**4
+    second = 60.0 * u - 180.0 * u**2 + 120.0 * u**3
+    curvature = np.abs(length * displacement * second) / (
+        length * length + (displacement * first) ** 2
+    ) ** 1.5
+    maximum = float(np.max(curvature))
+    return math.inf if maximum <= 0.0 else 1.0 / maximum
+
+
+@lru_cache(maxsize=256)
+def s_bend_length_for_minimum_radius(offset: float, radius: float) -> float:
+    """Longitudinal length giving the requested smoothstep minimum radius."""
+    displacement = abs(float(offset))
+    target = float(radius)
+    if target <= 0.0:
+        raise ValueError("S-bend radius must be positive.")
+    if displacement <= 1e-15:
+        return 0.0
+    low = max(1e-9, displacement * 0.01)
+    high = max(displacement, math.sqrt(6.0 * displacement * target))
+    while smoothstep_s_bend_minimum_radius(high, displacement, 10001) < target:
+        high *= 2.0
+    for _ in range(60):
+        middle = 0.5 * (low + high)
+        if smoothstep_s_bend_minimum_radius(middle, displacement, 10001) < target:
+            low = middle
+        else:
+            high = middle
+    return 0.5 * (low + high)
+
+
+def resolved_feedline_s_bend_length(p: dict[str, Any]) -> float:
+    radius = p.get("s_bend_radius")
+    if radius is None:
+        return float(p["s_bend_length"])
+    if abs(float(p["offset"])) <= 1e-15:
+        return float(p["s_bend_length"])
+    return s_bend_length_for_minimum_radius(float(p["offset"]), float(radius))
+
+
 def feedline_landmarks(p: dict[str, Any], mirrored: bool) -> dict[str, tuple[float, float]]:
     mirror_sign = -1.0 if mirrored else 1.0
     input_sign = mirror_sign * _signed_direction(p.get("input_s_bend_direction", "up"))
     output_sign = mirror_sign * _signed_direction(p.get("output_s_bend_direction", "down"), "down")
     x_input_straight_end = float(p["input_straight_length"])
-    x_first_s_bend_end = x_input_straight_end + float(p["s_bend_length"])
+    s_bend_length = resolved_feedline_s_bend_length(p)
+    x_first_s_bend_end = x_input_straight_end + s_bend_length
     y_first = input_sign * abs(float(p["offset"]))
-    x_lc_end = x_first_s_bend_end + float(p["Lc"])
-    x_second_s_bend_end = x_lc_end + float(p["s_bend_length"])
-    y_second = y_first + output_sign * abs(float(p["offset"]))
+    x_coupling_straight_start = x_first_s_bend_end + float(p.get("pre_coupling_straight_length", 0.0))
+    x_lc_end = x_coupling_straight_start + float(p["Lc"])
+    post_coupling = float(p.get("post_coupling_straight_length", 0.0))
+    if post_coupling < 0.0:
+        raise ValueError("Feedline post_coupling_straight_length cannot be negative.")
+    x_output_s_bend_start = x_lc_end + post_coupling
+    add_output_s_bend = bool(p.get("add_output_s_bend", True))
+    if add_output_s_bend:
+        x_second_s_bend_end = x_output_s_bend_start + s_bend_length
+        y_second = y_first + output_sign * abs(float(p["offset"]))
+    else:
+        x_second_s_bend_end = x_output_s_bend_start
+        y_second = y_first
     x_output = x_second_s_bend_end + float(p["output_straight_length"])
     return {
         "input": (0.0, 0.0),
         "input_straight_end": (x_input_straight_end, 0.0),
         "first_s_bend_end": (x_first_s_bend_end, y_first),
+        "coupling_straight_start": (x_coupling_straight_start, y_first),
         "lc_end": (x_lc_end, y_first),
+        "output_s_bend_start": (x_output_s_bend_start, y_first),
         "second_s_bend_end": (x_second_s_bend_end, y_second),
         "output": (x_output, y_second),
         "input_offset": (0.0, y_first),

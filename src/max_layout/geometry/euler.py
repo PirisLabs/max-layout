@@ -115,6 +115,30 @@ def mmi_gc_fanout_local_points(
     }
 
 
+def three_euler_inward_gc_alignment_target(
+    start_center: tuple[float, float],
+    start_orientation_deg: float,
+    p: dict[str, Any],
+) -> np.ndarray:
+    """Return the aligned GC target, including an opposing axial stagger.
+
+    Positive ``gc_horizontal_stagger`` moves each grating away from the MZI
+    center along its own outward-facing axis.  For the default horizontal MZI
+    this moves the upper/left grating left and the lower/right grating right.
+    """
+    total = (
+        2.0 * mmi_total_length(p)
+        + 2.0 * float(p.get("s_bend_length", 80.0))
+        + float(p.get("arm_length", 9718.0))
+    )
+    midpoint = np.asarray(start_center, dtype=float) + rot(
+        (total / 2.0, 0.0),
+        (float(start_orientation_deg) + 180.0) % 360.0,
+    )
+    stagger = float(p.get("gc_horizontal_stagger", 0.0))
+    return midpoint + rot((stagger, 0.0), float(start_orientation_deg))
+
+
 def three_euler_inward_gc_endpoint(start_center: tuple[float,float], start_orientation_deg: float, p: dict[str,Any], left_end: bool) -> tuple[tuple[float,float],float]:
     """Endpoint for an inward route whose mirrored last bend points away from the MZI."""
     side=1.0 if str(p.get("gc_vertical_side","up")).lower()=="up" else -1.0
@@ -128,7 +152,7 @@ def three_euler_inward_gc_endpoint(start_center: tuple[float,float], start_orien
             if fraction<0 or fraction>=.5:raise ValueError("GC inward-run fraction must be at least 0 and below 0.5.")
             run=float(p.get("gc_vertical_run",100.0) if bend_index==0 else (fraction*total if fraction>0 else p.get("gc_inward_run",300.0)))
             if bend_index==1 and bool(p.get("gc_align_gc_to_mzi_center",True)):
-                target=np.asarray(start_center,float)+rot((total/2,0),(float(start_orientation_deg)+180)%360);last_delta=rot(gc_euler_output_local(p,bend_angles[2]),heading);direction=rot((1,0),heading);run=float(np.dot(target-point-last_delta,direction))
+                target=three_euler_inward_gc_alignment_target(start_center,start_orientation_deg,p);last_delta=rot(gc_euler_output_local(p,bend_angles[2]),heading);direction=rot((1,0),heading);run=float(np.dot(target-point-last_delta,direction))
             if run<0:raise ValueError("Vertical-GC route straight lengths cannot be negative.")
             point+=rot((run,0.0),heading)
     return (float(point[0]),float(point[1])),heading

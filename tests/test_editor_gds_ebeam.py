@@ -188,14 +188,18 @@ class PhotonicTestBlockEbeamTests(unittest.TestCase):
         self.assertAlmostEqual(np.ptp([center[0] for center in y_centers]), 0.0)
         self.assertGreater(np.ptp([center[1] for center in y_centers]), 0.0)
 
-    def test_beamer_ftext_extracts_all_layers_before_mapping(self) -> None:
+    def test_beamer_ftext_extracts_only_shared_optical_and_marker_layers(self) -> None:
         flow = NativeLayoutWindow.beamer_flow_template(None, "", 1.8, 1.8, 1.8)
         import_index = flow.index("NODE Import ()")
         extract_index = flow.index("NODE Extract ()")
         mapping_index = flow.index("NODE Mapping ()")
         self.assertLess(import_index, extract_index)
         self.assertLess(extract_index, mapping_index)
-        self.assertIn("LAYERSET = *", flow[extract_index:mapping_index])
+        self.assertIn(
+            "LAYERSET = 1(0)%2C%207(0)%2C%2010(0)%2C%2011(0)",
+            flow[extract_index:mapping_index],
+        )
+        self.assertNotIn("LAYERSET = *", flow[extract_index:mapping_index])
         self.assertIn("OUT_PORT[0] = 5, Extract%20Layers, 0", flow)
         self.assertIn("IN_PORT[0] = 5, Extract%20Layers, 0", flow[mapping_index:])
 

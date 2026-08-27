@@ -24,10 +24,11 @@ from PySide6.QtCore import QPoint, QPointF, QProcess, QRectF, QSettings, QSize, 
 from PySide6.QtGui import QAction, QCloseEvent, QImageReader, QKeySequence, QPainterPath, QPixmap
 from PySide6.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGraphicsItem, QGraphicsScene, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSpinBox, QStatusBar, QTabWidget, QTableWidget, QTableWidgetItem, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
-from ..constants import CHOICE_PARAMETERS, COMPONENT_SPECS, DEFAULT_COMPONENT_VALUES, EBEAM_LAYER, GC_LAYER, LAYER_NAME_MAP, LEGACY_PHOTONIC_TEST_BLOCK_KINDS, MARKER_COMPONENT_KINDS, MARKER_LAYER, NATIVE_APP_VERSION, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, SIMULATION_COMPONENT_KINDS, SIMULATION_LAYER, component_display_name
-from ..beamer import beamer_cjob_template, beamer_frame_size_um, beamer_gpf_name
+from ..constants import CHOICE_PARAMETERS, COMPONENT_SPECS, DEFAULT_COMPONENT_VALUES, EBEAM_LAYER, EDGE_COUPLER_COMPONENT_KINDS, FEEDLINE_LAYER, GC_LAYER, GLOBAL_MARKER_LAYER, LAYER_NAME_MAP, LEGACY_PHOTONIC_TEST_BLOCK_KINDS, LOCAL_MARKER_LAYER, MARKER_COMPONENT_KINDS, MARKER_LAYER, MODULATOR_COMPONENT_KINDS, NATIVE_APP_VERSION, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, SIMULATION_COMPONENT_KINDS, SIMULATION_LAYER, VERTICAL_RACETRACK_FEEDLINE_KIND, WG_TIP_LAYER, component_display_name, edge_coupler_layer_name_map, edge_coupler_local_marker_layer, edge_coupler_slab_layer, edge_coupler_total_count
+from ..beamer import beamer_alignment_marks, beamer_cjob_template, beamer_edge_coupler_patterns, beamer_frame_size_um, beamer_gpf_name
 from ..gds.build import _add_component_geometry_to_cell, _canonicalize_component_layers, component_geometry_arrays, library_bbox_and_center, recenter_components_at_origin, resolve_and_build, rotate_components_layout, test_block_device_placements
 from ..gds.ebeam import geometry_field_coverage, multipass_field_layout
+from ..geometry.edge_coupler import assign_edge_coupler_layers, edge_coupler_front_parameters, migrate_edge_coupler_parameters
 from ..geometry.shapes import mmi_total_length
 from ..geometry.rf_taper import synchronize_rf_taper_points
 from ..geometry.transforms import scene_to_world_point, transform_points, transformed_local_points, world_to_scene_point
@@ -45,7 +46,7 @@ from ..lumerical_rf import build_lumerical_rf_preview_state, write_lumerical_rf_
 from ..params import resize_component_parameters
 from ..ports import PORT_ALIASES, component_global_ports, component_local_ports, solve_attachment
 from ..rf_defaults import RF_SIMULATABLE_COMPONENT_KINDS, RF_STACK_PRESETS, default_rf_configuration, normalize_rf_configuration
-from ..ui.dialogs import ArrayDialog, EbeamDialog, ModuleVariablesDialog
+from ..ui.dialogs import ArrayDialog, ArrayEditDialog, EbeamDialog, ModuleVariablesDialog
 from ..ui.items import ComponentGraphicsItem, EbeamContainerItem, LayoutView, WriteFieldItem, clear_preview_caches
 from ..ui.lumerical_dialog import (
     LumericalExportDialog,
@@ -160,6 +161,12 @@ def automatic_waveguide_port_span_um(
             params.get("width_start", 1.2)
             if str(port_name) == "left"
             else params.get("width_end", params.get("width_start", 1.2))
+        )
+    elif kind in EDGE_COUPLER_COMPONENT_KINDS:
+        width_um = float(
+            params.get("top_tip_width", 0.2)
+            if str(port_name) == "tip"
+            else params.get("top_end_width", 1.2)
         )
     elif kind in {"Grating coupler", "1x2 MMI", "Cascaded MMI", "MMI + Reference"}:
         width_um = float(params.get("wg_width", params.get("width", 1.2)))
@@ -1339,9 +1346,11 @@ class NativeLayoutWindow(QMainWindow):
         self.library_tree.clear()
         photonic_groups: dict[str, list[str]] = {
             "Waveguides & bends": [],
+            "Edge couplers": [],
             "Grating couplers": [],
             "MMI": [],
             "MZI": [],
+            "Modulators": [],
             "Resonators": [],
             "Photonic crystals": [],
             "Photonic test blocks": [],
@@ -1377,7 +1386,7 @@ class NativeLayoutWindow(QMainWindow):
                 if kind == "RF test block":group="RF test blocks"
                 elif "open" in lower or "short" in lower:group="Calibration structures"
                 elif kind == "Segmented electrode":group="CPW transmission lines"
-                elif "electrode" in lower or "mzi" in lower:group="Electrodes & modulators"
+                elif "electrode" in lower or "mzi" in lower or "modulator" in lower:group="Electrodes & modulators"
                 elif "taper" in lower:group="RF tapers"
                 elif "bend" in lower:group="RF bends"
                 elif "cpw" in lower:group="CPW transmission lines"
@@ -1391,12 +1400,14 @@ class NativeLayoutWindow(QMainWindow):
                 categories["Chip / utility"].append(kind)
             else:
                 lower=kind.lower()
-                if "test block" in lower:group="Photonic test blocks"
+                if kind in MODULATOR_COMPONENT_KINDS:group="Modulators"
+                elif "test block" in lower:group="Photonic test blocks"
                 elif "photonic crystal" in lower:group="Photonic crystals"
                 elif "mzi" in lower:group="MZI"
                 elif "mmi" in lower:group="MMI"
                 elif any(token in lower for token in ("ring", "racetrack", "resonator", "loopback")):group="Resonators"
-                elif kind == "GC-SOI" or "grating" in lower or "edge coupler" in lower:group="Grating couplers"
+                elif kind in EDGE_COUPLER_COMPONENT_KINDS:group="Edge couplers"
+                elif kind == "GC-SOI" or "grating" in lower:group="Grating couplers"
                 elif any(token in lower for token in ("straight", "taper", "bend", "feedline", "waveguide")):group="Waveguides & bends"
                 else:group="Other photonic"
                 photonic_groups[group].append(kind)
@@ -1462,10 +1473,13 @@ class NativeLayoutWindow(QMainWindow):
         self.update_ebeam_button.setVisible(False)
         self.module_variables_button = QPushButton("Module variables…")
         self.module_variables_button.setVisible(False)
+        self.edit_array_button = QPushButton("Edit entire array…")
+        self.edit_array_button.setVisible(False)
         button_row.addWidget(self.apply_properties_button)
         button_row.addWidget(self.update_ebeam_button)
         button_row.addWidget(self.module_variables_button)
         outer_layout.addLayout(button_row)
+        outer_layout.addWidget(self.edit_array_button)
         dock.setWidget(outer)
         dock.setMinimumWidth(315)
         self.properties_dock = dock
@@ -1473,6 +1487,7 @@ class NativeLayoutWindow(QMainWindow):
         self.apply_properties_button.clicked.connect(self.apply_properties)
         self.update_ebeam_button.clicked.connect(self.update_selected_ebeam)
         self.module_variables_button.clicked.connect(self.open_module_variables)
+        self.edit_array_button.clicked.connect(self.open_selected_array_editor)
         self.show_no_selection_properties()
 
     def create_project_dock(self) -> None:
@@ -1500,21 +1515,9 @@ class NativeLayoutWindow(QMainWindow):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(10, 10, 10, 10)
         self.layer_checkboxes: dict[int, QCheckBox] = {}
-        for layer, name in sorted(LAYER_NAME_MAP.items()):
-            row = QHBoxLayout()
-            swatch = QLabel()
-            swatch.setFixedSize(16, 16)
-            color = color_for_layer(layer, 255)
-            swatch.setStyleSheet(
-                f"background:{color.name()}; border-radius:4px; border:1px solid rgba(255,255,255,0.35);"
-            )
-            checkbox = QCheckBox(f"{layer}  {name}")
-            checkbox.setChecked(True)
-            checkbox.toggled.connect(partial(self.set_layer_visible, layer))
-            self.layer_checkboxes[layer] = checkbox
-            row.addWidget(swatch)
-            row.addWidget(checkbox, 1)
-            layout.addLayout(row)
+        self.layer_rows_layout = QVBoxLayout()
+        layout.addLayout(self.layer_rows_layout)
+        self.refresh_layer_checkboxes()
         layout.addSpacing(6)
         show_all = QPushButton("Show all layers")
         show_all.clicked.connect(self.show_all_layers)
@@ -1526,6 +1529,45 @@ class NativeLayoutWindow(QMainWindow):
         dock.setMinimumWidth(315)
         self.layers_dock = dock
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+
+    def active_layer_name_map(self) -> dict[int, str]:
+        layer_names = dict(LAYER_NAME_MAP)
+        edge_count = edge_coupler_total_count(self.components)
+        layer_names.update(edge_coupler_layer_name_map(edge_count))
+        return layer_names
+
+    def refresh_layer_checkboxes(self) -> None:
+        if not hasattr(self, "layer_rows_layout"):
+            return
+        while self.layer_rows_layout.count():
+            item = self.layer_rows_layout.takeAt(0)
+            row_layout = item.layout()
+            if row_layout is not None:
+                while row_layout.count():
+                    child = row_layout.takeAt(0)
+                    widget = child.widget()
+                    if widget is not None:
+                        widget.deleteLater()
+                row_layout.deleteLater()
+            elif item.widget() is not None:
+                item.widget().deleteLater()
+        self.layer_checkboxes = {}
+        for layer, name in sorted(self.active_layer_name_map().items()):
+            row = QHBoxLayout()
+            swatch = QLabel()
+            swatch.setFixedSize(16, 16)
+            color = color_for_layer(layer, 255)
+            swatch.setStyleSheet(
+                f"background:{color.name()}; border-radius:4px; border:1px solid rgba(255,255,255,0.35);"
+            )
+            checkbox = QCheckBox(f"{layer}  {name}")
+            self.layer_visibility.setdefault(layer, True)
+            checkbox.setChecked(self.layer_visibility.get(layer, True))
+            checkbox.toggled.connect(partial(self.set_layer_visible, layer))
+            self.layer_checkboxes[layer] = checkbox
+            row.addWidget(swatch)
+            row.addWidget(checkbox, 1)
+            self.layer_rows_layout.addLayout(row)
 
     def create_llm_dock(self) -> None:
         dock = QDockWidget("ChatGPT / LLM", self)
@@ -2028,6 +2070,7 @@ class NativeLayoutWindow(QMainWindow):
         self.statusBar().showMessage("New blank project created. Add a chip outline manually from Chip / utility if needed.")
 
     def project_payload(self) -> dict[str, Any]:
+        assign_edge_coupler_layers(self.components)
         return {
             "format": "photonic-layout-native",
             "version": 1,
@@ -2036,7 +2079,7 @@ class NativeLayoutWindow(QMainWindow):
             "next_group_id": self.next_group_id,
             "next_array_id": self.next_array_id,
             "next_module_instance_id": self.next_module_instance_id,
-            "layer_map": LAYER_NAME_MAP,
+            "layer_map": NativeLayoutWindow.active_layer_name_map(self),
         }
 
     def save_project(self) -> None:
@@ -2074,6 +2117,7 @@ class NativeLayoutWindow(QMainWindow):
                 raise ValueError("The selected file does not contain a component list.")
             for component in components:
                 synchronize_rf_taper_points(component)
+                migrate_edge_coupler_parameters(component)
                 if component.get("kind") == "Fiber geometry" and bool(component.get("auto_placed", False)):
                     component.setdefault("params", {})["z reference"] = "top of SiO2 cladding"
                 if component.get("kind") == "GC-SOI":
@@ -2123,6 +2167,7 @@ class NativeLayoutWindow(QMainWindow):
         self.components = json.loads(json.dumps(self.components))
         for component in self.components:
             synchronize_rf_taper_points(component)
+            migrate_edge_coupler_parameters(component)
         clear_preview_caches()
         self.rebuild_scene(select_uids=selected)
         self.view.viewport().update()
@@ -2188,6 +2233,8 @@ class NativeLayoutWindow(QMainWindow):
             "params": params,
             "attachment": None,
         }
+        if kind in EDGE_COUPLER_COMPONENT_KINDS:
+            assign_edge_coupler_layers([*self.components, component])
         synchronize_rf_taper_points(component)
         self.next_uid += 1
         return component
@@ -2215,6 +2262,8 @@ class NativeLayoutWindow(QMainWindow):
             "1x2 MMI": ["left_external", "upper_right", "lower_right"],
             "Cascaded MMI": ["input", "output"],
             "MMI + Reference": ["left_external", "upper_right", "lower_right", "reference_left_external", "reference_right"],
+            "MZI + CPW modulator": ["optical_left", "optical_right"],
+            "MZI + segmented-electrode modulator": ["optical_left", "optical_right"],
             "Grating coupler": ["waveguide_point"],
             "GC-SOI": ["waveguide_point"],
         }.get(kind)
@@ -3310,16 +3359,18 @@ class NativeLayoutWindow(QMainWindow):
             "MMI + Reference":["mmi_length","mmi_width","taper_width","wg_width","reference_dy","reference_branch"],
             "MMI split-combine cascade":["cascade_count","mmi_length","mmi_width","taper_width","wg_width","interconnect_length"],
             "MZI":["mmi_length","mmi_width","taper_width","wg_width","arm_separation","s_bend_length","arm_length"],
-            "MZI vertical GC":["mmi_length","mmi_width","taper_width","wg_width","arm_separation","arm_length","gc_vertical_run"],
+            "MZI vertical GC":["mmi_length","mmi_width","taper_width","wg_width","arm_separation","arm_length","gc_horizontal_stagger","gc_vertical_run"],
             "Ring":["radius","width"],
             "Elliptical ring":["radius_x","radius_y","width"],
             "Racetrack":["radius","coupling_length","width"],
             "Ring + two feedlines":["ring_radius","ring_width","coupling_gap","feedline_width","feedline_length","grating_coupler_separation"],
-            "Edge coupler":["tip_width","wg_width","taper_length","wg_straight_length"],
+            "Exponential edge coupler":["top_taper_length","top_start_offset","narrow_slab_straight_length","wide_slab_straight_length","slab_start_width","slab_end_width","top_tip_width","top_end_width","slab_exponential_factor","local_alignment_mark_size","local_alignment_mark_vertical_offset"],
+            "Linear edge coupler":["top_taper_length","top_start_offset","narrow_slab_straight_length","wide_slab_straight_length","slab_start_width","slab_end_width","top_tip_width","top_end_width","local_alignment_mark_size","local_alignment_mark_vertical_offset"],
             "Loopback mirror":["Lc","gap","s_bend_length","arc_radius","width"],
             "Feedline":["wg_width","Lc","offset","s_bend_length","pitch","fill_factor"],
             "Ring + feedline":["ring_radius","ring_width","coupling_gap","resonator_count","resonator_spacing","wg_width","Lc"],
             "Racetrack + feedline":["racetrack_length","racetrack_radius","racetrack_width","Lc","coupling_gap","resonator_count","resonator_spacing","wg_width"],
+            VERTICAL_RACETRACK_FEEDLINE_KIND:["racetrack_length","R_eff","coupling_gap","feedline_length","offset","s_bend_length","pitch","fill_factor"],
             "Photonic crystal":["pitch_x","pitch_y","hole_radius_x","hole_radius_y","columns","rows","defect_rows","lattice","hole_shape"],
         }.get(source_kind,keys[:6])
         common=[key for key in common if key in keys]
@@ -3399,6 +3450,8 @@ class NativeLayoutWindow(QMainWindow):
         if name in LEGACY_PHOTONIC_TEST_BLOCK_KINDS and not self.configure_test_block_sweeps(component):
             self.next_uid=max(1,self.next_uid-1);return
         self.components.append(component)
+        if name in EDGE_COUPLER_COMPONENT_KINDS:
+            self.refresh_layer_checkboxes()
         companions = self.automatic_simulation_companions(component)
         if companions:
             group_id = f"G{self.next_group_id}"
@@ -3480,6 +3533,8 @@ class NativeLayoutWindow(QMainWindow):
         )
         if select_uids is not None:
             selected = [int(uid) for uid in select_uids]
+        assign_edge_coupler_layers(self.components)
+        NativeLayoutWindow.refresh_layer_checkboxes(self)
         self.scene.clear()
         self.items_by_uid.clear()
         for component in self.components:
@@ -3585,6 +3640,7 @@ class NativeLayoutWindow(QMainWindow):
         self.parameter_widgets.clear()
         self.update_ebeam_button.setVisible(False)
         self.module_variables_button.setVisible(False)
+        self.edit_array_button.setVisible(False)
 
     def show_no_selection_properties(self) -> None:
         self.clear_properties()
@@ -3659,8 +3715,56 @@ class NativeLayoutWindow(QMainWindow):
         if component is None:
             self.show_no_selection_properties()
             return
+        is_modulator = component.get("kind") in MODULATOR_COMPONENT_KINDS
+        is_edge_coupler = component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS
+        is_vertical_racetrack_feedline = (
+            component.get("kind") == VERTICAL_RACETRACK_FEEDLINE_KIND
+        )
+        if is_edge_coupler:
+            migrate_edge_coupler_parameters(component)
         title = QLabel(f"<b>{component.get('kind')}</b> · UID {component.get('uid')}")
         self.properties_form.addRow(title)
+        if is_modulator:
+            params = component.get("params", {})
+            arm_separation = float(params.get("signal_width", 130.0)) + float(
+                params.get("initial_gap", 5.0)
+            )
+            coupling = QLabel(
+                f"Derived MZI arm separation: <b>{arm_separation:g} µm</b><br>"
+                "Initial gap also controls the center electrode, both bends, "
+                "and both taper starts.<br>"
+                f"Each bend overlaps the horizontal electrode by "
+                f"<b>{float(params.get('electrode_bend_overlap', 2.0)):g} µm</b>.<br>"
+                f"Edge couplers: <b>{'enabled' if bool(params.get('add_edge_coupler_tapers', False)) else 'disabled'}</b>."
+            )
+            coupling.setWordWrap(True)
+            self.properties_form.addRow(coupling)
+        if is_vertical_racetrack_feedline:
+            symmetry = QLabel(
+                "The feedline is rebuilt symmetrically around the racetrack coupling point. "
+                "Its two S-bends each use half of the entered total S-bend length and "
+                "half of the entered total lateral offset. The two grating couplers land "
+                "on opposite lateral sides of the coupling line."
+            )
+            symmetry.setWordWrap(True)
+            self.properties_form.addRow(symmetry)
+        if component.get("array_group_id"):
+            array_spec = self.array_spec_for_member(component)
+            array_summary = QLabel(
+                f"<b>Array {component.get('array_group_id')}</b> · "
+                f"{int(array_spec['nx'])} columns × {int(array_spec['ny'])} rows<br>"
+                f"Column sweep: {array_spec.get('x_parameter') or 'none'} · "
+                f"Row sweep: {array_spec.get('y_parameter') or 'none'}"
+            )
+            array_summary.setWordWrap(True)
+            array_summary.setToolTip(
+                "Use Edit entire array to change dimensions, spacing, sweeps, or the "
+                "shared base parameters for every component template. The normal Apply "
+                "button below changes only this selected cell."
+            )
+            self.properties_form.addRow(array_summary)
+            self.edit_array_button.setVisible(True)
+            self.edit_array_button.setEnabled(True)
         if component.get("kind") in {"Grating coupler", "GC-SOI"}:
             migrate_grating_fiber_offset_parameter(component)
             grating_params = component.setdefault("params", {})
@@ -3706,19 +3810,28 @@ class NativeLayoutWindow(QMainWindow):
             # Older saved layouts predate the editable waveguide-side offset.
             component.setdefault("params", {})
             component["params"].setdefault("fdtd_port_offset_from_waveguide_end_um", 2.0)
-        for key, value in (
-            ("x", component.get("x", 0.0)),
-            ("y", component.get("y", 0.0)),
-            ("orientation_deg", component.get("orientation_deg", 0.0)),
-        ):
-            spec = ["float", value]
-            widget = self.make_parameter_widget(key, spec, value)
-            self.properties_form.addRow(key, widget)
-            self.parameter_widgets[key] = (widget, "float")
-        mirrored = QCheckBox()
-        mirrored.setChecked(bool(component.get("mirrored", False)))
-        self.properties_form.addRow("mirrored", mirrored)
-        self.parameter_widgets["mirrored"] = (mirrored, "bool")
+        def add_transform_controls() -> None:
+            for key, value in (
+                ("x", component.get("x", 0.0)),
+                ("y", component.get("y", 0.0)),
+                ("orientation_deg", component.get("orientation_deg", 0.0)),
+            ):
+                spec = ["float", value]
+                widget = self.make_parameter_widget(key, spec, value)
+                self.properties_form.addRow(key, widget)
+                self.parameter_widgets[key] = (widget, "float")
+            mirrored = QCheckBox()
+            mirrored.setChecked(bool(component.get("mirrored", False)))
+            self.properties_form.addRow("mirrored", mirrored)
+            self.parameter_widgets["mirrored"] = (mirrored, "bool")
+
+        # Modulators and composite edge couplers lead with their main design
+        # controls. Position and expert parameters remain visible below them.
+        front_loaded_parameters = (
+            is_modulator or is_edge_coupler or is_vertical_racetrack_feedline
+        )
+        if not front_loaded_parameters:
+            add_transform_controls()
 
         if component.get("kind") == "E-beam multipass":
             self.update_ebeam_button.setVisible(True)
@@ -3730,7 +3843,69 @@ class NativeLayoutWindow(QMainWindow):
             self.properties_form.addRow(field_info)
 
         specs = COMPONENT_SPECS.get(component.get("kind"), {})
-        for key, value in component.get("params", {}).items():
+        parameter_items = list(component.get("params", {}).items())
+        major_modulator_keys = (
+            "initial_gap",
+            "final_gap",
+            "signal_width",
+            "taper_length",
+            "profile",
+            "mzi_length",
+            "electrode_bend_overlap",
+            "add_edge_coupler_tapers",
+            "add_grating_couplers",
+            "edge_coupler_profile",
+            "edge_coupler_tip_width",
+            "left_edge_coupler_taper_length",
+            "right_edge_coupler_taper_length",
+            "edge_coupler_top_start_offset",
+            "edge_coupler_narrow_slab_straight_length",
+            "edge_coupler_wide_slab_straight_length",
+            "edge_coupler_slab_start_width",
+            "edge_coupler_slab_end_width",
+            "edge_coupler_exponential_factor",
+            "edge_coupler_local_marker_size",
+            "edge_coupler_local_marker_vertical_offset",
+        )
+        front_parameter_keys = (
+            major_modulator_keys
+            if is_modulator
+            else edge_coupler_front_parameters(str(component.get("kind", "")))
+            if is_edge_coupler
+            else (
+                "racetrack_length",
+                "R_eff",
+                "racetrack_width",
+                "coupling_gap",
+                "coupling_side",
+                "feedline_length",
+                "wg_width",
+                "input_straight_length",
+                "s_bend_length",
+                "offset",
+                "Lc",
+                "pitch",
+                "fill_factor",
+                "add_grating_couplers",
+            )
+            if is_vertical_racetrack_feedline
+            else ()
+        )
+        front_parameter_count = 0
+        if front_loaded_parameters:
+            parameters = component.get("params", {})
+            front_parameter_count = sum(key in parameters for key in front_parameter_keys)
+            major_key_set = set(front_parameter_keys)
+            parameter_items = [
+                (key, parameters[key]) for key in front_parameter_keys if key in parameters
+            ] + [
+                (key, value) for key, value in parameter_items if key not in major_key_set
+            ]
+        transform_controls_added = not front_loaded_parameters
+        for parameter_index, (key, value) in enumerate(parameter_items):
+            if front_loaded_parameters and parameter_index == front_parameter_count:
+                add_transform_controls()
+                transform_controls_added = True
             if component.get("kind") in {"RF test block","Photonic test block"} and key=="columns":
                 continue
             if component.get("kind")=="Photonic test block" and key=="edge_spacing" and all(spacing_key in component.get("params",{}) for spacing_key in ("device_x_spacing","device_y_spacing")):
@@ -3783,7 +3958,70 @@ class NativeLayoutWindow(QMainWindow):
                     "linspace(start, stop). The component supplies the tooth count automatically."
                 )
             parameter_label = (
-                "Grating excitation" if key == "excitation_type"
+                "Racetrack round-trip length (µm)" if is_vertical_racetrack_feedline and key == "racetrack_length"
+                else "Euler bend R_eff (µm)" if is_vertical_racetrack_feedline and key == "R_eff"
+                else "Point-coupling gap (µm)" if is_vertical_racetrack_feedline and key == "coupling_gap"
+                else "Vertical feedline side" if is_vertical_racetrack_feedline and key == "coupling_side"
+                else "Symmetric feedline length (µm)" if is_vertical_racetrack_feedline and key == "feedline_length"
+                else "Total S-bend length — split between two ends (µm)" if is_vertical_racetrack_feedline and key == "s_bend_length"
+                else "Total lateral offset — split between two ends (µm)" if is_vertical_racetrack_feedline and key == "offset"
+                else "Centered coupling-section length (µm)" if is_vertical_racetrack_feedline and key == "Lc"
+                else "Opposing upper/lower GC horizontal stagger (µm)" if component.get("kind") == "MZI vertical GC" and key == "gc_horizontal_stagger"
+                else "Interaction / bend / taper-start gap (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "initial_gap"
+                else "External taper-end gap (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "final_gap"
+                else "RF signal width (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "signal_width"
+                else "Symmetric taper length (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "taper_length"
+                else "Symmetric taper form" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "profile"
+                else "MZI straight-arm length (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "mzi_length"
+                else "Horizontal CPW-to-bend overlap (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "electrode_bend_overlap"
+                else "Edge coupler (two optical ends)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "add_edge_coupler_tapers"
+                else "Grating coupler (two optical ends)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "add_grating_couplers"
+                else "Edge-coupler taper profile" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "edge_coupler_profile"
+                else "Edge-coupler facet width (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "edge_coupler_tip_width"
+                else "Left edge-coupler taper length (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "left_edge_coupler_taper_length"
+                else "Right edge-coupler taper length (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "right_edge_coupler_taper_length"
+                else "Edge-coupler top-WG start offset (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "edge_coupler_top_start_offset"
+                else "Edge-coupler narrow-side SLAB straight (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "edge_coupler_narrow_slab_straight_length"
+                else "Edge-coupler wide-side SLAB straight (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "edge_coupler_wide_slab_straight_length"
+                else "Edge-coupler SLAB start width (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "edge_coupler_slab_start_width"
+                else "Edge-coupler SLAB end width (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "edge_coupler_slab_end_width"
+                else "Edge-coupler exponential factor" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "edge_coupler_exponential_factor"
+                else "Edge-coupler LOCAL square size (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "edge_coupler_local_marker_size"
+                else "Edge-coupler LOCAL marker offset (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "edge_coupler_local_marker_vertical_offset"
+                else "Feed length (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "Feed_length"
+                else "Top WG taper length (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "top_taper_length"
+                else "Top WG start offset from SLAB taper start (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "top_start_offset"
+                else "Narrow-side SLAB straight length (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "narrow_slab_straight_length"
+                else "Wide-side SLAB straight length (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "wide_slab_straight_length"
+                else "SLAB start width (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "slab_start_width"
+                else "SLAB end width (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "slab_end_width"
+                else "Top WG tip width (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "top_tip_width"
+                else "Top WG end width (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "top_end_width"
+                else "SLAB exponential factor" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "slab_exponential_factor"
+                else "LOCAL square size (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "local_alignment_mark_size"
+                else "LOCAL marker offset above/below WG (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "local_alignment_mark_vertical_offset"
+                else "SLAB curve points" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "points"
+                else "Top taper layer (Wg_tip)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "layer"
+                else "Top taper datatype" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "datatype"
+                else "Numbered SLAB layer (automatic)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "slab_layer"
+                else "Bottom taper datatype" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "slab_datatype"
+                else "Numbered LOCAL marker ID (automatic)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "local_alignment_mark_name"
+                else "Shared LOCAL marker layer (L-markers)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "local_alignment_mark_layer"
+                else "LOCAL marker datatype" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "local_alignment_mark_datatype"
+                else "Ebeam global marker size (µm)" if component.get("kind") == "Chip outline" and key == "ebeam_global_marker_size"
+                else "Ebeam global marker gap inside frame (µm)" if component.get("kind") == "Chip outline" and key == "ebeam_global_marker_edge_clearance"
+                else "Ebeam global markers per chip side" if component.get("kind") == "Chip outline" and key == "ebeam_global_marker_count"
+                else "Ebeam global marker spacing (µm)" if component.get("kind") == "Chip outline" and key == "ebeam_global_marker_spacing"
+                else "Ebeam global marker name" if component.get("kind") == "Chip outline" and key == "ebeam_global_marker_name"
+                else "Ebeam global marker layer (G-markers)" if component.get("kind") == "Chip outline" and key == "ebeam_global_marker_layer"
+                else "Ebeam global marker datatype" if component.get("kind") == "Chip outline" and key == "ebeam_global_marker_datatype"
+                else "Dicing marker on G-markers layer" if component.get("kind") == "Square mark" and key == "dicing_marker"
+                else "Initial slab width (µm)" if component.get("kind") == "SLAB taper" and key == "initial_width"
+                else "Final slab width (µm)" if component.get("kind") == "SLAB taper" and key == "final_width"
+                else "SLAB taper length (µm)" if component.get("kind") == "SLAB taper" and key == "length"
+                else "SLAB exponential factor" if component.get("kind") == "SLAB taper" and key == "exponential_factor"
+                else "Center CPW electrode length (µm)" if component.get("kind") == "MZI + CPW modulator" and key == "electrode_length"
+                else "Grating excitation" if key == "excitation_type"
                 else "Fiber offset (µm)" if key == "fiber_offset"
                 else "Angle theta (degrees)" if key == "angle_theta"
                 else "Gaussian waist radius (µm)" if key == "gaussian_waist_radius_um"
@@ -3807,10 +4045,39 @@ class NativeLayoutWindow(QMainWindow):
                 else "Grating straight waveguide length (µm)" if key == "wg_length" and component.get("kind") in {"Grating coupler", "GC-SOI"}
                 else "GC straight lead length (µm)" if key == "gc_wg_length"
                 else "CPW taper model" if key == "cpw_profile"
+                else "Mark size (µm)" if component.get("kind") == "Four-corner cross + squares marks" and key == "size"
+                else "Center-to-center X spacing (µm)" if component.get("kind") == "Four-corner cross + squares marks" and key == "x_spacing"
+                else "Center-to-center Y spacing (µm)" if component.get("kind") == "Four-corner cross + squares marks" and key == "y_spacing"
+                else "Cross bar width" if component.get("kind") == "Four-corner cross + squares marks" and key == "bar_width"
+                else "Corner square size" if component.get("kind") == "Four-corner cross + squares marks" and key == "square_size"
+                else "Cross-to-square gap" if component.get("kind") == "Four-corner cross + squares marks" and key == "square_gap"
                 else key
             )
             self.properties_form.addRow(parameter_label, widget)
             self.parameter_widgets[f"params.{key}"] = (widget, spec[0])
+
+        if not transform_controls_added:
+            add_transform_controls()
+
+        if is_modulator:
+            edge_entry = self.parameter_widgets.get("params.add_edge_coupler_tapers")
+            grating_entry = self.parameter_widgets.get("params.add_grating_couplers")
+            if edge_entry is not None and grating_entry is not None:
+                edge_checkbox = edge_entry[0]
+                grating_checkbox = grating_entry[0]
+                if isinstance(edge_checkbox, QCheckBox) and isinstance(grating_checkbox, QCheckBox):
+                    edge_checkbox.setToolTip(
+                        "Attach one complete edge coupler to each optical end of the modulator."
+                    )
+                    grating_checkbox.setToolTip(
+                        "Attach one grating coupler to each optical end of the modulator."
+                    )
+                    edge_checkbox.toggled.connect(
+                        lambda checked: grating_checkbox.setChecked(False) if checked else None
+                    )
+                    grating_checkbox.toggled.connect(
+                        lambda checked: edge_checkbox.setChecked(False) if checked else None
+                    )
 
         active = self.active_field
         if component.get("kind") == "E-beam multipass" and active and int(active[0]) == int(component["uid"]):
@@ -3898,6 +4165,10 @@ class NativeLayoutWindow(QMainWindow):
             self.commit_interaction_snapshot(snapshot)
             if component.get("kind") == "E-beam multipass":
                 self.refresh_ebeam_scene_item(int(component["uid"]), selected=True)
+            elif component.get("kind") in MODULATOR_COMPONENT_KINDS:
+                # A coupler choice changes the global numbered SLAB/L-marker
+                # allocation, so every affected component must be refreshed.
+                self.rebuild_scene(select_uids=[int(component["uid"])])
             elif companions_changed:
                 self.rebuild_scene(preserve_selection=True)
             else:
@@ -3949,10 +4220,16 @@ class NativeLayoutWindow(QMainWindow):
             return EBEAM_LAYER
         if kind in RF_COMPONENT_KINDS or kind == "MZI + CPW module":
             return RF_LAYER
+        if kind == "Square mark" and bool(
+            component.get("params", {}).get("dicing_marker", False)
+        ):
+            return GLOBAL_MARKER_LAYER
         if kind in MARKER_COMPONENT_KINDS:
             return MARKER_LAYER
         if kind in {"Grating coupler", "GC-SOI"}:
             return GC_LAYER
+        if kind == "Feedline":
+            return FEEDLINE_LAYER
         if kind in {"Chip outline", "4-inch wafer outline"}:
             return int(component.get("params", {}).get("layer", 100))
         return PHOTONIC_LAYER
@@ -4789,6 +5066,490 @@ class NativeLayoutWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Arrays / modules
     # ------------------------------------------------------------------
+    def _array_members(self, array_id: str) -> list[dict[str, Any]]:
+        return [
+            component
+            for component in self.components
+            if str(component.get("array_group_id", "")) == str(array_id)
+        ]
+
+    @staticmethod
+    def _array_role_map(members: list[dict[str, Any]]) -> dict[int, str]:
+        """Return stable source-template roles, including for legacy arrays."""
+        roles: dict[int, str] = {}
+        cells: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for component in members:
+            if bool(component.get("array_is_label", False)):
+                continue
+            stored = component.get("array_template_id")
+            if stored is not None:
+                roles[int(component["uid"])] = str(stored)
+                continue
+            raw_index = component.get("array_index", [0, 0])
+            try:
+                cell = (int(raw_index[0]), int(raw_index[1]))
+            except (IndexError, TypeError, ValueError):
+                cell = (0, 0)
+            cells.setdefault(cell, []).append(component)
+
+        # Older JSON files have array_index but no template identifier.  The
+        # original creator cloned components in a deterministic order, so the
+        # Nth component of one kind in every cell is the same source role.
+        for cell_components in cells.values():
+            by_kind: dict[str, list[dict[str, Any]]] = {}
+            for component in cell_components:
+                by_kind.setdefault(str(component.get("kind", "Component")), []).append(component)
+            for kind, same_kind in by_kind.items():
+                same_kind.sort(key=lambda component: int(component.get("uid", 0)))
+                for occurrence, component in enumerate(same_kind):
+                    roles[int(component["uid"])] = f"legacy:{kind}:{occurrence}"
+        return roles
+
+    @staticmethod
+    def _array_axis_sweep_candidate(
+        members: list[dict[str, Any]],
+        roles: dict[int, str],
+        nx: int,
+        ny: int,
+        axis: str,
+    ) -> tuple[str, list[float]]:
+        """Infer one legacy row/column sweep from repeated numeric parameters."""
+        candidates: list[tuple[int, str, list[float]]] = []
+        by_role: dict[str, list[dict[str, Any]]] = {}
+        for component in members:
+            role = roles.get(int(component.get("uid", -1)))
+            if role is not None:
+                by_role.setdefault(role, []).append(component)
+        axis_count = nx if axis == "x" else ny
+        other_count = ny if axis == "x" else nx
+        for role, role_members in by_role.items():
+            by_cell = {
+                tuple(int(value) for value in component.get("array_index", [0, 0])[:2]): component
+                for component in role_members
+            }
+            if len(by_cell) < axis_count:
+                continue
+            numeric_keys = sorted(
+                {
+                    key
+                    for component in role_members
+                    for key, value in component.get("params", {}).items()
+                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                }
+            )
+            for key in numeric_keys:
+                axis_values: list[float] = []
+                valid = True
+                for axis_index in range(axis_count):
+                    values = []
+                    for other_index in range(other_count):
+                        cell = (
+                            (axis_index, other_index)
+                            if axis == "x"
+                            else (other_index, axis_index)
+                        )
+                        component = by_cell.get(cell)
+                        if component is None or key not in component.get("params", {}):
+                            continue
+                        values.append(float(component["params"][key]))
+                    if not values:
+                        valid = False
+                        break
+                    reference = float(np.median(values))
+                    tolerance = max(1e-10, abs(reference) * 1e-9)
+                    if any(abs(value - reference) > tolerance for value in values):
+                        valid = False
+                        break
+                    axis_values.append(reference)
+                if not valid or len(axis_values) != axis_count:
+                    continue
+                if max(axis_values) - min(axis_values) <= max(
+                    1e-10, max(abs(value) for value in axis_values) * 1e-9
+                ):
+                    continue
+                lowered = key.lower()
+                # Prefer the names users most often scan, then deterministic order.
+                score = 0
+                if axis == "x" and any(token in lowered for token in ("fill", "duty", "width")):
+                    score += 4
+                if axis == "y" and any(token in lowered for token in ("pitch", "period", "length")):
+                    score += 4
+                if lowered.startswith("gc_"):
+                    score += 2
+                candidates.append((score, key, axis_values))
+        if not candidates:
+            return "", []
+        candidates.sort(key=lambda entry: (-entry[0], entry[1]))
+        return candidates[0][1], candidates[0][2]
+
+    def array_spec_for_member(self, member: dict[str, Any]) -> dict[str, Any]:
+        """Return a normalized persisted or best-effort inferred array recipe."""
+        array_id = str(member.get("array_group_id", ""))
+        members = self._array_members(array_id) if array_id else []
+        if not members:
+            raise ValueError("The selected component is not part of a generated array.")
+        max_col = max(int(component.get("array_index", [0, 0])[0]) for component in members)
+        max_row = max(int(component.get("array_index", [0, 0])[1]) for component in members)
+        stored = next(
+            (
+                copy.deepcopy(component.get("array_spec"))
+                for component in members
+                if isinstance(component.get("array_spec"), dict)
+            ),
+            None,
+        )
+        nx = max(1, int((stored or {}).get("nx", max_col + 1)))
+        ny = max(1, int((stored or {}).get("ny", max_row + 1)))
+
+        def normalized_spacings(key: str, count: int, coordinate: str) -> list[float]:
+            raw = (stored or {}).get(key)
+            if isinstance(raw, (list, tuple)) and len(raw) == max(0, count - 1):
+                return [float(value) for value in raw]
+            if count <= 1:
+                return []
+            roles = self._array_role_map(members)
+            role_counts: dict[str, int] = {}
+            for role in roles.values():
+                role_counts[role] = role_counts.get(role, 0) + 1
+            anchor_role = max(role_counts, key=role_counts.get)
+            positions: list[float] = []
+            for index in range(count):
+                values = []
+                for component in members:
+                    if roles.get(int(component.get("uid", -1))) != anchor_role:
+                        continue
+                    cell = component.get("array_index", [0, 0])
+                    axis_index = int(cell[0] if coordinate == "x" else cell[1])
+                    if axis_index == index:
+                        values.append(float(component.get(coordinate, 0.0)))
+                positions.append(float(np.median(values)) if values else (positions[-1] if positions else 0.0))
+            return [positions[index + 1] - positions[index] for index in range(count - 1)]
+
+        roles = self._array_role_map(members)
+        inferred_x_name, inferred_x_values = self._array_axis_sweep_candidate(
+            members, roles, nx, ny, "x"
+        )
+        inferred_y_name, inferred_y_values = self._array_axis_sweep_candidate(
+            members, roles, nx, ny, "y"
+        )
+        spec = {
+            "version": 1,
+            "nx": nx,
+            "ny": ny,
+            "x_spacings": normalized_spacings("x_spacings", nx, "x"),
+            "y_spacings": normalized_spacings("y_spacings", ny, "y"),
+            "x_parameter": str((stored or {}).get("x_parameter", inferred_x_name)),
+            "x_values": [
+                float(value)
+                for value in (stored or {}).get("x_values", inferred_x_values)
+            ],
+            "y_parameter": str((stored or {}).get("y_parameter", inferred_y_name)),
+            "y_values": [
+                float(value)
+                for value in (stored or {}).get("y_values", inferred_y_values)
+            ],
+            "auto_label": bool((stored or {}).get("auto_label", False)),
+            "label_prefix": str((stored or {}).get("label_prefix", "A")),
+            "label_offset_x": float((stored or {}).get("label_offset_x", 20.0)),
+            "label_offset_y": float((stored or {}).get("label_offset_y", 20.0)),
+        }
+        if spec["x_parameter"] and len(spec["x_values"]) != nx:
+            spec["x_values"] = inferred_x_values or [0.0] * nx
+        if spec["y_parameter"] and len(spec["y_values"]) != ny:
+            spec["y_values"] = inferred_y_values or [0.0] * ny
+        return spec
+
+    def array_templates_for_member(
+        self,
+        member: dict[str, Any],
+        spec: dict[str, Any] | None = None,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Return one base-cell component for each source role in the array."""
+        array_id = str(member.get("array_group_id", ""))
+        members = self._array_members(array_id)
+        spec = copy.deepcopy(spec or self.array_spec_for_member(member))
+        x_positions = [0.0]
+        for spacing in spec.get("x_spacings", []):
+            x_positions.append(x_positions[-1] + float(spacing))
+        y_positions = [0.0]
+        for spacing in spec.get("y_spacings", []):
+            y_positions.append(y_positions[-1] + float(spacing))
+        roles = self._array_role_map(members)
+        by_role: dict[str, list[dict[str, Any]]] = {}
+        for component in members:
+            role = roles.get(int(component.get("uid", -1)))
+            if role is not None:
+                by_role.setdefault(role, []).append(component)
+        templates: list[tuple[str, dict[str, Any]]] = []
+        for role in sorted(by_role):
+            representative = min(
+                by_role[role],
+                key=lambda component: (
+                    int(component.get("array_index", [0, 0])[1]),
+                    int(component.get("array_index", [0, 0])[0]),
+                    int(component.get("uid", 0)),
+                ),
+            )
+            template = copy.deepcopy(representative)
+            col, row = [int(value) for value in representative.get("array_index", [0, 0])[:2]]
+            template["x"] = float(template.get("x", 0.0)) - (x_positions[col] if col < len(x_positions) else 0.0)
+            template["y"] = float(template.get("y", 0.0)) - (y_positions[row] if row < len(y_positions) else 0.0)
+            template["array_template_id"] = role
+            template["array_index"] = [0, 0]
+            templates.append((role, template))
+        return templates
+
+    @staticmethod
+    def _normalized_array_edit_spec(raw: dict[str, Any]) -> dict[str, Any]:
+        nx = max(1, int(raw.get("nx", 1)))
+        ny = max(1, int(raw.get("ny", 1)))
+        x_parameter = str(raw.get("x_parameter", "")).strip()
+        y_parameter = str(raw.get("y_parameter", "")).strip()
+        if x_parameter and y_parameter and x_parameter == y_parameter:
+            raise ValueError("The row and column sweep parameters must be different.")
+        x_spacings = parse_sequence(str(raw.get("x_spacings_text", "")), nx - 1) if nx > 1 else []
+        y_spacings = parse_sequence(str(raw.get("y_spacings_text", "")), ny - 1) if ny > 1 else []
+        if x_parameter and not str(raw.get("x_values_text", "")).strip():
+            raise ValueError("Enter one column-sweep value for every array column.")
+        if y_parameter and not str(raw.get("y_values_text", "")).strip():
+            raise ValueError("Enter one row-sweep value for every array row.")
+        return {
+            "version": 1,
+            "nx": nx,
+            "ny": ny,
+            "x_spacings": x_spacings,
+            "y_spacings": y_spacings,
+            "x_parameter": x_parameter,
+            "x_values": parse_sequence(str(raw.get("x_values_text", "")), nx) if x_parameter else [],
+            "y_parameter": y_parameter,
+            "y_values": parse_sequence(str(raw.get("y_values_text", "")), ny) if y_parameter else [],
+            "auto_label": bool(raw.get("auto_label", False)),
+            "label_prefix": str(raw.get("label_prefix", "A")),
+            "label_offset_x": float(raw.get("label_offset_x", 20.0)),
+            "label_offset_y": float(raw.get("label_offset_y", 20.0)),
+        }
+
+    def open_selected_array_editor(self) -> None:
+        selected = self.selected_components()
+        if len(selected) != 1 or not selected[0].get("array_group_id"):
+            QMessageBox.information(self, "Edit array", "Select one generated-array member first.")
+            return
+        member = selected[0]
+        array_id = str(member["array_group_id"])
+        spec = self.array_spec_for_member(member)
+        templates = self.array_templates_for_member(member, spec)
+        dialog = ArrayEditDialog(self, array_id, spec, templates)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        snapshot = self.snapshot()
+        try:
+            updated_spec = self._normalized_array_edit_spec(dialog.raw_specification())
+            selected_uid = int(member["uid"])
+            changed_uids = self.regenerate_array(
+                array_id,
+                updated_spec,
+                dialog.template_updates(),
+            )
+            self.commit_interaction_snapshot(snapshot)
+            self.rebuild_scene(
+                select_uids=[selected_uid] if selected_uid in changed_uids else changed_uids[:1]
+            )
+            self.statusBar().showMessage(
+                f"Updated array {array_id}: {updated_spec['nx']} × {updated_spec['ny']} cells.",
+                8000,
+            )
+        except Exception as exc:
+            if self.snapshot() != snapshot:
+                self.restore_snapshot(snapshot)
+            QMessageBox.critical(self, "Invalid array", str(exc))
+
+    def regenerate_array(
+        self,
+        array_id: str,
+        spec: dict[str, Any],
+        template_updates: dict[str, dict[str, Any]] | None = None,
+    ) -> list[int]:
+        """Regenerate only one array from its base templates.
+
+        Existing UIDs are retained for cells that still exist. New cells are
+        cloned from the base templates, removed cells are deleted, and sweep
+        values are applied last so they remain authoritative.
+        """
+        members = self._array_members(array_id)
+        if not members:
+            raise ValueError(f"Array {array_id} no longer exists.")
+        member = next(
+            (component for component in members if not component.get("array_is_label", False)),
+            members[0],
+        )
+        normalized = {
+            "version": 1,
+            "nx": max(1, int(spec.get("nx", 1))),
+            "ny": max(1, int(spec.get("ny", 1))),
+            "x_spacings": [float(value) for value in spec.get("x_spacings", [])],
+            "y_spacings": [float(value) for value in spec.get("y_spacings", [])],
+            "x_parameter": str(spec.get("x_parameter", "")),
+            "x_values": [float(value) for value in spec.get("x_values", [])],
+            "y_parameter": str(spec.get("y_parameter", "")),
+            "y_values": [float(value) for value in spec.get("y_values", [])],
+            "auto_label": bool(spec.get("auto_label", False)),
+            "label_prefix": str(spec.get("label_prefix", "A")),
+            "label_offset_x": float(spec.get("label_offset_x", 20.0)),
+            "label_offset_y": float(spec.get("label_offset_y", 20.0)),
+        }
+        nx, ny = normalized["nx"], normalized["ny"]
+        if len(normalized["x_spacings"]) != max(0, nx - 1):
+            raise ValueError(f"Expected {max(0, nx - 1)} X spacings.")
+        if len(normalized["y_spacings"]) != max(0, ny - 1):
+            raise ValueError(f"Expected {max(0, ny - 1)} Y spacings.")
+        if normalized["x_parameter"] and len(normalized["x_values"]) != nx:
+            raise ValueError(f"Expected {nx} column-sweep values.")
+        if normalized["y_parameter"] and len(normalized["y_values"]) != ny:
+            raise ValueError(f"Expected {ny} row-sweep values.")
+
+        previous_spec = self.array_spec_for_member(member)
+        templates = dict(self.array_templates_for_member(member, previous_spec))
+        updates = template_updates or {}
+        for role, update in updates.items():
+            if role not in templates:
+                continue
+            template = templates[role]
+            for key in ("x", "y", "orientation_deg", "mirrored"):
+                if key in update:
+                    template[key] = copy.deepcopy(update[key])
+            template.setdefault("params", {}).update(copy.deepcopy(update.get("params", {})))
+
+        x_positions = [0.0]
+        for spacing in normalized["x_spacings"]:
+            x_positions.append(x_positions[-1] + float(spacing))
+        y_positions = [0.0]
+        for spacing in normalized["y_spacings"]:
+            y_positions.append(y_positions[-1] + float(spacing))
+
+        roles = self._array_role_map(members)
+        existing: dict[tuple[str, int, int], dict[str, Any]] = {}
+        for component in members:
+            if bool(component.get("array_is_label", False)):
+                continue
+            role = roles.get(int(component.get("uid", -1)))
+            if role is None:
+                continue
+            col, row = [int(value) for value in component.get("array_index", [0, 0])[:2]]
+            existing[(role, col, row)] = component
+
+        target_components: list[dict[str, Any]] = []
+        target_by_cell_role: dict[tuple[int, int, str], dict[str, Any]] = {}
+        group_ids: dict[tuple[int, int, str], str] = {}
+        for row in range(ny):
+            for col in range(nx):
+                for role, template in templates.items():
+                    component = existing.get((role, col, row))
+                    if component is None:
+                        component = copy.deepcopy(template)
+                        component["uid"] = self.next_uid
+                        self.next_uid += 1
+                    else:
+                        uid = int(component["uid"])
+                        component.clear()
+                        component.update(copy.deepcopy(template))
+                        component["uid"] = uid
+                    component["x"] = float(template.get("x", 0.0)) + x_positions[col]
+                    component["y"] = float(template.get("y", 0.0)) + y_positions[row]
+                    component["array_group_id"] = str(array_id)
+                    component["array_template_id"] = str(role)
+                    component["array_index"] = [col, row]
+                    component["array_spec"] = copy.deepcopy(normalized)
+                    component.pop("array_is_label", None)
+                    component.pop("_last_group_position", None)
+                    source_group = template.get("group_id")
+                    if source_group:
+                        group_key = (col, row, str(source_group))
+                        if group_key not in group_ids:
+                            if col == 0 and row == 0:
+                                group_ids[group_key] = str(source_group)
+                            else:
+                                group_ids[group_key] = f"G{self.next_group_id}"
+                                self.next_group_id += 1
+                        component["group_id"] = group_ids[group_key]
+                    if normalized["x_parameter"] in component.get("params", {}):
+                        component["params"][normalized["x_parameter"]] = normalized["x_values"][col]
+                    if normalized["y_parameter"] in component.get("params", {}):
+                        component["params"][normalized["y_parameter"]] = normalized["y_values"][row]
+                    target_components.append(component)
+                    target_by_cell_role[(col, row, role)] = component
+
+        # Restore cell-local relationships using the template relationship,
+        # rather than leaving clones attached to the base cell.
+        template_uid_to_role = {
+            int(template.get("uid", -1)): role for role, template in templates.items()
+        }
+        for row in range(ny):
+            for col in range(nx):
+                for role, template in templates.items():
+                    component = target_by_cell_role[(col, row, role)]
+                    attachment = component.get("attachment")
+                    if isinstance(attachment, dict):
+                        target_role = template_uid_to_role.get(int(attachment.get("target_uid", -1)))
+                        if target_role and (col, row, target_role) in target_by_cell_role:
+                            attachment["target_uid"] = int(target_by_cell_role[(col, row, target_role)]["uid"])
+                    if component.get("coverage_source_uids"):
+                        component["coverage_source_uids"] = [
+                            int(target_by_cell_role[(col, row, template_uid_to_role[int(uid)])]["uid"])
+                            if int(uid) in template_uid_to_role
+                            and (col, row, template_uid_to_role[int(uid)]) in target_by_cell_role
+                            else int(uid)
+                            for uid in component["coverage_source_uids"]
+                        ]
+
+        unrelated = [
+            component
+            for component in self.components
+            if str(component.get("array_group_id", "")) != str(array_id)
+        ]
+        self.components = unrelated + target_components
+
+        if normalized["auto_label"]:
+            for row in range(ny):
+                for col in range(nx):
+                    cell_components = [
+                        target_by_cell_role[(col, row, role)]
+                        for role in templates
+                        if target_by_cell_role[(col, row, role)].get("kind") != "E-beam multipass"
+                    ]
+                    if not cell_components:
+                        continue
+                    bounds = self.components_world_bounds(cell_components)
+                    fragments = []
+                    if normalized["x_parameter"]:
+                        fragments.append(
+                            f"{normalized['x_parameter']}={normalized['x_values'][col]:g}"
+                        )
+                    if normalized["y_parameter"]:
+                        fragments.append(
+                            f"{normalized['y_parameter']}={normalized['y_values'][row]:g}"
+                        )
+                    prefix = normalized["label_prefix"]
+                    text_value = f"{prefix}-" if prefix else ""
+                    text_value += ", ".join(fragments) if fragments else f"{col},{row}"
+                    label = self.make_component(
+                        "Text / Number",
+                        bounds[0] + normalized["label_offset_x"],
+                        bounds[3] + normalized["label_offset_y"],
+                    )
+                    label["params"].update({"text": text_value, "layer": MARKER_LAYER, "datatype": 0})
+                    label["array_group_id"] = str(array_id)
+                    label["array_index"] = [col, row]
+                    label["array_template_id"] = "__array_label__"
+                    label["array_is_label"] = True
+                    label["array_spec"] = copy.deepcopy(normalized)
+                    self.components.append(label)
+
+        return [
+            int(component["uid"])
+            for component in self.components
+            if str(component.get("array_group_id", "")) == str(array_id)
+        ]
+
     def create_array(self) -> None:
         selected = self.selected_components()
         if not selected:
@@ -4834,9 +5595,26 @@ class NativeLayoutWindow(QMainWindow):
         snapshot = self.snapshot()
         array_id = f"A{self.next_array_id}"
         self.next_array_id += 1
+        array_spec = {
+            "version": 1,
+            "nx": nx,
+            "ny": ny,
+            "x_spacings": [float(value) for value in x_spacings[: max(0, nx - 1)]],
+            "y_spacings": [float(value) for value in y_spacings[: max(0, ny - 1)]],
+            "x_parameter": dialog.x_param.currentText(),
+            "x_values": [float(value) for value in x_values] if dialog.x_param.currentText() else [],
+            "y_parameter": dialog.y_param.currentText(),
+            "y_values": [float(value) for value in y_values] if dialog.y_param.currentText() else [],
+            "auto_label": dialog.auto_label.isChecked(),
+            "label_prefix": dialog.label_prefix.text().strip(),
+            "label_offset_x": dialog.label_offset_x.value(),
+            "label_offset_y": dialog.label_offset_y.value(),
+        }
         for component in originals:
             component["array_group_id"] = array_id
             component["array_index"] = [0, 0]
+            component["array_template_id"] = str(component["uid"])
+            component["array_spec"] = copy.deepcopy(array_spec)
         # deepcopy is materially faster than a JSON serialize/parse roundtrip
         # for large arrays while preserving the independent nested parameters.
         base_order = [copy.deepcopy(component) for component in originals]
@@ -4845,6 +5623,7 @@ class NativeLayoutWindow(QMainWindow):
         for row in range(ny):
             for col in range(nx):
                 if row == 0 and col == 0:
+                    cell_components = originals
                     if dialog.x_param.currentText():
                         for component in selected:
                             if dialog.x_param.currentText() in component.get("params", {}):
@@ -4853,35 +5632,43 @@ class NativeLayoutWindow(QMainWindow):
                         for component in selected:
                             if dialog.y_param.currentText() in component.get("params", {}):
                                 component["params"][dialog.y_param.currentText()] = y_values[row]
-                    continue
-                uid_map: dict[int, int] = {}
-                cell_components: list[dict[str, Any]] = []
-                for base in base_order:
-                    duplicate = copy.deepcopy(base)
-                    old_uid = int(base["uid"])
-                    duplicate["uid"] = self.next_uid
-                    self.next_uid += 1
-                    uid_map[old_uid] = int(duplicate["uid"])
-                    duplicate["x"] = float(base["x"]) + x_positions[col]
-                    duplicate["y"] = float(base["y"]) + y_positions[row]
-                    duplicate["array_group_id"] = array_id
-                    duplicate["array_index"] = [col, row]
-                    duplicate.pop("_last_group_position", None)
-                    if dialog.x_param.currentText() and dialog.x_param.currentText() in duplicate.get("params", {}):
-                        duplicate["params"][dialog.x_param.currentText()] = x_values[col]
-                    if dialog.y_param.currentText() and dialog.y_param.currentText() in duplicate.get("params", {}):
-                        duplicate["params"][dialog.y_param.currentText()] = y_values[row]
-                    cell_components.append(duplicate)
-                for duplicate in cell_components:
-                    if duplicate.get("coverage_source_uids"):
-                        duplicate["coverage_source_uids"] = [
-                            uid_map.get(int(uid), int(uid)) for uid in duplicate["coverage_source_uids"]
-                        ]
-                    attachment = duplicate.get("attachment")
-                    if attachment and int(attachment.get("target_uid", -1)) in uid_map:
-                        attachment["target_uid"] = uid_map[int(attachment["target_uid"])]
-                self.components.extend(cell_components)
-                created_uids.extend(int(component["uid"]) for component in cell_components)
+                else:
+                    uid_map: dict[int, int] = {}
+                    cell_components = []
+                    group_map: dict[str, str] = {}
+                    for base in base_order:
+                        duplicate = copy.deepcopy(base)
+                        old_uid = int(base["uid"])
+                        duplicate["uid"] = self.next_uid
+                        self.next_uid += 1
+                        uid_map[old_uid] = int(duplicate["uid"])
+                        duplicate["x"] = float(base["x"]) + x_positions[col]
+                        duplicate["y"] = float(base["y"]) + y_positions[row]
+                        duplicate["array_group_id"] = array_id
+                        duplicate["array_index"] = [col, row]
+                        duplicate["array_spec"] = copy.deepcopy(array_spec)
+                        duplicate.pop("_last_group_position", None)
+                        source_group = duplicate.get("group_id")
+                        if source_group:
+                            if str(source_group) not in group_map:
+                                group_map[str(source_group)] = f"G{self.next_group_id}"
+                                self.next_group_id += 1
+                            duplicate["group_id"] = group_map[str(source_group)]
+                        if dialog.x_param.currentText() and dialog.x_param.currentText() in duplicate.get("params", {}):
+                            duplicate["params"][dialog.x_param.currentText()] = x_values[col]
+                        if dialog.y_param.currentText() and dialog.y_param.currentText() in duplicate.get("params", {}):
+                            duplicate["params"][dialog.y_param.currentText()] = y_values[row]
+                        cell_components.append(duplicate)
+                    for duplicate in cell_components:
+                        if duplicate.get("coverage_source_uids"):
+                            duplicate["coverage_source_uids"] = [
+                                uid_map.get(int(uid), int(uid)) for uid in duplicate["coverage_source_uids"]
+                            ]
+                        attachment = duplicate.get("attachment")
+                        if attachment and int(attachment.get("target_uid", -1)) in uid_map:
+                            attachment["target_uid"] = uid_map[int(attachment["target_uid"])]
+                    self.components.extend(cell_components)
+                    created_uids.extend(int(component["uid"]) for component in cell_components)
 
                 if dialog.auto_label.isChecked():
                     cell_non_ebeam = [component for component in cell_components if component.get("kind") != "E-beam multipass"]
@@ -4905,6 +5692,9 @@ class NativeLayoutWindow(QMainWindow):
                         label["params"]["datatype"] = 0
                         label["array_group_id"] = array_id
                         label["array_index"] = [col, row]
+                        label["array_template_id"] = "__array_label__"
+                        label["array_is_label"] = True
+                        label["array_spec"] = copy.deepcopy(array_spec)
                         self.components.append(label)
                         created_uids.append(int(label["uid"]))
 
@@ -5083,10 +5873,52 @@ class NativeLayoutWindow(QMainWindow):
     # E-beam fields
     # ------------------------------------------------------------------
     def ebeam_source_polygons(self, components: list[dict[str, Any]]) -> list[gdstk.Polygon]:
-        """Flatten exact world-space geometry eligible for E-beam coverage (layers 1/2/3 only)."""
-        eligible={PHOTONIC_LAYER,GC_LAYER,MARKER_LAYER};result=[]
+        """Flatten exact world-space optical and alignment geometry for coverage."""
+        result=[]
         for source in components:
             if source.get("kind")=="E-beam multipass":continue
+            eligible={PHOTONIC_LAYER,GC_LAYER,MARKER_LAYER,GLOBAL_MARKER_LAYER,WG_TIP_LAYER,FEEDLINE_LAYER}
+            if str(source.get("kind", "")) in EDGE_COUPLER_COMPONENT_KINDS:
+                params = source.get("params", {})
+                eligible.update(
+                    {
+                        int(params.get("slab_layer", edge_coupler_slab_layer(1))),
+                        int(
+                            params.get(
+                                "local_alignment_mark_layer",
+                                edge_coupler_local_marker_layer(1),
+                            )
+                        ),
+                    }
+                )
+                if str(source.get("kind", "")) in {
+                    "Exponential edge coupler pair + feed",
+                    "Linear edge coupler pair + feed",
+                }:
+                    eligible.update(
+                        {
+                            int(params.get("right_slab_layer", edge_coupler_slab_layer(2))),
+                            int(
+                                params.get(
+                                    "right_local_alignment_mark_layer",
+                                    edge_coupler_local_marker_layer(2),
+                                )
+                            ),
+                        }
+                    )
+            elif (
+                str(source.get("kind", "")) in MODULATOR_COMPONENT_KINDS
+                and bool(source.get("params", {}).get("add_edge_coupler_tapers", False))
+            ):
+                params = source.get("params", {})
+                eligible.update(
+                    {
+                        int(params.get("left_edge_coupler_slab_layer", edge_coupler_slab_layer(1))),
+                        int(params.get("left_edge_coupler_local_marker_layer", edge_coupler_local_marker_layer(1))),
+                        int(params.get("right_edge_coupler_slab_layer", edge_coupler_slab_layer(2))),
+                        int(params.get("right_edge_coupler_local_marker_layer", edge_coupler_local_marker_layer(2))),
+                    }
+                )
             library=gdstk.Library(unit=1e-6,precision=1e-9);cell=library.new_cell(f"COVER_SOURCE_{int(source.get('uid',0))}")
             _add_component_geometry_to_cell(safe_json_copy(source),cell)
             result.extend(polygon for polygon in cell.get_polygons(apply_repetitions=True,include_paths=True) if int(polygon.layer) in eligible)
@@ -5094,7 +5926,7 @@ class NativeLayoutWindow(QMainWindow):
 
     @staticmethod
     def polygon_collection_bounds(polygons: list[gdstk.Polygon]) -> tuple[float,float,float,float]:
-        if not polygons:raise ValueError("No layer 1, 2, or 3 geometry was found in the selection.")
+        if not polygons:raise ValueError("No optical or alignment-marker geometry was found in the selection.")
         points=np.vstack([np.asarray(polygon.points,float) for polygon in polygons]);return (float(points[:,0].min()),float(points[:,1].min()),float(points[:,0].max()),float(points[:,1].max()))
 
     def create_ebeam_coverage(self) -> None:
@@ -5104,7 +5936,7 @@ class NativeLayoutWindow(QMainWindow):
             return
         source_polygons=self.ebeam_source_polygons(sources)
         if not source_polygons:
-            QMessageBox.information(self,"E-beam coverage","The selection contains no WG, GC, or marker geometry on layers 1, 2, or 3. RF-only geometry is intentionally ignored.");return
+            QMessageBox.information(self,"E-beam coverage","The selection contains no WG, GC, SLAB, or alignment-marker geometry. RF-only geometry is intentionally ignored.");return
         dialog = EbeamDialog(DEFAULT_COMPONENT_VALUES["E-beam multipass"], self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -6820,6 +7652,7 @@ class NativeLayoutWindow(QMainWindow):
             QMessageBox.critical(self, "Import failed", str(exc))
 
     def export_beamer_ftext(self) -> None:
+        assign_edge_coupler_layers(self.components)
         records = self.collect_field_records()
         if not records:
             QMessageBox.information(self, "BEAMER FTEXT", "No E-beam fields exist.")
@@ -6849,14 +7682,65 @@ class NativeLayoutWindow(QMainWindow):
                     f"STOP_Y = {record['ymax']:.12g}",
                 ]
             )
-        flow = self.beamer_flow_template(
+        output_path = Path(path)
+        flow = NativeLayoutWindow.beamer_flow_template(
+            self,
             "\n".join(region_lines),
             wg_dose,
             gc_dose,
             marker_dose,
+            layer_mappings=[
+                (PHOTONIC_LAYER, "WG", "Wg"),
+                (WG_TIP_LAYER, "WG_TIP", "Wg_tip"),
+                (GLOBAL_MARKER_LAYER, "G_MARKERS", "G-markers"),
+                (LOCAL_MARKER_LAYER, "L_MARKERS", "L-markers"),
+            ],
+            layer_doses=[
+                ("WG", wg_dose),
+                ("WG_TIP", wg_dose),
+                ("G_MARKERS", marker_dose),
+                ("L_MARKERS", marker_dose),
+            ],
+            gpf_name=f"{output_path.stem}.gpf",
         )
-        output_path = Path(path)
         output_path.write_text(flow, encoding="utf-8")
+        main_gpf_name = beamer_gpf_name(flow)
+        edge_patterns = beamer_edge_coupler_patterns(
+            self.components,
+            main_gpf_name,
+        )
+        edge_flow_paths: list[Path] = []
+        for pattern in edge_patterns:
+            number = int(pattern["coupler_number"])
+            slab_name = f"SLAB_{number:03d}"
+            edge_flow = NativeLayoutWindow.beamer_flow_template(
+                self,
+                "\n".join(region_lines),
+                wg_dose,
+                gc_dose,
+                marker_dose,
+                layer_mappings=[
+                    (int(pattern["slab_layer"]), slab_name, slab_name),
+                    (
+                        int(pattern["local_marker_layer"]),
+                        "L_MARKERS",
+                        "L-markers",
+                    ),
+                    (GLOBAL_MARKER_LAYER, "G_MARKERS", "G-markers"),
+                ],
+                layer_doses=[
+                    (slab_name, wg_dose),
+                    ("L_MARKERS", marker_dose),
+                    ("G_MARKERS", marker_dose),
+                ],
+                gpf_name=str(pattern["name"]),
+                multipass_layer=slab_name,
+            )
+            edge_flow_path = output_path.with_name(
+                Path(str(pattern["name"])).with_suffix(".ftxt").name
+            )
+            edge_flow_path.write_text(edge_flow, encoding="utf-8")
+            edge_flow_paths.append(edge_flow_path)
         frame_size_um = beamer_frame_size_um(
             self.components,
             records,
@@ -6868,14 +7752,17 @@ class NativeLayoutWindow(QMainWindow):
         cjob_path = output_path.with_suffix(".cjob")
         cjob_path.write_text(
             beamer_cjob_template(
-                beamer_gpf_name(flow),
+                main_gpf_name,
                 frame_size_um,
                 exposure_name=output_path.stem,
+                local_alignment_marks=beamer_alignment_marks(self.components),
+                edge_coupler_patterns=edge_patterns,
             ),
             encoding="utf-8",
         )
         self.statusBar().showMessage(
-            f"Exported BEAMER FTEXT ({len(records)} regions) and CJOB: "
+            f"Exported BEAMER FTEXT ({len(records)} regions), "
+            f"{len(edge_flow_paths)} numbered SLAB flow(s), and CJOB: "
             f"{output_path}, {cjob_path}"
         )
 
@@ -6885,12 +7772,47 @@ class NativeLayoutWindow(QMainWindow):
         wg_dose: float,
         gc_dose: float,
         marker_dose: float,
+        *,
+        layer_mappings: list[tuple[int, str, str]] | None = None,
+        layer_doses: list[tuple[str, float]] | None = None,
+        gpf_name: str = "photonic_layout.gpf",
+        multipass_layer: str = "WG",
     ) -> str:
+        mappings = layer_mappings or [
+            (PHOTONIC_LAYER, "WG", "Wg"),
+            (WG_TIP_LAYER, "WG_TIP", "Wg_tip"),
+            (GLOBAL_MARKER_LAYER, "G_MARKERS", "G-markers"),
+            (LOCAL_MARKER_LAYER, "L_MARKERS", "L-markers"),
+        ]
+        doses = layer_doses or [
+            ("WG", wg_dose),
+            ("WG_TIP", wg_dose),
+            ("G_MARKERS", marker_dose),
+            ("L_MARKERS", marker_dose),
+        ]
+        lib_comment = "%3B".join(
+            f"Layer_{int(layer)}_{name}" for layer, name, _output in mappings
+        )
+        mapping_lines = "\n".join(
+            f"LAYER_MAPPING = {int(layer)}(0)%20%3A%20{name}%20%3A%20{output}"
+            for layer, name, output in mappings
+        )
+        extract_layer_set = "%2C%20".join(
+            f"{int(layer)}(0)" for layer, _name, _output in mappings
+        )
+        assignment_lines = "\n".join(
+            f"ASSIGNMENT = {name}%20%3A%20{float(value):.6f}"
+            for name, value in doses
+        )
+        safe_gpf_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(gpf_name))
+        safe_multipass_layer = re.sub(
+            r"[^A-Za-z0-9_.-]+", "_", str(multipass_layer)
+        )
         return f"""FLOW photonic_layout
 PROGRAM_VERSION BEAMER_Revision_Number_7.4.0_(a48748191b),_Jul_21_2025,_08:56:31
 OPERATING_SYSTEM Microsoft_Windows_8
 ZOOM_LEVEL 1.000000
-LIB_COMMENT Layer_1_WG%3BLayer_2_GC%3BLayer_3_Marker%3BLayer_4_RF%3BLayer_5_Probe%3BLayer_6_Ebeam
+LIB_COMMENT {lib_comment}
 SHOW_LIB_COMMENT false
  ()
 NODE Import ()
@@ -6949,7 +7871,7 @@ QAP_END
 
 
 VERSION = 3
-LAYERSET = *
+LAYERSET = {extract_layer_set}
 EXTRACT_TYPE = INSTANCES
 ResultMode = Region/Instances
 DOSECLASSSHRINK = MAINTAIN
@@ -6976,9 +7898,7 @@ UserDefinedMinFigSize = 0.100000
 
 ASSIGN_METHOD = SET_VALUE
 ASSIGN_MODE = BYLAYER
-ASSIGNMENT = WG%20%3A%20{wg_dose:.6f}
-ASSIGNMENT = GC%20%3A%20{gc_dose:.6f}
-ASSIGNMENT = MARKER%20%3A%20{marker_dose:.6f}
+{assignment_lines}
 ENDNODE
 
 NODE Export ()
@@ -6996,7 +7916,7 @@ FileName
 QAP_END
 
 
-FILE_NAME = .%5Cphotonic_layout.gpf
+FILE_NAME = .%5C{safe_gpf_name}
 FILE_TYPE = 7
 EXTENT_AUTOMATIC
 
@@ -7077,7 +7997,7 @@ MAINFIELD_OFFSET_ABSOLUTE = false
 SUBFIELD_OFFSET_X = 0.000000
 SUBFIELD_OFFSET_Y = 0.000000
 SUBFIELD_OFFSET_ABSOLUTE = false
-MULTIPASS_LAYER = WG
+MULTIPASS_LAYER = {safe_multipass_layer}
 ENDNODE
 
 NODE Mapping ()
@@ -7095,12 +8015,7 @@ QAP_START
 QAP_END
 
 
-LAYER_MAPPING = 1(0)%20%3A%20WG%20%3A%20Wg
-LAYER_MAPPING = 2(0)%20%3A%20GC%20%3A%20Gc
-LAYER_MAPPING = 3(0)%20%3A%20MARKER%20%3A%20marker
-LAYER_MAPPING = 4(0)%20%3A%20RF%20%3A%20RF
-LAYER_MAPPING = 5(0)%20%3A%20probe%20%3A%20probe
-LAYER_MAPPING = 6(0)%20%3A%20Ebeam%20%3A%20Ebeam
+{mapping_lines}
 ENDNODE
 
 ENDFLOW
@@ -7158,6 +8073,9 @@ ENDFLOW
             "euler": "Euler bend",
             "gc": "Grating coupler",
             "grating coupler": "Grating coupler",
+            "edge coupler": "Exponential edge coupler",
+            "exponential edge coupler": "Exponential edge coupler",
+            "linear edge coupler": "Linear edge coupler",
             "mmi": "1x2 MMI",
             "1x2 mmi": "1x2 MMI",
             "mmi reference": "MMI + Reference",
@@ -7647,7 +8565,7 @@ ENDFLOW
         sbend_keys = ("s_bend_length", "arm_separation", "wg_width")
         vertical_route_keys = (
             "gc_prebend_straight", "gc_vertical_run", "gc_inward_run_fraction",
-            "gc_align_gc_to_mzi_center", "gc_inward_run", "gc_euler_radius",
+            "gc_align_gc_to_mzi_center", "gc_horizontal_stagger", "gc_inward_run", "gc_euler_radius",
             "gc_euler_fraction", "gc_vertical_side",
         )
         cpw_keys = (
@@ -7750,6 +8668,19 @@ ENDFLOW
         """Resolve the exact polygon under a normal click and show its local controls."""
         component = self.component_by_uid(component_item.uid)
         if component is None:
+            return
+        if component.get("array_group_id"):
+            # Array membership is more important than a polygon-local section:
+            # every normal click must reveal the persisted array recipe and its
+            # Edit Entire Array affordance immediately.
+            self.show_component_properties(component)
+            return
+        if component.get("kind") in MODULATOR_COMPONENT_KINDS:
+            # A modulator is edited as one symmetric, parameter-coupled block.
+            # Clicking its MZI, bend, or taper geometry must therefore open the
+            # shared block controls first; section-specific edits remain in the
+            # right-click menu.
+            self.show_component_properties(component)
             return
         # A generated scan is one selectable parent containing many devices.
         # Its normal selection panel already exposes the block-level controls;

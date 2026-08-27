@@ -10,7 +10,10 @@ import numpy as np
 from ..backend import backend
 from ..constants import DEFAULT_DATATYPE, GC_LAYER, PHOTONIC_LAYER
 from ..gds.primitives import add_rect
-from ..geometry.euler import gc_euler_output_local
+from ..geometry.euler import (
+    gc_euler_output_local,
+    three_euler_inward_gc_alignment_target,
+)
 from ..geometry.shapes import mmi_total_length
 from ..geometry.transforms import rot, transform_points
 from ..utils import parse_sequence
@@ -75,15 +78,15 @@ def add_parent_focusing_gc(
     datatype: int,
     cell_name: str,
 ) -> None:
-    """Add a GC with a layer-1 connector and layer-2 grating geometry.
+    """Add a GC with a parent-waveguide connector and layer-2 grating geometry.
 
     The immutable GC block is generated exactly as supplied.  Assembly then
     removes its initial rectangular waveguide from the GC layer and recreates
-    that connector once on the photonic layer.  The connector and taper meet
+    that connector once on the supplied parent layer.  The connector and taper meet
     at one boundary, so no rectangular overlap remains.
     """
-    photonic_layer = PHOTONIC_LAYER
-    photonic_datatype = DEFAULT_DATATYPE
+    photonic_layer = int(layer)
+    photonic_datatype = int(datatype)
     gc_layer = int(p.get("gc_layer", GC_LAYER))
     gc_datatype = int(p.get("gc_datatype", DEFAULT_DATATYPE))
     wg_length = float(p.get("gc_wg_length", p.get("wg_length", 20.0)))
@@ -145,7 +148,7 @@ def add_parent_focusing_gc(
         float(orientation_deg) % 360.0,
     )
 
-    # One non-overlapping photonic connector on layer 1.
+    # One non-overlapping connector on the parent waveguide layer.
     top.add(
         gdstk.Polygon(
             connector_points,
@@ -377,7 +380,7 @@ def add_three_euler_inward_gc(top: gdstk.Cell, p: dict[str,Any], start_center: t
             if fraction<0 or fraction>=.5:raise ValueError("GC inward-run fraction must be at least 0 and below 0.5.")
             run=float(p.get("gc_vertical_run",100.0) if bend_index==0 else (fraction*total if fraction>0 else p.get("gc_inward_run",300.0)))
             if bend_index==1 and bool(p.get("gc_align_gc_to_mzi_center",True)):
-                target=np.asarray(start_center,float)+rot((total/2,0),(float(start_orientation_deg)+180)%360);last_delta=rot(gc_euler_output_local(p,bend_angles[2]),heading);direction=rot((1,0),heading);run=float(np.dot(target-np.asarray(point)-last_delta,direction))
+                target=three_euler_inward_gc_alignment_target(start_center,start_orientation_deg,p);last_delta=rot(gc_euler_output_local(p,bend_angles[2]),heading);direction=rot((1,0),heading);run=float(np.dot(target-np.asarray(point)-last_delta,direction))
             if run<0:raise ValueError("Vertical-GC route straight lengths cannot be negative.")
             add_rect(top,np.array([[0,-width/2],[run,-width/2],[run,width/2],[0,width/2]],float),point,heading,layer,datatype);point=tuple(np.asarray(point)+rot((run,0),heading))
     add_parent_focusing_gc(top,p,point,heading,width,layer,datatype,cell_name)

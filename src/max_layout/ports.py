@@ -7,16 +7,21 @@ import math
 
 import numpy as np
 
-from .constants import SIMULATION_COMPONENT_KINDS
+from .constants import EDGE_COUPLER_COMPONENT_KINDS, EDGE_COUPLER_FEED_KINDS, MODULATOR_COMPONENT_KINDS, SIMULATION_COMPONENT_KINDS, VERTICAL_RACETRACK_FEEDLINE_KIND
+from .geometry.edge_coupler import edge_coupler_feed_landmarks, resolved_edge_coupler_parameters
+from .geometry.chip_outline import chip_outline_global_marker_centers
 from .geometry.euler import euler_output_local, grating_route_bend_angle, mmi_gc_fanout_local_points, routed_gc_local_endpoint, three_euler_inward_gc_endpoint
 from .geometry.landmarks import cpw_bend_landmarks, feedline_landmarks, loopback_landmarks, resonator_x_positions, ring_two_feedline_landmarks, segmented_electrode_landmarks
+from .geometry.modulator import resolve_modulator_layout
 from .geometry.rf_taper import gap_profile, symmetric_cpw_taper_profile
 from .geometry.shapes import mmi_total_length
 from .geometry.transforms import rot
+from .geometry.vertical_racetrack_feedline import resolve_vertical_racetrack_feedline
 
 PORT_ALIASES: dict[str, dict[str, str]] = {
     "Straight": {"input": "left", "output": "right"},
     "Taper": {"input": "left", "output": "right"},
+    "SLAB taper": {"input": "left", "output": "right"},
     "S-bend": {"input": "left", "output": "right"},
     "Euler bend": {"input": "start", "output": "end"},
     "Grating coupler": {"waveguide": "waveguide_point"},
@@ -28,6 +33,8 @@ PORT_ALIASES: dict[str, dict[str, str]] = {
     "MZI": {"input": "left_external", "output": "right_external", "splitter_upper_output": "splitter_upper_end", "splitter_lower_output": "splitter_lower_end", "combiner_upper_input": "combiner_upper_start", "combiner_lower_input": "combiner_lower_start"},
     "MZI vertical GC": {"input": "left_external", "output": "right_external", "left_gc": "left_gc_waveguide", "right_gc": "right_gc_waveguide"},
     "MZI + CPW module": {"optical_left": "left_external", "optical_right": "right_external", "rf_signal_left": "signal_left", "rf_signal_right": "signal_right", "upper_gap_left": "upper_gap_left", "lower_gap_left": "lower_gap_left", "upper_gap_right": "upper_gap_right", "lower_gap_right": "lower_gap_right"},
+    "MZI + CPW modulator": {"input": "optical_left", "output": "optical_right", "rf_input": "rf_signal_left", "rf_output": "rf_signal_right"},
+    "MZI + segmented-electrode modulator": {"input": "optical_left", "output": "optical_right", "rf_input": "rf_signal_left", "rf_output": "rf_signal_right"},
     "CPW": {"signal_input": "signal_left", "upper_gap_input": "upper_gap_left", "lower_gap_input": "lower_gap_left", "signal_output": "signal_right", "upper_gap_output": "upper_gap_right", "lower_gap_output": "lower_gap_right", "input": "signal_left", "output": "signal_right"},
     "CPW open": {"signal_connection": "signal_left", "upper_gap_connection": "upper_gap_left", "lower_gap_connection": "lower_gap_left", "input": "signal_left", "reference": "reference_plane"},
     "CPW short": {"signal_connection": "signal_left", "upper_gap_connection": "upper_gap_left", "lower_gap_connection": "lower_gap_left", "input": "signal_left", "reference": "reference_plane"},
@@ -35,11 +42,21 @@ PORT_ALIASES: dict[str, dict[str, str]] = {
     "Symmetric CPW taper": {"signal_input": "signal_left", "upper_gap_input": "upper_gap_left", "lower_gap_input": "lower_gap_left", "signal_output": "signal_right", "upper_gap_output": "upper_gap_right", "lower_gap_output": "lower_gap_right", "input": "signal_left", "output": "signal_right"},
     "CPW bend": {"signal_start": "signal_start", "upper_gap_start": "upper_gap_start", "lower_gap_start": "lower_gap_start", "signal_end": "signal_end", "upper_gap_end": "upper_gap_end", "lower_gap_end": "lower_gap_end"},
     "Segmented electrode": {"input": "signal_left", "output": "signal_right", "signal_input": "signal_left", "signal_output": "signal_right", "upper_gap_input": "upper_gap_left", "lower_gap_input": "lower_gap_left", "upper_gap_output": "upper_gap_right", "lower_gap_output": "lower_gap_right"},
-    "Edge coupler": {"facet": "tip", "waveguide": "waveguide_end"},
+    "Edge coupler": {"facet": "tip", "slab_facet": "slab_start", "waveguide": "waveguide_end"},
+    "Exponential edge coupler": {"facet": "tip", "slab_facet": "slab_start", "waveguide": "waveguide_end"},
+    "Linear edge coupler": {"facet": "tip", "slab_facet": "slab_start", "waveguide": "waveguide_end"},
+    "Exponential edge coupler pair + feed": {"input": "left_tip", "output": "right_tip"},
+    "Linear edge coupler pair + feed": {"input": "left_tip", "output": "right_tip"},
     "Loopback mirror": {"input": "left_upper", "output": "left_lower", "bend_start": "upper_straight_end", "bend_end": "lower_s_bend_end"},
     "Feedline": {"input_gc_waveguide": "left_gc_point", "output_gc_waveguide": "right_gc_point"},
     "Ring + feedline": {"input_gc_waveguide": "left_gc_point", "output_gc_waveguide": "right_gc_point"},
     "Racetrack + feedline": {"input_gc_waveguide": "left_gc_point", "output_gc_waveguide": "right_gc_point"},
+    VERTICAL_RACETRACK_FEEDLINE_KIND: {
+        "input": "input_gc_point",
+        "output": "output_gc_point",
+        "input_gc_waveguide": "input_gc_point",
+        "output_gc_waveguide": "output_gc_point",
+    },
     "Ring + two feedlines": {"upper_input": "upper_left_gc", "upper_output": "upper_right_gc", "lower_input": "lower_left_gc", "lower_output": "lower_right_gc"},
 }
 
@@ -58,7 +75,7 @@ def component_local_ports(component: dict[str, Any]) -> dict[str, dict[str, Any]
     def add(name: str, center: tuple[float, float], outward: float, domain: str = "optical") -> None:
         ports[name] = {"center": center, "outward_orientation_deg": outward % 360.0, "domain": domain}
 
-    if kind in {"Straight", "Taper"}:
+    if kind in {"Straight", "Taper", "SLAB taper"}:
         add("left", (0.0, 0.0), 180.0); add("right", (float(p["length"]), 0.0), 0.0)
     elif kind == "S-bend":
         add("left", (0.0, 0.0), 180.0); add("right", (float(p["length"]), ms * float(p["offset"])), 0.0)
@@ -222,6 +239,102 @@ def component_local_ports(component: dict[str, Any]) -> dict[str, dict[str, Any]
                 left_bend = grating_route_bend_angle(p, mirrored, "gc_input_route", 180.0);right_bend = grating_route_bend_angle(p, mirrored, "gc_output_route", 0.0);left_gc, left_o = routed_gc_local_endpoint((0.0,0.0),180.0,left_bend,p);right_gc, right_o = routed_gc_local_endpoint((L,0.0),0.0,right_bend,p)
             add("left_gc_waveguide",left_gc,left_o)
             add("right_gc_waveguide",right_gc,right_o)
+    elif kind in MODULATOR_COMPONENT_KINDS:
+        q = resolve_modulator_layout(kind, p)
+
+        def reflected_point(point: tuple[float, float]) -> tuple[float, float]:
+            return (float(point[0]), ms * float(point[1]))
+
+        def reflected_angle(angle: float) -> float:
+            return ms * float(angle)
+
+        mzi_component = {
+            "kind": "MZI",
+            "mirrored": mirrored,
+            "params": q["mzi_parameters"],
+        }
+        mzi_ports = component_local_ports(mzi_component)
+        use_gc = bool(q["mzi_parameters"].get("add_grating_couplers", False))
+        left_name = "left_gc_waveguide" if use_gc else "left_external"
+        right_name = "right_gc_waveguide" if use_gc else "right_external"
+        mzi_x = float(q["mzi_start"][0])
+
+        def shifted_mzi_port(name: str) -> tuple[tuple[float, float], float]:
+            source = mzi_ports[name]
+            center = source["center"]
+            return (
+                (mzi_x + float(center[0]), float(center[1])),
+                float(source["outward_orientation_deg"]),
+            )
+
+        optical_left, optical_left_o = shifted_mzi_port(left_name)
+        optical_right, optical_right_o = shifted_mzi_port(right_name)
+        if bool(q["add_edge_coupler_tapers"]):
+            optical_left = tuple(q["optical_left"])
+            optical_right = tuple(q["optical_right"])
+            optical_left_o = 180.0
+            optical_right_o = 0.0
+            local_offset = float(q["edge_coupler_local_marker_vertical_offset"])
+            add(
+                "left_local_alignment_top",
+                reflected_point((float(optical_left[0]), local_offset)),
+                0.0,
+                "alignment",
+            )
+            add(
+                "left_local_alignment_bottom",
+                reflected_point((float(optical_left[0]), -local_offset)),
+                0.0,
+                "alignment",
+            )
+            add(
+                "right_local_alignment_top",
+                reflected_point((float(optical_right[0]), local_offset)),
+                0.0,
+                "alignment",
+            )
+            add(
+                "right_local_alignment_bottom",
+                reflected_point((float(optical_right[0]), -local_offset)),
+                0.0,
+                "alignment",
+            )
+        add("optical_left", optical_left, optical_left_o)
+        add("optical_right", optical_right, optical_right_o)
+
+        left_external = reflected_point(tuple(q["left_rf_external"]))
+        right_external = reflected_point(tuple(q["right_rf_external"]))
+        left_angle = reflected_angle(float(q["left_taper_angle"]))
+        right_angle = reflected_angle(float(q["right_taper_angle"]))
+        add("rf_signal_left", left_external, left_angle, "rf")
+        add("rf_signal_right", right_external, right_angle, "rf")
+
+        gap_offset = float(p["signal_width"]) / 2.0 + float(p["final_gap"]) / 2.0
+
+        def external_gap_points(
+            center: tuple[float, float], angle: float
+        ) -> tuple[tuple[float, float], tuple[float, float]]:
+            radians = math.radians(float(angle))
+            transverse = (-math.sin(radians), math.cos(radians))
+            upper = (
+                center[0] + gap_offset * transverse[0],
+                center[1] + gap_offset * transverse[1],
+            )
+            lower = (
+                center[0] - gap_offset * transverse[0],
+                center[1] - gap_offset * transverse[1],
+            )
+            return upper, lower
+
+        left_upper, left_lower = external_gap_points(left_external, left_angle)
+        right_upper, right_lower = external_gap_points(right_external, right_angle)
+        add("upper_gap_left", left_upper, left_angle, "alignment")
+        add("lower_gap_left", left_lower, left_angle, "alignment")
+        add("upper_gap_right", right_upper, right_angle, "alignment")
+        add("lower_gap_right", right_lower, right_angle, "alignment")
+        add("center", reflected_point(tuple(q["electrode_center"])), 0.0, "alignment")
+        add("active_start", reflected_point(tuple(q["optical_active_start"])), 180.0, "alignment")
+        add("active_end", reflected_point(tuple(q["optical_active_end"])), 0.0, "alignment")
     elif kind == "MZI + CPW module":
         mlen = mmi_total_length(p)
         sb = float(p["s_bend_length"]); arm = float(p["arm_length"])
@@ -252,6 +365,27 @@ def component_local_ports(component: dict[str, Any]) -> dict[str, dict[str, Any]
         add("lower_gap_right", (total, -ws/2.0 - ge/2.0), 0.0, "alignment")
         add("upper_ground_right", (total, ws/2.0 + ge + wg/2.0), 0.0, "rf")
         add("lower_ground_right", (total, -ws/2.0 - ge - wg/2.0), 0.0, "rf")
+    elif kind == "modulator_RF2_bridge":
+        L=float(p["length"]); signal=float(p["signal_width"]); ground=float(p["ground_width"]); gap=float(p["gap"]); separation=float(p["microstrip_separation"])
+        half_separation=separation/2.0
+        top_ground_y=half_separation+ground/2.0; top_signal_y=half_separation+ground+gap+signal/2.0
+        bottom_signal_y=-half_separation-signal/2.0; bottom_ground_y=-half_separation-signal-gap-ground/2.0
+        top_gap_y=half_separation+ground+gap/2.0; bottom_gap_y=-half_separation-signal-gap/2.0
+        add("top_signal_left",(0.0,top_signal_y),180.0,"rf"); add("top_signal_right",(L,top_signal_y),0.0,"rf")
+        add("top_ground_left",(0.0,top_ground_y),180.0,"rf"); add("top_ground_right",(L,top_ground_y),0.0,"rf")
+        add("bottom_signal_left",(0.0,bottom_signal_y),180.0,"rf"); add("bottom_signal_right",(L,bottom_signal_y),0.0,"rf")
+        add("bottom_ground_left",(0.0,bottom_ground_y),180.0,"rf"); add("bottom_ground_right",(L,bottom_ground_y),0.0,"rf")
+        add("top_gap_left",(0.0,top_gap_y),180.0,"alignment"); add("top_gap_right",(L,top_gap_y),0.0,"alignment")
+        add("bottom_gap_left",(0.0,bottom_gap_y),180.0,"alignment"); add("bottom_gap_right",(L,bottom_gap_y),0.0,"alignment")
+        add("bridge_center",(L/2.0,0.0),0.0,"rf"); add("center",(L/2.0,0.0),0.0,"alignment")
+    elif kind == "modulator_RF2":
+        L=float(p["length"]); signal=float(p["signal_width"]); ground=float(p["ground_width"]); gap=float(p["gap"])
+        signal_y=gap/2.0+signal/2.0; ground_y=-gap/2.0-ground/2.0
+        center_y=(gap/2.0+signal-gap/2.0-ground)/2.0
+        add("signal_left",(0.0,signal_y),180.0,"rf"); add("signal_right",(L,signal_y),0.0,"rf")
+        add("ground_left",(0.0,ground_y),180.0,"rf"); add("ground_right",(L,ground_y),0.0,"rf")
+        add("gap_center_left",(0.0,0.0),180.0,"alignment"); add("gap_center_right",(L,0.0),0.0,"alignment")
+        add("center",(L/2.0,center_y),0.0,"alignment")
     elif kind in {"CPW", "Tapered CPW"}:
         L=float(p["length"]); ws=float(p["signal_width"]); wg=float(p["ground_width"])
         if kind=="CPW": gi=go=float(p["gap"])
@@ -321,21 +455,70 @@ def component_local_ports(component: dict[str, Any]) -> dict[str, dict[str, Any]
         add("lower_gap_right", (L, q["lower_gap_center"]), 0.0, "alignment")
         add("upper_ground_right", (L, ws/2.0+gap+wg/2.0), 0.0, "rf")
         add("lower_ground_right", (L, -ws/2.0-gap-wg/2.0), 0.0, "rf")
-    elif kind == "Edge coupler":
-        taper=float(p["taper_length"]); total=taper+float(p["wg_straight_length"])
-        add("tip",(0,0),180); add("taper_end",(taper,0),0); add("waveguide_end",(total,0),0)
+    elif kind in EDGE_COUPLER_FEED_KINDS:
+        values = resolved_edge_coupler_parameters(p)
+        q = edge_coupler_feed_landmarks(values)
+        mark_dy = values["local_alignment_mark_vertical_offset"]
+        add("left_slab_facet", (0.0, 0.0), 180.0, "alignment")
+        add("left_tip", (q["top_tip_x"], 0.0), 180.0)
+        add("feed_left", (q["left_connection_x"], 0.0), 0.0)
+        add("feed_right", (q["right_connection_x"], 0.0), 180.0)
+        add("right_tip", (q["right_tip_x"], 0.0), 0.0)
+        add("right_slab_facet", (q["total_length"], 0.0), 0.0, "alignment")
+        add("left_local_alignment_top", (q["top_tip_x"], ms * mark_dy), 0.0, "alignment")
+        add("left_local_alignment_bottom", (q["top_tip_x"], -ms * mark_dy), 0.0, "alignment")
+        add("right_local_alignment_top", (q["right_tip_x"], ms * mark_dy), 0.0, "alignment")
+        add("right_local_alignment_bottom", (q["right_tip_x"], -ms * mark_dy), 0.0, "alignment")
+    elif kind in EDGE_COUPLER_COMPONENT_KINDS:
+        values = resolved_edge_coupler_parameters(p)
+        taper = values["top_taper_length"]
+        offset = values["top_start_offset"]
+        narrow_straight = values["narrow_slab_straight_length"]
+        wide_straight = values["wide_slab_straight_length"]
+        slab_taper_start = narrow_straight
+        slab_taper_end = slab_taper_start + offset + taper
+        slab_total = slab_taper_end + wide_straight
+        add("slab_start",(0,0),180,"alignment")
+        add("slab_taper_start",(slab_taper_start,0),180,"alignment")
+        add("slab_taper_end",(slab_taper_end,0),0,"alignment")
+        add("slab_end",(slab_total,0),0,"alignment")
+        add("tip",(slab_taper_start+offset,0),180)
+        add("taper_end",(slab_taper_end,0),0)
+        add("waveguide_end",(slab_taper_end,0),0)
+        mark_x = slab_taper_start + offset
+        mark_dy = values["local_alignment_mark_vertical_offset"]
+        add("local_alignment_top",(mark_x,mark_dy),0,"alignment")
+        add("local_alignment_bottom",(mark_x,-mark_dy),0,"alignment")
     elif kind == "Loopback mirror":
         q=loopback_landmarks(p, mirrored)
         add("left_upper",q["left_upper"],180); add("left_lower",q["left_lower"],180); add("upper_straight_end",q["upper_straight_end"],0); add("lower_straight_end",q["lower_straight_end"],0); add("upper_s_bend_end",q["upper_s_bend_end"],0); add("lower_s_bend_end",q["lower_s_bend_end"],180); add("arc_center",q["arc_center"],0,"alignment")
+    elif kind == VERTICAL_RACETRACK_FEEDLINE_KIND:
+        layout = resolve_vertical_racetrack_feedline(p, mirrored)
+        q = feedline_landmarks(layout["feed_params"], False)
+        feed_start = np.asarray(layout["feed_start"], dtype=float)
+        feed_angle = float(layout["feed_orientation_deg"])
+
+        def mapped(point: tuple[float, float]) -> tuple[float, float]:
+            return tuple(feed_start + rot(point, feed_angle))
+
+        add("input_gc_point", mapped(q["input"]), feed_angle + 180.0)
+        add("output_gc_point", mapped(q["output"]), feed_angle)
+        add("input_s_bend_end", mapped(q["first_s_bend_end"]), feed_angle)
+        add("coupling_section_start", mapped(q["coupling_straight_start"]), feed_angle)
+        add("coupling_point", layout["coupling_center"], feed_angle, "alignment")
+        add("coupling_section_end", mapped(q["lc_end"]), feed_angle)
+        add("output_s_bend_start", mapped(q["output_s_bend_start"]), feed_angle)
+        add("output_s_bend_end", mapped(q["second_s_bend_end"]), feed_angle)
+        add("racetrack_center", (0.0, 0.0), 0.0, "alignment")
     elif kind in {"Feedline", "Ring + feedline", "Racetrack + feedline"}:
         q=feedline_landmarks(p, mirrored)
-        add("left_gc_point",q["input"],180); add("left_straight_end",q["input_straight_end"],0); add("first_s_bend_end",q["first_s_bend_end"],0); add("Lc_end",q["lc_end"],0); add("second_s_bend_end",q["second_s_bend_end"],0); add("right_gc_point",q["output"],0)
+        add("left_gc_point",q["input"],180); add("left_straight_end",q["input_straight_end"],0); add("first_s_bend_end",q["first_s_bend_end"],0); add("coupling_straight_start",q["coupling_straight_start"],0); add("Lc_end",q["lc_end"],0); add("output_s_bend_start",q["output_s_bend_start"],0); add("second_s_bend_end",q["second_s_bend_end"],0); add("right_gc_point",q["output"],0)
         if kind=="Ring + feedline":
             side=(1 if str(p.get("resonator_side","upper")).lower()=="upper" else -1)*ms; y=q["first_s_bend_end"][1]+side*(float(p["wg_width"])/2+float(p["coupling_gap"])+float(p["ring_width"])/2+float(p["ring_radius"]))
-            for i,x in enumerate(resonator_x_positions(p,q["first_s_bend_end"][0],q["lc_end"][0]),1): add(f"ring_center_{i}",(float(x),float(y)),0,"alignment")
+            for i,x in enumerate(resonator_x_positions(p,q["coupling_straight_start"][0],q["lc_end"][0]),1): add(f"ring_center_{i}",(float(x),float(y)),0,"alignment")
         elif kind=="Racetrack + feedline":
             side=(1 if str(p.get("resonator_side","upper")).lower()=="upper" else -1)*ms; y=q["first_s_bend_end"][1]+side*(float(p["wg_width"])/2+float(p["coupling_gap"])+float(p["racetrack_width"])/2+float(p["racetrack_radius"]))
-            for i,x in enumerate(resonator_x_positions(p,q["first_s_bend_end"][0],q["lc_end"][0]),1): add(f"racetrack_center_{i}",(float(x),float(y)),0,"alignment")
+            for i,x in enumerate(resonator_x_positions(p,q["coupling_straight_start"][0],q["lc_end"][0]),1): add(f"racetrack_center_{i}",(float(x),float(y)),0,"alignment")
     elif kind == "Ring + two feedlines":
         q=ring_two_feedline_landmarks(p)
         add("upper_left_gc",q["upper_left_gc"],180); add("upper_left_bus",q["upper_left_bus"],0); add("upper_right_bus",q["upper_right_bus"],0); add("upper_right_gc",q["upper_right_gc"],0)
@@ -349,9 +532,13 @@ def component_local_ports(component: dict[str, Any]) -> dict[str, dict[str, Any]
         length=float(p.get("length",50.0));add("left",(-length/2,0.0),180.0);add("right",(length/2,0.0),0.0)
     elif kind.startswith("Photonic crystal ") or kind == "Boolean geometry":
         add("center",(0.0,0.0),0.0,"alignment")
-    elif kind in {"Ring", "Elliptical ring", "Racetrack", "Text / Number", "Square mark", "Cross mark", "Pointy cross mark", "Cross + squares mark", "Vernier mark"}:
+    elif kind in {"Ring", "Elliptical ring", "Racetrack", "Euler racetrack", "Text / Number", "Square mark", "Cross mark", "Pointy cross mark", "Cross + squares mark", "Four-corner cross + squares marks", "Vernier mark"}:
         add("center",(0,0),0,"alignment")
-    elif kind in {"Chip outline", "E-beam multipass"} or kind in SIMULATION_COMPONENT_KINDS:
+    elif kind == "Chip outline":
+        add("center",(0.0,0.0),0.0,"alignment")
+        for side, center in chip_outline_global_marker_centers(p).items():
+            add(f"ebeam_global_{side}",center,0.0,"alignment")
+    elif kind == "E-beam multipass" or kind in SIMULATION_COMPONENT_KINDS:
         add("center",(0.0,0.0),0.0,"alignment")
     else:
         raise ValueError(f"Unsupported component type: {kind}")

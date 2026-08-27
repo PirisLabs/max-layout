@@ -11,15 +11,20 @@ import gdstk
 import numpy as np
 
 from ..backend import backend
-from ..constants import DEFAULT_COMPONENT_VALUES, DEFAULT_DATATYPE, EBEAM_LAYER, GC_COMPOSITE_KINDS, GC_LAYER, MARKER_COMPONENT_KINDS, MARKER_LAYER, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_COMPONENT_KINDS, RF_LAYER, SIMULATION_COMPONENT_KINDS
+from ..constants import DEFAULT_COMPONENT_VALUES, DEFAULT_DATATYPE, EBEAM_LAYER, EDGE_COUPLER_COMPONENT_KINDS, EDGE_COUPLER_FEED_KINDS, EXPONENTIAL_EDGE_COUPLER_FEED_KIND, FEEDLINE_LAYER, GC_COMPOSITE_KINDS, GC_LAYER, GLOBAL_MARKER_LAYER, LAYER_NAME_MAP, LINEAR_EDGE_COUPLER_FEED_KIND, MARKER_COMPONENT_KINDS, MARKER_LAYER, MODULATOR_COMPONENT_KINDS, PHOTONIC_COMPONENT_KINDS, PHOTONIC_LAYER, RF_BENDS_LAYER, RF_COMPONENT_KINDS, RF_LAYER, SIMULATION_COMPONENT_KINDS, SLAB_LAYER, VERTICAL_RACETRACK_FEEDLINE_KIND, WG_TIP_LAYER, edge_coupler_layer_name_map, edge_coupler_local_marker_layer, edge_coupler_slab_layer, edge_coupler_total_count
 from ..gds.couplers import add_parent_focusing_gc, add_routed_parent_gc, add_soi_grating_coupler, add_three_euler_inward_gc
 from ..gds.ebeam import add_ebeam_field_outline, add_ebeam_parameter_text, multipass_field_layout
 from ..gds.primitives import add_rect, copy_cell_polygons_to_top
+from ..geometry.edge_coupler import assign_edge_coupler_layers, edge_coupler_feed_landmarks, edge_coupler_slab_profile, migrate_edge_coupler_parameters, resolved_edge_coupler_parameters
+from ..geometry.chip_outline import chip_outline_global_marker_centers
 from ..geometry.euler import grating_route_bend_angle, mmi_gc_fanout_local_points
-from ..geometry.landmarks import cpw_bend_landmarks, feedline_landmarks, loopback_landmarks, resonator_x_positions, ring_two_feedline_landmarks, segmented_electrode_landmarks
+from ..geometry.landmarks import cpw_bend_landmarks, feedline_landmarks, loopback_landmarks, resonator_x_positions, resolved_feedline_s_bend_length, ring_two_feedline_landmarks, segmented_electrode_landmarks
+from ..geometry.modulator import resolve_modulator_layout
 from ..geometry.rf_taper import _gap_transition_values, gap_profile, rf_taper_point_count, symmetric_cpw_taper_profile
+from ..geometry.slab_taper import slab_taper_profile
 from ..geometry.shapes import _capsule_polygons, cpw_annular_sector_points, mmi_total_length
 from ..geometry.transforms import _transform_polygon, add_local_polygon, rot, transform_points
+from ..geometry.vertical_racetrack_feedline import resolve_vertical_racetrack_feedline
 from ..ports import component_global_ports, component_local_ports, normalize_port_name, solve_attachment
 from ..utils import compact_parameter_range, inclusive_sweep, numeric_list, safe_json_copy
 
@@ -276,30 +281,65 @@ def add_feedline_to_gds(component: dict[str, Any], top: gdstk.Cell) -> dict[str,
     if bool(p.get("add_grating_couplers", True)):
         add_parent_focusing_gc(
             top, p, start, (orientation + 180.0) % 360.0, width,
-            PHOTONIC_LAYER, DEFAULT_DATATYPE, f"FEEDLINE_INPUT_GC_{uid}",
+            layer, datatype, f"FEEDLINE_INPUT_GC_{uid}",
         )
 
     add_rect(top, np.array([[0.0, -width/2.0], [float(p["input_straight_length"]), -width/2.0], [float(p["input_straight_length"]), width/2.0], [0.0, width/2.0]], dtype=float), start, orientation, layer, datatype)
 
     first_start = tuple(np.asarray(start) + rot(points["input_straight_end"], orientation))
     first_offset = points["first_s_bend_end"][1]
+    s_bend_length = resolved_feedline_s_bend_length(p)
     first_s, first_end, first_orientation, *_ = backend.make_s_bend_gdstk(
-        length=float(p["s_bend_length"]), offset=first_offset, width=width,
+        length=s_bend_length, offset=first_offset, width=width,
         start_center=first_start, orientation_deg=orientation, layer=layer, datatype=datatype,
         tolerance=float(p.get("tolerance", 0.001)),
     )
     top.add(first_s)
 
-    add_rect(top, np.array([[0.0, -width/2.0], [float(p["Lc"]), -width/2.0], [float(p["Lc"]), width/2.0], [0.0, width/2.0]], dtype=float), first_end, first_orientation, layer, datatype)
+    pre_coupling = float(p.get("pre_coupling_straight_length", 0.0))
+    if pre_coupling < 0.0:
+        raise ValueError("Feedline pre_coupling_straight_length cannot be negative.")
+    if pre_coupling > 0.0:
+        add_rect(top, np.array([[0.0, -width/2.0], [pre_coupling, -width/2.0], [pre_coupling, width/2.0], [0.0, width/2.0]], dtype=float), first_end, first_orientation, layer, datatype)
+    coupling_start = tuple(np.asarray(first_end) + rot((pre_coupling, 0.0), first_orientation))
 
-    second_start = tuple(np.asarray(first_end) + rot((float(p["Lc"]), 0.0), first_orientation))
-    second_offset = points["second_s_bend_end"][1] - points["lc_end"][1]
-    second_s, second_end, second_orientation, *_ = backend.make_s_bend_gdstk(
-        length=float(p["s_bend_length"]), offset=second_offset, width=width,
-        start_center=second_start, orientation_deg=first_orientation, layer=layer, datatype=datatype,
-        tolerance=float(p.get("tolerance", 0.001)),
+    add_rect(top, np.array([[0.0, -width/2.0], [float(p["Lc"]), -width/2.0], [float(p["Lc"]), width/2.0], [0.0, width/2.0]], dtype=float), coupling_start, first_orientation, layer, datatype)
+
+    lc_end = tuple(np.asarray(coupling_start) + rot((float(p["Lc"]), 0.0), first_orientation))
+    post_coupling = float(p.get("post_coupling_straight_length", 0.0))
+    if post_coupling < 0.0:
+        raise ValueError("Feedline post_coupling_straight_length cannot be negative.")
+    if post_coupling > 0.0:
+        add_rect(
+            top,
+            np.array(
+                [
+                    [0.0, -width / 2.0],
+                    [post_coupling, -width / 2.0],
+                    [post_coupling, width / 2.0],
+                    [0.0, width / 2.0],
+                ],
+                dtype=float,
+            ),
+            lc_end,
+            first_orientation,
+            layer,
+            datatype,
+        )
+    second_start = tuple(
+        np.asarray(lc_end) + rot((post_coupling, 0.0), first_orientation)
     )
-    top.add(second_s)
+    if bool(p.get("add_output_s_bend", True)):
+        second_offset = points["second_s_bend_end"][1] - points["lc_end"][1]
+        second_s, second_end, second_orientation, *_ = backend.make_s_bend_gdstk(
+            length=s_bend_length, offset=second_offset, width=width,
+            start_center=second_start, orientation_deg=first_orientation, layer=layer, datatype=datatype,
+            tolerance=float(p.get("tolerance", 0.001)),
+        )
+        top.add(second_s)
+    else:
+        second_end = second_start
+        second_orientation = first_orientation
 
     add_rect(top, np.array([[0.0, -width/2.0], [float(p["output_straight_length"]), -width/2.0], [float(p["output_straight_length"]), width/2.0], [0.0, width/2.0]], dtype=float), second_end, second_orientation, layer, datatype)
 
@@ -307,7 +347,7 @@ def add_feedline_to_gds(component: dict[str, Any], top: gdstk.Cell) -> dict[str,
     if bool(p.get("add_grating_couplers", True)):
         add_parent_focusing_gc(
             top, p, output_global, orientation, width,
-            PHOTONIC_LAYER, DEFAULT_DATATYPE, f"FEEDLINE_OUTPUT_GC_{uid}",
+            layer, datatype, f"FEEDLINE_OUTPUT_GC_{uid}",
         )
     return points
 
@@ -452,7 +492,16 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
         return
     start = (float(component["x"]), float(component["y"])); orientation = float(component.get("orientation_deg", 0.0)) % 360.0
     mirrored = bool(component.get("mirrored", False)); ms = -1.0 if mirrored else 1.0
-    if kind == "E-beam multipass":
+    if component.get("_layer_override") is not None:
+        # Composite builders may deliberately split native child geometry
+        # across named fabrication layers after the top-level component has
+        # already been canonicalized.
+        layer = int(component["_layer_override"])
+        datatype = int(component.get("_datatype_override", DEFAULT_DATATYPE))
+    elif kind == "SLAB taper":
+        layer = SLAB_LAYER
+        datatype = DEFAULT_DATATYPE
+    elif kind == "E-beam multipass":
         # EPBG write fields always export on the dedicated Ebeam layer.
         layer = EBEAM_LAYER
         datatype = DEFAULT_DATATYPE
@@ -460,7 +509,11 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
         layer = RF_LAYER
         datatype = DEFAULT_DATATYPE
     elif kind in MARKER_COMPONENT_KINDS:
-        layer = MARKER_LAYER
+        layer = (
+            GLOBAL_MARKER_LAYER
+            if kind == "Square mark" and bool(p.get("dicing_marker", False))
+            else MARKER_LAYER
+        )
         datatype = DEFAULT_DATATYPE
     elif kind == "Grating coupler":
         layer = GC_LAYER
@@ -513,6 +566,17 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
     if kind == "Taper":
         length = float(p["length"]); w0 = float(p["width_start"]); w1 = float(p["width_end"])
         add_rect(top, np.array([[0,-w0/2],[length,-w1/2],[length,w1/2],[0,w0/2]], float), start, orientation, layer, datatype); return
+    if kind == "SLAB taper":
+        xs, widths = slab_taper_profile(p)
+        upper = np.column_stack((xs, widths / 2.0))
+        lower = np.column_stack((xs[::-1], -widths[::-1] / 2.0))
+        polygon = gdstk.Polygon(
+            transform_points(np.vstack((upper, lower)), start, orientation),
+            layer=SLAB_LAYER,
+            datatype=DEFAULT_DATATYPE,
+        )
+        top.add(*polygon.fracture(max_points=4000, precision=0.001))
+        return
     if kind == "S-bend":
         path, *_ = backend.make_s_bend_gdstk(length=float(p["length"]), offset=ms*float(p["offset"]), width=float(p["width"]), start_center=start, orientation_deg=orientation, layer=layer, datatype=datatype, tolerance=float(p["tolerance"])); top.add(path); return
     if kind == "Euler bend":
@@ -895,6 +959,100 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
                 for field_index in range(field_count):
                     local_x=coverage_center+(field_index-(field_count-1)/2)*field;field_center=tuple(np.asarray(row_start)+rot((local_x,0),orientation));add_ebeam_field_outline(top,field_center,orientation,field);add_ebeam_parameter_text(top,f"MZI{index+1} L={total:g}",field_center,orientation,field,float(p.get("parameter_text_height",10)))
         return
+    if kind in MODULATOR_COMPONENT_KINDS:
+        layout = resolve_modulator_layout(kind, p)
+
+        def add_modulator_child(
+            child_kind: str,
+            child_parameters: dict[str, Any],
+            local_start: tuple[float, float],
+            local_orientation: float,
+            child_mirrored: bool = False,
+            child_index: int = 0,
+        ) -> None:
+            local_x = float(local_start[0])
+            local_y = -float(local_start[1]) if mirrored else float(local_start[1])
+            local_angle = -float(local_orientation) if mirrored else float(local_orientation)
+            child_start = tuple(np.asarray(start) + rot((local_x, local_y), orientation))
+            _add_component_geometry_to_cell(
+                {
+                    "uid": uid * 10 + child_index + 1,
+                    "kind": child_kind,
+                    "x": child_start[0],
+                    "y": child_start[1],
+                    "orientation_deg": (orientation + local_angle) % 360.0,
+                    "mirrored": bool(child_mirrored) ^ bool(mirrored),
+                    "attachment": None,
+                    "params": child_parameters,
+                    "_layer_override": child_parameters.get("layer"),
+                    "_datatype_override": child_parameters.get(
+                        "datatype", DEFAULT_DATATYPE
+                    ),
+                },
+                top,
+            )
+
+        # The center electrode and both outer RF routes use one resolved set of
+        # widths and gaps.  Every child starts at the preceding child's exact
+        # signal port, avoiding floating-point/manual-placement seams.
+        add_modulator_child(
+            str(layout["electrode_kind"]),
+            dict(layout["electrode_parameters"]),
+            (0.0, 0.0),
+            0.0,
+            child_index=0,
+        )
+        add_modulator_child(
+            "CPW bend",
+            dict(layout["bend_parameters"]),
+            tuple(layout["left_bend_start"]),
+            180.0,
+            child_index=1,
+        )
+        add_modulator_child(
+            "CPW bend",
+            dict(layout["bend_parameters"]),
+            tuple(layout["right_bend_start"]),
+            0.0,
+            child_index=2,
+        )
+        add_modulator_child(
+            "Tapered CPW",
+            dict(layout["taper_parameters"]),
+            tuple(layout["left_bend_end"]),
+            float(layout["left_taper_angle"]),
+            child_index=3,
+        )
+        add_modulator_child(
+            "Tapered CPW",
+            dict(layout["taper_parameters"]),
+            tuple(layout["right_bend_end"]),
+            float(layout["right_taper_angle"]),
+            child_index=4,
+        )
+        add_modulator_child(
+            "MZI",
+            dict(layout["mzi_parameters"]),
+            tuple(layout["mzi_start"]),
+            0.0,
+            child_index=5,
+        )
+        if bool(layout["add_edge_coupler_tapers"]):
+            add_modulator_child(
+                str(layout["edge_coupler_kind"]),
+                dict(layout["left_edge_coupler_parameters"]),
+                tuple(layout["left_edge_coupler_start"]),
+                0.0,
+                child_index=6,
+            )
+            add_modulator_child(
+                str(layout["edge_coupler_kind"]),
+                dict(layout["right_edge_coupler_parameters"]),
+                tuple(layout["right_edge_coupler_start"]),
+                180.0,
+                child_index=7,
+            )
+        return
     if kind in {"MZI", "MZI vertical GC"}:
         common = dict(
             mmi_width=float(p["mmi_width"]), mmi_length=float(p["mmi_length"]),
@@ -1034,6 +1192,52 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
         return
     if kind == "Racetrack":
         add_racetrack_to_gds(top, (0.0, 0.0), float(p["radius"]), float(p["coupling_length"]), float(p["width"]), int(p.get("points", 128)), start, orientation, layer, datatype); return
+    if kind == VERTICAL_RACETRACK_FEEDLINE_KIND:
+        layout = resolve_vertical_racetrack_feedline(p, mirrored)
+        add_euler_racetrack_to_gds(
+            top,
+            (0.0, 0.0),
+            float(p["racetrack_length"]),
+            float(p["R_eff"]),
+            float(p["racetrack_width"]),
+            start,
+            orientation,
+            layer,
+            datatype,
+            max(101, int(p.get("points", 4001))),
+        )
+        feed_start = tuple(
+            np.asarray(start, dtype=float)
+            + rot(layout["feed_start"], orientation)
+        )
+        add_feedline_to_gds(
+            {
+                "uid": uid * 1000 + 1,
+                "kind": "Feedline",
+                "x": feed_start[0],
+                "y": feed_start[1],
+                "orientation_deg": orientation + float(layout["feed_orientation_deg"]),
+                "mirrored": False,
+                "attachment": None,
+                "params": layout["feed_params"],
+            },
+            top,
+        )
+        return
+    if kind == "Euler racetrack":
+        add_euler_racetrack_to_gds(
+            top,
+            (0.0, 0.0),
+            float(p["racetrack_length"]),
+            float(p["R_eff"]),
+            float(p["width"]),
+            start,
+            orientation,
+            layer,
+            datatype,
+            max(101, int(p.get("points", 4001))),
+        )
+        return
     if kind == "Double-ring test block":
         active=set(p.get("sweep_parameters",["coupling_gap","ring_radius"]));gaps=numeric_list(p.get("gap_values","0.5,0.6,0.7,0.8,0.9,1.0")) if "coupling_gap" in active else [float(p.get("nominal_gap",.7))];radii=numeric_list(p.get("radius_values","20,50,100,200")) if "ring_radius" in active else [float(p.get("nominal_radius",200))]
         if not gaps or not radii or any(v<=0 for v in gaps+radii):raise ValueError("Ring test-block gaps and radii must be positive.")
@@ -1128,13 +1332,216 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
                     poly.translate(-float(center_local[0]),-float(center_local[1]))
                     top.add(_transform_polygon(poly,start,orientation))
         return
-    if kind == "Edge coupler":
-        tip=float(p["tip_width"]); width=float(p["wg_width"]); taper=float(p["taper_length"]); output=float(p["wg_straight_length"])
-        if tip <= 0 or width <= 0 or taper <= 0 or output < 0:
-            raise ValueError("Edge coupler widths and taper_length must be positive; wg_straight_length cannot be negative.")
-        # One true trapezoidal inverse taper followed by an optional straight.
-        add_rect(top,np.array([[0,-tip/2],[taper,-width/2],[taper,width/2],[0,tip/2]],float),start,orientation,layer,datatype)
-        if output>0: add_rect(top,np.array([[taper,-width/2],[taper+output,-width/2],[taper+output,width/2],[taper,width/2]],float),start,orientation,layer,datatype)
+    if kind in EDGE_COUPLER_FEED_KINDS:
+        values = resolved_edge_coupler_parameters(p)
+        landmarks = edge_coupler_feed_landmarks(values)
+        primitive_kind = (
+            "Linear edge coupler"
+            if kind == LINEAR_EDGE_COUPLER_FEED_KIND
+            else "Exponential edge coupler"
+        )
+        number = max(1, int(component.get("edge_coupler_number", 1)))
+        left_parameters = dict(p)
+        left_parameters.update(
+            {
+                "slab_layer": int(p.get("slab_layer", edge_coupler_slab_layer(number))),
+                "local_alignment_mark_name": str(
+                    p.get("local_alignment_mark_name", f"L{number}")
+                ),
+                "local_alignment_mark_layer": int(
+                    p.get(
+                        "local_alignment_mark_layer",
+                        edge_coupler_local_marker_layer(number),
+                    )
+                ),
+            }
+        )
+        right_number = number + 1
+        right_parameters = dict(p)
+        right_parameters.update(
+            {
+                "slab_layer": int(
+                    p.get("right_slab_layer", edge_coupler_slab_layer(right_number))
+                ),
+                "slab_datatype": int(p.get("right_slab_datatype", DEFAULT_DATATYPE)),
+                "local_alignment_mark_name": str(
+                    p.get("right_local_alignment_mark_name", f"L{right_number}")
+                ),
+                "local_alignment_mark_layer": int(
+                    p.get(
+                        "right_local_alignment_mark_layer",
+                        edge_coupler_local_marker_layer(right_number),
+                    )
+                ),
+                "local_alignment_mark_datatype": int(
+                    p.get("right_local_alignment_mark_datatype", DEFAULT_DATATYPE)
+                ),
+            }
+        )
+        _add_component_geometry_to_cell(
+            {
+                "uid": uid * 10 + 1,
+                "kind": primitive_kind,
+                "x": start[0],
+                "y": start[1],
+                "orientation_deg": orientation,
+                "mirrored": mirrored,
+                "params": left_parameters,
+            },
+            top,
+        )
+        right_origin = tuple(
+            np.asarray(start)
+            + rot((float(landmarks["right_origin_x"]), 0.0), orientation)
+        )
+        _add_component_geometry_to_cell(
+            {
+                "uid": uid * 10 + 2,
+                "kind": primitive_kind,
+                "x": right_origin[0],
+                "y": right_origin[1],
+                "orientation_deg": (orientation + 180.0) % 360.0,
+                "mirrored": mirrored,
+                "params": right_parameters,
+            },
+            top,
+        )
+        feed_width = values["top_end_width"]
+        if feed_width <= 0.0:
+            raise ValueError("Edge-coupler feed waveguide width must be positive.")
+        add_rect(
+            top,
+            np.array(
+                [
+                    [landmarks["left_connection_x"], -feed_width / 2.0],
+                    [landmarks["right_connection_x"], -feed_width / 2.0],
+                    [landmarks["right_connection_x"], feed_width / 2.0],
+                    [landmarks["left_connection_x"], feed_width / 2.0],
+                ],
+                float,
+            ),
+            start,
+            orientation,
+            PHOTONIC_LAYER,
+            DEFAULT_DATATYPE,
+        )
+        return
+    if kind in EDGE_COUPLER_COMPONENT_KINDS:
+        values = resolved_edge_coupler_parameters(p)
+        length = values["top_taper_length"]
+        top_start_offset = values["top_start_offset"]
+        total_length = length + top_start_offset
+        narrow_straight_length = values["narrow_slab_straight_length"]
+        wide_straight_length = values["wide_slab_straight_length"]
+        slab_taper_start = narrow_straight_length
+        slab_taper_end = slab_taper_start + total_length
+        slab_initial = values["slab_start_width"]
+        slab_final = values["slab_end_width"]
+        top_initial = values["top_tip_width"]
+        top_final = values["top_end_width"]
+        factor = values["slab_exponential_factor"]
+        local_mark_size = values["local_alignment_mark_size"]
+        local_mark_offset = values["local_alignment_mark_vertical_offset"]
+        if (
+            length <= 0.0
+            or slab_initial <= 0.0
+            or slab_final <= 0.0
+            or top_initial <= 0.0
+            or top_final <= 0.0
+            or factor <= 0.0
+            or top_start_offset < 0.0
+            or narrow_straight_length < 0.0
+            or wide_straight_length < 0.0
+            or local_mark_size <= 0.0
+            or local_mark_offset < 0.0
+        ):
+            raise ValueError(
+                "Edge coupler length, SLAB widths, top widths, and exponential "
+                "factor and local mark size must be positive; offsets and straight "
+                "lengths cannot be negative."
+            )
+
+        # Narrow- and wide-side SLAB-only straights surround the unchanged
+        # L1 + L2 design. The top WG still begins at L1 and spans only L2.
+        slab_xs, slab_widths = edge_coupler_slab_profile(values, kind)
+        slab_xs = slab_xs + slab_taper_start
+        slab_upper = np.column_stack((slab_xs, slab_widths / 2.0))
+        slab_lower = np.column_stack((slab_xs[::-1], -slab_widths[::-1] / 2.0))
+        if narrow_straight_length > 0.0:
+            add_rect(
+                top,
+                np.array(
+                    [
+                        [0.0, -slab_initial / 2.0],
+                        [slab_taper_start, -slab_initial / 2.0],
+                        [slab_taper_start, slab_initial / 2.0],
+                        [0.0, slab_initial / 2.0],
+                    ],
+                    float,
+                ),
+                start,
+                orientation,
+                values["slab_layer"],
+                DEFAULT_DATATYPE,
+            )
+        slab_polygon = gdstk.Polygon(
+            transform_points(np.vstack((slab_upper, slab_lower)), start, orientation),
+            layer=values["slab_layer"],
+            datatype=DEFAULT_DATATYPE,
+        )
+        top.add(*slab_polygon.fracture(max_points=4000, precision=0.001))
+        if wide_straight_length > 0.0:
+            add_rect(
+                top,
+                np.array(
+                    [
+                        [slab_taper_end, -slab_final / 2.0],
+                        [slab_taper_end + wide_straight_length, -slab_final / 2.0],
+                        [slab_taper_end + wide_straight_length, slab_final / 2.0],
+                        [slab_taper_end, slab_final / 2.0],
+                    ],
+                    float,
+                ),
+                start,
+                orientation,
+                values["slab_layer"],
+                DEFAULT_DATATYPE,
+            )
+        add_rect(
+            top,
+            np.array(
+                [
+                    [slab_taper_start + top_start_offset, -top_initial / 2.0],
+                    [slab_taper_end, -top_final / 2.0],
+                    [slab_taper_end, top_final / 2.0],
+                    [slab_taper_start + top_start_offset, top_initial / 2.0],
+                ],
+                float,
+            ),
+            start,
+            orientation,
+            WG_TIP_LAYER,
+            DEFAULT_DATATYPE,
+        )
+        top_start_x = slab_taper_start + top_start_offset
+        half_mark = local_mark_size / 2.0
+        for mark_y in (local_mark_offset, -local_mark_offset):
+            add_rect(
+                top,
+                np.array(
+                    [
+                        [top_start_x - half_mark, mark_y - half_mark],
+                        [top_start_x + half_mark, mark_y - half_mark],
+                        [top_start_x + half_mark, mark_y + half_mark],
+                        [top_start_x - half_mark, mark_y + half_mark],
+                    ],
+                    float,
+                ),
+                start,
+                orientation,
+                values["local_alignment_mark_layer"],
+                DEFAULT_DATATYPE,
+            )
         return
     if kind == "Loopback mirror":
         q=loopback_landmarks(p,mirrored); width=float(p["width"]); lc=float(p["Lc"]); sb=float(p["s_bend_length"]); radius=float(p["arc_radius"]); offset=float(q["offset"][0])
@@ -1161,7 +1568,7 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             bus_y = points["first_s_bend_end"][1]
             radius = float(p["ring_radius"]); ring_width = float(p["ring_width"])
             y = bus_y + side * (float(p["wg_width"])/2.0 + float(p["coupling_gap"]) + ring_width/2.0 + radius)
-            for x in resonator_x_positions(p, points["first_s_bend_end"][0], points["lc_end"][0]):
+            for x in resonator_x_positions(p, points["coupling_straight_start"][0], points["lc_end"][0]):
                 add_ring_to_gds(top, (x, y), radius, ring_width, 256, start, orientation, int(p.get("resonator_layer",layer)), int(p.get("resonator_datatype",datatype)))
         elif kind == "Racetrack + feedline":
             side = 1.0 if str(p.get("resonator_side", "upper")).lower() == "upper" else -1.0
@@ -1176,11 +1583,11 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             if total_length is not None:
                 straight, _arc, height = euler_racetrack_metrics(float(total_length), radius)
                 y = bus_y + side * (float(p["wg_width"])/2.0 + float(p["coupling_gap"]) + race_width/2.0 + height/2.0)
-                for x in resonator_x_positions(p, points["first_s_bend_end"][0], points["lc_end"][0]):
+                for x in resonator_x_positions(p, points["coupling_straight_start"][0], points["lc_end"][0]):
                     add_euler_racetrack_to_gds(top, (x, y), float(total_length), radius, race_width, start, orientation, int(p.get("resonator_layer",layer)), int(p.get("resonator_datatype",datatype)))
             else:
                 y = bus_y + side * (float(p["wg_width"])/2.0 + float(p["coupling_gap"]) + race_width/2.0 + radius)
-                for x in resonator_x_positions(p, points["first_s_bend_end"][0], points["lc_end"][0]):
+                for x in resonator_x_positions(p, points["coupling_straight_start"][0], points["lc_end"][0]):
                     add_racetrack_to_gds(top, (x, y), radius, float(p["racetrack_coupling_length"]), race_width, 128, start, orientation, int(p.get("resonator_layer",layer)), int(p.get("resonator_datatype",datatype)))
         return
     if kind == "CPW":
@@ -1188,6 +1595,33 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
         add_rect(top,np.array([[0,-ws/2],[length,-ws/2],[length,ws/2],[0,ws/2]],float),start,orientation,layer,datatype)
         add_rect(top,np.array([[0,ws/2+gap],[length,ws/2+gap],[length,ws/2+gap+wg],[0,ws/2+gap+wg]],float),start,orientation,layer,datatype)
         add_rect(top,np.array([[0,-ws/2-gap-wg],[length,-ws/2-gap-wg],[length,-ws/2-gap],[0,-ws/2-gap]],float),start,orientation,layer,datatype); return
+    if kind == "modulator_RF2":
+        length=float(p["length"]); signal=float(p["signal_width"]); ground=float(p["ground_width"]); gap=float(p["gap"])
+        if min(length,signal,ground)<=0.0 or gap<0.0:
+            raise ValueError("modulator_RF2 requires positive length and conductor widths; gap cannot be negative.")
+        signal_low=gap/2.0; signal_high=signal_low+signal
+        ground_high=-gap/2.0; ground_low=ground_high-ground
+        add_rect(top,np.array([[0,signal_low],[length,signal_low],[length,signal_high],[0,signal_high]],float),start,orientation,layer,datatype)
+        add_rect(top,np.array([[0,ground_low],[length,ground_low],[length,ground_high],[0,ground_high]],float),start,orientation,layer,datatype); return
+    if kind == "modulator_RF2_bridge":
+        length=float(p["length"]); signal=float(p["signal_width"]); ground=float(p["ground_width"]); gap=float(p["gap"]); separation=float(p["microstrip_separation"]); bridge=float(p["center_strip_width"])
+        if min(length,signal,ground,bridge)<=0.0 or min(gap,separation)<0.0 or bridge>length:
+            raise ValueError("modulator_RF2_bridge requires positive length, conductor widths, and center strip width; gap and microstrip separation cannot be negative and center strip width cannot exceed length.")
+        half_separation=separation/2.0
+        top_ground_low=half_separation; top_ground_high=top_ground_low+ground
+        top_signal_low=top_ground_high+gap; top_signal_high=top_signal_low+signal
+        bottom_signal_high=-half_separation; bottom_signal_low=bottom_signal_high-signal
+        bottom_ground_high=bottom_signal_low-gap; bottom_ground_low=bottom_ground_high-ground
+        bridge_left=(length-bridge)/2.0; bridge_right=(length+bridge)/2.0
+        add_rect(top,np.array([[0,top_signal_low],[length,top_signal_low],[length,top_signal_high],[0,top_signal_high]],float),start,orientation,layer,datatype)
+        add_rect(top,np.array([[0,top_ground_low],[length,top_ground_low],[length,top_ground_high],[0,top_ground_high]],float),start,orientation,layer,datatype)
+        add_rect(top,np.array([[0,bottom_signal_low],[length,bottom_signal_low],[length,bottom_signal_high],[0,bottom_signal_high]],float),start,orientation,layer,datatype)
+        add_rect(top,np.array([[0,bottom_ground_low],[length,bottom_ground_low],[length,bottom_ground_high],[0,bottom_ground_high]],float),start,orientation,layer,datatype)
+        # The bridge only fills the separation between the facing inner
+        # conductor edges.  Sharing the boundary keeps the conductors
+        # electrically continuous without overlapping GDS polygons (and thus
+        # avoids double exposure in the joined region).
+        add_rect(top,np.array([[bridge_left,bottom_signal_high],[bridge_right,bottom_signal_high],[bridge_right,top_ground_low],[bridge_left,top_ground_low]],float),start,orientation,layer,datatype); return
     if kind == "CPW open":
         length=float(p["length"]); ws=float(p["signal_width"]); gap=float(p["gap"]); wg=float(p["ground_width"]); recess=float(p.get("signal_recess",20.0))
         if length <= 0 or ws <= 0 or gap < 0 or wg <= 0 or recess < 0 or recess >= length:
@@ -1359,6 +1793,10 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
         add_rect(top,np.array([[x0,y1-line_width],[x1,y1-line_width],[x1,y1],[x0,y1]],float),start,orientation,layer,datatype)
         add_rect(top,np.array([[x0,y0+line_width],[x0+line_width,y0+line_width],[x0+line_width,y1-line_width],[x0,y1-line_width]],float),start,orientation,layer,datatype)
         add_rect(top,np.array([[x1-line_width,y0+line_width],[x1,y0+line_width],[x1,y1-line_width],[x1-line_width,y1-line_width]],float),start,orientation,layer,datatype)
+        global_marker_size=float(p.get("ebeam_global_marker_size",50.0));global_marker_half=global_marker_size/2.0
+        for marker_center in chip_outline_global_marker_centers(p).values():
+            cx,cy=marker_center
+            add_rect(top,np.array([[cx-global_marker_half,cy-global_marker_half],[cx+global_marker_half,cy-global_marker_half],[cx+global_marker_half,cy+global_marker_half],[cx-global_marker_half,cy+global_marker_half]],float),start,orientation,GLOBAL_MARKER_LAYER,DEFAULT_DATATYPE)
         if int(p.get("show_dimensions", 1)):
             dim_layer=int(p.get("dimension_layer", layer)); scale_label=max(0.01,float(p.get("dimension_text_scale",1.0)))
             bottom=tuple(np.asarray(start)+rot((0.0,y0-float(p.get("dimension_offset",150.0))),orientation))
@@ -1367,18 +1805,106 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
             top.add(gdstk.Label(f"H = {height:g} um",left,anchor="n",rotation=math.radians(orientation+90.0),magnification=scale_label,layer=dim_layer,texttype=datatype))
         return
     if kind == "4-inch wafer outline":
-        diameter=float(p.get("diameter",100000.0));flat_length=float(p.get("primary_flat_length",32500.0));line_width=float(p.get("line_width",100.0));point_count=max(64,int(p.get("points",720)));filled=bool(int(p.get("filled",0)))
-        radius=diameter/2.0
+        diameter = float(p.get("diameter", 100000.0))
+        flat_length = float(p.get("primary_flat_length", 32500.0))
+        line_width = float(p.get("line_width", 100.0))
+        point_count = max(64, int(p.get("points", 720)))
+        filled = bool(int(p.get("filled", 0)))
+        radius = diameter / 2.0
         if diameter<=0 or flat_length<=0 or flat_length>=diameter or line_width<=0 or line_width>=radius:
             raise ValueError("4-inch wafer outline requires diameter > flat length > 0 and a positive line width smaller than the radius.")
-        half_flat=flat_length/2.0;y_flat=-math.sqrt(max(0.0,radius*radius-half_flat*half_flat));theta_right=math.atan2(y_flat,half_flat);theta_left=math.atan2(y_flat,-half_flat)+2.0*math.pi
-        angles=np.unique(np.concatenate((np.linspace(theta_right,theta_left,point_count),np.array([0.0,math.pi/2.0,math.pi]))));outer_points=np.column_stack((radius*np.cos(angles),radius*np.sin(angles)));outer=gdstk.Polygon(outer_points,layer=layer,datatype=datatype)
+        half_flat = flat_length / 2.0
+        y_flat = -math.sqrt(max(0.0, radius * radius - half_flat * half_flat))
+        theta_right = math.atan2(y_flat, half_flat)
+        theta_left = math.atan2(y_flat, -half_flat) + 2.0 * math.pi
+        angles = np.unique(
+            np.concatenate(
+                (
+                    np.linspace(theta_right, theta_left, point_count),
+                    np.array([0.0, math.pi / 2.0, math.pi]),
+                )
+            )
+        )
+        outer_points = np.column_stack(
+            (radius * np.cos(angles), radius * np.sin(angles))
+        )
+        outer = gdstk.Polygon(outer_points, layer=layer, datatype=datatype)
         if filled:
-            top.add(gdstk.Polygon(transform_points(outer_points,start,orientation),layer=layer,datatype=datatype))
+            top.add(
+                gdstk.Polygon(
+                    transform_points(outer_points, start, orientation),
+                    layer=layer,
+                    datatype=datatype,
+                )
+            )
         else:
-            inner=gdstk.offset(outer,-line_width,join="round",tolerance=2,precision=0.001,layer=layer,datatype=datatype)
-            outline=gdstk.boolean(outer,inner,"not",precision=0.001,layer=layer,datatype=datatype)
-            for polygon in outline:top.add(gdstk.Polygon(transform_points(np.asarray(polygon.points,float),start,orientation),layer=layer,datatype=datatype))
+            inner = gdstk.offset(
+                outer,
+                -line_width,
+                join="round",
+                tolerance=2,
+                precision=0.001,
+                layer=layer,
+                datatype=datatype,
+            )
+            outline = gdstk.boolean(
+                outer,
+                inner,
+                "not",
+                precision=0.001,
+                layer=layer,
+                datatype=datatype,
+            )
+            for polygon in outline:
+                top.add(
+                    gdstk.Polygon(
+                        transform_points(
+                            np.asarray(polygon.points, float), start, orientation
+                        ),
+                        layer=layer,
+                        datatype=datatype,
+                    )
+                )
+
+        if bool(int(p.get("show_3_inch_boundary", 1))):
+            boundary_diameter = float(
+                p.get("three_inch_boundary_diameter", 76200.0)
+            )
+            boundary_line_width = float(
+                p.get("three_inch_boundary_line_width", line_width)
+            )
+            boundary_radius = boundary_diameter / 2.0
+            if (
+                boundary_diameter <= 0.0
+                or boundary_diameter >= diameter
+                or boundary_line_width <= 0.0
+                or boundary_line_width >= boundary_radius
+            ):
+                raise ValueError(
+                    "The 3-inch boundary requires 0 < boundary diameter < wafer diameter "
+                    "and a positive line width smaller than its radius."
+                )
+            circle_tolerance = max(
+                0.001,
+                boundary_radius * (1.0 - math.cos(math.pi / point_count)),
+            )
+            boundary = gdstk.ellipse(
+                (0.0, 0.0),
+                boundary_radius,
+                inner_radius=boundary_radius - boundary_line_width,
+                tolerance=circle_tolerance,
+                layer=layer,
+                datatype=datatype,
+            )
+            top.add(
+                gdstk.Polygon(
+                    transform_points(
+                        np.asarray(boundary.points, float), start, orientation
+                    ),
+                    layer=layer,
+                    datatype=datatype,
+                )
+            )
         return
     if kind == "Chip marker block":
         chip_w=float(p.get("chip_width",14000));chip_h=float(p.get("chip_height",12000));size=float(p.get("corner_square_size",50));clear=float(p.get("edge_clearance",0));half=size/2;inset=clear+half
@@ -1416,19 +1942,19 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
                 local=np.asarray(poly.points,dtype=float)-label_center+label_position;top.add(gdstk.Polygon(transform_points(local,start,orientation),layer=MARKER_LAYER,datatype=datatype))
         return
     if kind == "Square mark":
-        size=float(p["size"]); line_width=float(p["line_width"]); filled=int(p.get("filled",0))
-        if size <= 0 or line_width <= 0:
-            raise ValueError("Square mark size and line_width must be positive.")
-        h=size/2.0
+        size=float(p["size"]); width=float(p.get("width",size)); height=float(p.get("height",size)); line_width=float(p["line_width"]); filled=int(p.get("filled",0))
+        if min(size,width,height,line_width) <= 0:
+            raise ValueError("Square/rectangular mark dimensions and line_width must be positive.")
+        hx=width/2.0;hy=height/2.0
         if filled:
-            add_rect(top,np.array([[-h,-h],[h,-h],[h,h],[-h,h]],float),start,orientation,layer,datatype)
+            add_rect(top,np.array([[-hx,-hy],[hx,-hy],[hx,hy],[-hx,hy]],float),start,orientation,layer,datatype)
         else:
-            if 2.0*line_width >= size:
-                raise ValueError("Square mark line_width must be smaller than half the size for an outline mark.")
-            add_rect(top,np.array([[-h,-h],[h,-h],[h,-h+line_width],[-h,-h+line_width]],float),start,orientation,layer,datatype)
-            add_rect(top,np.array([[-h,h-line_width],[h,h-line_width],[h,h],[-h,h]],float),start,orientation,layer,datatype)
-            add_rect(top,np.array([[-h,-h+line_width],[-h+line_width,-h+line_width],[-h+line_width,h-line_width],[-h,h-line_width]],float),start,orientation,layer,datatype)
-            add_rect(top,np.array([[h-line_width,-h+line_width],[h,-h+line_width],[h,h-line_width],[h-line_width,h-line_width]],float),start,orientation,layer,datatype)
+            if 2.0*line_width >= min(width,height):
+                raise ValueError("Mark line_width must be smaller than half its shortest dimension.")
+            add_rect(top,np.array([[-hx,-hy],[hx,-hy],[hx,-hy+line_width],[-hx,-hy+line_width]],float),start,orientation,layer,datatype)
+            add_rect(top,np.array([[-hx,hy-line_width],[hx,hy-line_width],[hx,hy],[-hx,hy]],float),start,orientation,layer,datatype)
+            add_rect(top,np.array([[-hx,-hy+line_width],[-hx+line_width,-hy+line_width],[-hx+line_width,hy-line_width],[-hx,hy-line_width]],float),start,orientation,layer,datatype)
+            add_rect(top,np.array([[hx-line_width,-hy+line_width],[hx,-hy+line_width],[hx,hy-line_width],[hx-line_width,hy-line_width]],float),start,orientation,layer,datatype)
         return
     if kind == "Cross mark":
         size=float(p["size"]); line_width=float(p["line_width"])
@@ -1484,6 +2010,42 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
         for sx,sy in ((-1.0,1.0),(1.0,1.0),(-1.0,-1.0),(1.0,-1.0)):
             cx=sx*square_center_offset; cy=sy*square_center_offset
             add_rect(top,np.array([[cx-hs,cy-hs],[cx+hs,cy-hs],[cx+hs,cy+hs],[cx-hs,cy+hs]],float),start,orientation,layer,datatype)
+        return
+    if kind == "Four-corner cross + squares marks":
+        size = float(p["size"])
+        x_spacing = float(p["x_spacing"])
+        y_spacing = float(p["y_spacing"])
+        if size <= 0.0 or x_spacing <= 0.0 or y_spacing <= 0.0:
+            raise ValueError(
+                "Four-corner Cross + Squares marks require positive mark size and X/Y center spacing."
+            )
+        child_params = {
+            "size": size,
+            "bar_width": float(p["bar_width"]),
+            "square_size": float(p["square_size"]),
+            "square_gap": float(p["square_gap"]),
+            "layer": layer,
+            "datatype": datatype,
+        }
+        for index, (sx, sy) in enumerate(
+            ((-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0))
+        ):
+            local_center = (sx * x_spacing / 2.0, sy * y_spacing / 2.0)
+            world_center = tuple(
+                np.asarray(start, dtype=float) + rot(local_center, orientation)
+            )
+            _add_component_geometry_to_cell(
+                {
+                    "uid": uid * 10 + index + 1,
+                    "kind": "Cross + squares mark",
+                    "x": world_center[0],
+                    "y": world_center[1],
+                    "orientation_deg": orientation,
+                    "mirrored": False,
+                    "params": child_params,
+                },
+                top,
+            )
         return
     if kind == "Vernier mark":
         count=max(2,int(p["finger_count"])); fw=float(p["finger_width"]); fl=float(p["finger_length"]); pitch=float(p["pitch"]); pitch_delta=float(p["pitch_delta"]); gap=float(p["row_gap"]); base=float(p["base_thickness"]); layer_a=int(p["layer_a"]); layer_b=int(p["layer_b"])
@@ -1560,11 +2122,31 @@ def _canonicalize_component_layers(component: dict[str, Any]) -> None:
     if kind == "E-beam multipass":
         params["field_layer"] = EBEAM_LAYER
         params["field_datatype"] = DEFAULT_DATATYPE
+    elif kind in EDGE_COUPLER_COMPONENT_KINDS:
+        migrate_edge_coupler_parameters(component)
+        number = max(1, int(component.get("edge_coupler_number", 1)))
+        params["layer"] = WG_TIP_LAYER
+        params["datatype"] = DEFAULT_DATATYPE
+        params["slab_layer"] = edge_coupler_slab_layer(number)
+        params["slab_datatype"] = DEFAULT_DATATYPE
+        params["local_alignment_mark_name"] = f"L{number}"
+        params["local_alignment_mark_layer"] = edge_coupler_local_marker_layer(number)
+        params["local_alignment_mark_datatype"] = DEFAULT_DATATYPE
+    elif kind == "Chip outline":
+        params["ebeam_global_marker_layer"] = GLOBAL_MARKER_LAYER
+        params["ebeam_global_marker_datatype"] = DEFAULT_DATATYPE
+    elif kind == "SLAB taper":
+        params["layer"] = SLAB_LAYER
+        params["datatype"] = DEFAULT_DATATYPE
     elif kind in RF_COMPONENT_KINDS:
         params["layer"] = RF_LAYER
         params["datatype"] = DEFAULT_DATATYPE
     elif kind in MARKER_COMPONENT_KINDS:
-        params["layer"] = MARKER_LAYER
+        params["layer"] = (
+            GLOBAL_MARKER_LAYER
+            if kind == "Square mark" and bool(params.get("dicing_marker", False))
+            else MARKER_LAYER
+        )
         params["datatype"] = DEFAULT_DATATYPE
         if kind == "Vernier mark":
             params["layer_a"] = MARKER_LAYER
@@ -1579,6 +2161,20 @@ def _canonicalize_component_layers(component: dict[str, Any]) -> None:
         params["slab_datatype"] = DEFAULT_DATATYPE
         params["etched_layer"] = GC_LAYER
         params["etched_datatype"] = DEFAULT_DATATYPE
+    elif kind in MODULATOR_COMPONENT_KINDS:
+        params["layer"] = PHOTONIC_LAYER
+        params["datatype"] = DEFAULT_DATATYPE
+        params["gc_layer"] = GC_LAYER
+        params["gc_datatype"] = DEFAULT_DATATYPE
+        params["rf_layer"] = RF_LAYER
+        params["rf_datatype"] = DEFAULT_DATATYPE
+        params["rf_bends_layer"] = RF_BENDS_LAYER
+        params["rf_bends_datatype"] = DEFAULT_DATATYPE
+    elif kind == "Feedline":
+        params["layer"] = FEEDLINE_LAYER
+        params["datatype"] = DEFAULT_DATATYPE
+        params["gc_layer"] = GC_LAYER
+        params["gc_datatype"] = DEFAULT_DATATYPE
     elif kind in GC_COMPOSITE_KINDS:
         params["layer"] = PHOTONIC_LAYER
         params["datatype"] = DEFAULT_DATATYPE
@@ -1600,6 +2196,7 @@ def resolve_and_build(components: list[dict[str, Any]]) -> gdstk.Library:
     library = gdstk.Library(unit=1e-6, precision=1e-9)
     top = library.new_cell("TOP")
     by_uid = {int(c["uid"]): json.loads(json.dumps(c)) for c in components}
+    edge_couplers = assign_edge_coupler_layers(list(by_uid.values()))
     for component in by_uid.values():
         _canonicalize_component_layers(component)
 
@@ -1641,12 +2238,11 @@ def resolve_and_build(components: list[dict[str, Any]]) -> gdstk.Library:
         add_component_to_gds(by_uid[uid], top, library)
 
     try:
-        top.set_property("LAYER_NAME_1", "WG")
-        top.set_property("LAYER_NAME_2", "GC")
-        top.set_property("LAYER_NAME_3", "Marker")
-        top.set_property("LAYER_NAME_4", "RF")
-        top.set_property("LAYER_NAME_5", "Probe")
-        top.set_property("LAYER_NAME_6", "Ebeam")
+        layer_names = dict(LAYER_NAME_MAP)
+        layer_names.update(edge_coupler_layer_name_map(edge_coupler_total_count(list(by_uid.values()))))
+        for layer_number, layer_name in layer_names.items():
+            if int(layer_number) > 0:
+                top.set_property(f"LAYER_NAME_{int(layer_number)}", str(layer_name))
     except Exception:
         pass
 

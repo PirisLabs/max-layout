@@ -139,7 +139,36 @@ Raise the thread count at **Layout → Performance / CPU Threads…**, or set
 ## Main capabilities
 
 - Photonic, RF, and mixed TFLN layout components.
+- Symmetric continuous-CPW and segmented-electrode MZI modulator blocks. Their
+  shared interaction gap automatically controls the MZI arm separation, center
+  electrode, RF bends, and both taper starts; both external taper ends share a
+  second gap and both sides share one taper length/profile. Each RF bend has a
+  configurable, symmetric 2 µm default longitudinal overlap with the center
+  horizontal electrode. The front Properties controls provide mutually
+  exclusive **Edge coupler** and **Grating coupler** checkboxes. The edge
+  choice attaches one complete exponential or linear WG+SLAB edge coupler to
+  each optical end, with independent left/right taper lengths, a configurable
+  0.3 µm default facet width, and a unique numbered SLAB/L-marker pair for
+  each end.
 - MMI, MZI, grating coupler, ring, racetrack, CPW, and segmented-electrode tools.
+  The resonator library includes an **Euler racetrack** whose exposed
+  `racetrack_length` is the complete round-trip centerline length and whose
+  exposed `R_eff` sets the minimum centerline radius of each full-Euler bend.
+  Feedline, ring+feedline, and racetrack+feedline components use a straight,
+  one S-bend, coupling straight, and output straight by default, placing their
+  two grating couplers on different transverse coordinates. An exposed
+  **add output S bend** checkbox restores the second S-bend when a return to the
+  original grating line is desired. A feedline JSON may specify
+  `s_bend_radius` to derive the fifth-order S-bend length from an exact minimum
+  centerline radius, and `pre_coupling_straight_length` to keep that bend away
+  from the coupling region.
+  The RF library also includes `modulator_RF2`: two separate parallel
+  conductors with independently editable signal width, ground width, conductor
+  gap, length, layer, and datatype. Its companion `modulator_RF2_bridge`
+  contains two complete microstrip pairs, each with its own conductor gap. An
+  editable separation spaces the two pairs, and a narrow centered bridge joins
+  the adjacent inner conductors. The bridge terminates exactly at their facing
+  edges, so the GDS polygons touch without an overlapping double-exposure area.
 - One consolidated Photonic crystal component with selectable rectangle,
   ellipse, or hexagon slab; square or triangular hole lattice; circular or
   elliptical holes; crystal size; bulk or line-defect-waveguide mode; and
@@ -193,6 +222,44 @@ Raise the thread count at **Layout → Performance / CPU Threads…**, or set
   and layer-batched rendering for repeated arrays. Exceptionally large legacy
   layouts can opt into the older display-only approximation with
   `MAX_LAYOUT_APPROXIMATE_PREVIEW=1`; exported GDS remains exact.
+- Named fabrication layers 7 (`Wg_tip`), 8 (`SLAB`), and 9 (`RFbends`) in the layer panel and
+  saved layer map. Modulator center electrodes remain on `RF` layer 4, while
+  their symmetric bends and tapers are placed on `RFbends` layer 9.
+- Native `SLAB taper` edge-coupler primitive on layer 8, with editable initial
+  width, final width, length, point count, and exponential factor.
+- Dedicated **Edge couplers** library category with **Exponential** and
+  **Linear** variants, plus exponential and linear **pair + straight feed**
+  components. A pair sandwiches an editable straight waveguide between two
+  opposed complete edge couplers; `Feed_length` defaults to 2500 µm and its
+  connecting straight remains on `WG` layer 1. In all variants the SLAB taper spans the complete
+  `offset + top-WG taper length`, while the top tip/WG taper on `Wg_tip` layer 7
+  begins at the offset and spans only its own taper length. The SLAB profile is
+  exponential or linear according to the selected variant; the top WG remains
+  linear. SLAB-only straight sections surround the unchanged taper design: a
+  100 µm narrow-side section at the SLAB start width and a 10 µm wide-side
+  section at the SLAB end width. Intuitive controls for all four lengths and
+  all four endpoint widths are presented first in the Properties panel.
+- Edge couplers are numbered deterministically by UID. Coupler 1 uses `SLAB 1`
+  layer 12, coupler 2 uses `SLAB 2` layer 13, and the sequence continues with
+  one SLAB layer per physical coupler. All 50 × 50 µm local squares share
+  `L-markers` layer 11, matching the shared `Wg_tip` layer 7 organization. The
+  local squares are centered at the top-WG start X coordinate and 100 µm above
+  and below its centerline. BEAMER export creates
+  one numbered SLAB FTEXT/GPF flow per coupler, and the CJOB records the exact
+  transformed local coordinates, matching SLAB layer, shared L-marker layer, UID,
+  local ID, and GPF filename.
+- The main BEAMER FTEXT Extract node activates only `WG` layer 1, `Wg_tip`
+  layer 7, `G-markers` layer 10, and shared `L-markers` layer 11. Numbered SLAB
+  layers remain isolated in their own per-coupler FTEXT/GPF flows.
+- Every chip frame automatically includes three 50 × 50 µm `Ebeam global marker`
+  squares at 200 µm center spacing on shared `G-markers` layer 10 at each of
+  its top, bottom, left, and right centers. The squares
+  remain fully inside the frame and reposition symmetrically whenever the frame
+  size, line width, marker size, or inside clearance changes. Their transformed
+  centers are included alongside the LOCAL centers in CJOB XML metadata.
+- A filled `Square mark` with `dicing_marker` enabled is forced onto shared
+  `G-markers` layer 10. This supports frame dicing references of any requested size while
+  keeping ordinary square alignment marks on the standard Marker layer.
 
 ## Lumerical simulation notebooks
 

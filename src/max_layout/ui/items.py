@@ -638,6 +638,27 @@ class ComponentGraphicsItem(QGraphicsItemGroup):
         for (layer,datatype),path in layer_paths.items():
             child=QGraphicsPathItem(path);child.setBrush(QBrush(color_for_layer(layer,135)));pen=QPen(color_for_layer(layer,230),0);pen.setCosmetic(True);child.setPen(pen);child.setData(0,layer);child.setData(1,datatype);child.setData(2,"geometry");self.addToGroup(child);rect=path.boundingRect();bounds=rect if bounds is None else bounds.united(rect)
 
+        # Dicing marks can be only a few tens of micrometres thick, which is
+        # sub-pixel at a full-chip view.  Add a screen-constant locator in the
+        # editor only; exact fabrication polygons and GDS export are unchanged.
+        if self.component.get("kind") == "Square mark" and bool(
+            self.component.get("params", {}).get("dicing_marker", False)
+        ):
+            locator = QGraphicsRectItem(QRectF(-6.0, -6.0, 12.0, 12.0))
+            locator.setFlag(
+                QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True
+            )
+            locator.setBrush(Qt.BrushStyle.NoBrush)
+            locator_pen = QPen(color_for_layer(10, 255), 1.5)
+            locator_pen.setCosmetic(True)
+            locator.setPen(locator_pen)
+            locator.setZValue(140)
+            locator.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            locator.setData(0, 10)
+            locator.setData(2, "dicing_preview_locator")
+            locator.setToolTip("Dicing marker locator — editor preview only")
+            self.addToGroup(locator)
+
         if not polygons and bounds is None:
             child = QGraphicsRectItem(QRectF(-15, -10, 30, 20))
             child.setBrush(QBrush(QColor(140, 140, 140, 60)))

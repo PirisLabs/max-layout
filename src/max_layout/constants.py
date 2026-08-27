@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .geometry.vertical_racetrack_feedline import VERTICAL_RACETRACK_FEEDLINE_KIND
+
 APP_DIR = Path(__file__).resolve().parent
 
 MODULE_DB_FILE = Path.home() / ".photonic_layout_editor_modules.json"
@@ -21,9 +23,82 @@ PROBE_LAYER = 5
 
 EBEAM_LAYER = 6
 
+WG_TIP_LAYER = 7
+
+SLAB_LAYER = 8
+
+RF_BENDS_LAYER = 9
+
+GLOBAL_MARKER_LAYER = 10
+
+# Every edge coupler keeps a distinct SLAB layer so individual slab GPFs can
+# still be written, but all local alignment squares share one L-markers layer.
+# This mirrors the shared Wg_tip layer and avoids one extra layer per coupler.
+LOCAL_MARKER_LAYER = 11
+EDGE_COUPLER_LAYER_BASE = 12
+
+# Standalone optical feedlines use a dedicated layer.  Keeping it high leaves
+# room for the numbered edge-coupler SLAB layers that begin at layer 12.
+FEEDLINE_LAYER = 200
+
+
+def edge_coupler_slab_layer(number: int) -> int:
+    index = int(number)
+    if index < 1:
+        raise ValueError("Edge-coupler numbers start at 1.")
+    layer = EDGE_COUPLER_LAYER_BASE + index - 1
+    if layer > 65534:
+        raise ValueError("Too many edge couplers for distinct GDS layers.")
+    return layer
+
+
+def edge_coupler_local_marker_layer(number: int) -> int:
+    if int(number) < 1:
+        raise ValueError("Edge-coupler numbers start at 1.")
+    return LOCAL_MARKER_LAYER
+
+
+def edge_coupler_layer_name_map(count: int) -> dict[int, str]:
+    result: dict[int, str] = {}
+    for number in range(1, max(0, int(count)) + 1):
+        result[edge_coupler_slab_layer(number)] = f"SLAB {number}"
+    return result
+
 DEFAULT_DATATYPE = 0
 
 SIMULATION_LAYER = 0
+
+EXPONENTIAL_EDGE_COUPLER_FEED_KIND = "Exponential edge coupler pair + feed"
+LINEAR_EDGE_COUPLER_FEED_KIND = "Linear edge coupler pair + feed"
+EDGE_COUPLER_FEED_KINDS = frozenset(
+    {EXPONENTIAL_EDGE_COUPLER_FEED_KIND, LINEAR_EDGE_COUPLER_FEED_KIND}
+)
+
+EDGE_COUPLER_COMPONENT_KINDS = frozenset(
+    {
+        "Edge coupler",
+        "Exponential edge coupler",
+        "Linear edge coupler",
+        *EDGE_COUPLER_FEED_KINDS,
+    }
+)
+
+
+def edge_coupler_slot_count(kind: str) -> int:
+    return 2 if str(kind) in EDGE_COUPLER_FEED_KINDS else int(
+        str(kind) in EDGE_COUPLER_COMPONENT_KINDS
+    )
+
+
+def component_edge_coupler_slot_count(component: Any) -> int:
+    kind = str(component.get("kind", ""))
+    if kind in MODULATOR_COMPONENT_KINDS:
+        return 2 if bool(component.get("params", {}).get("add_edge_coupler_tapers", False)) else 0
+    return edge_coupler_slot_count(kind)
+
+
+def edge_coupler_total_count(components: Any) -> int:
+    return sum(component_edge_coupler_slot_count(component) for component in components)
 
 LAYER_NAME_MAP = {
     SIMULATION_LAYER: "Simulation only (not GDS)",
@@ -33,6 +108,12 @@ LAYER_NAME_MAP = {
     RF_LAYER: "RF",
     PROBE_LAYER: "Probe",
     EBEAM_LAYER: "Ebeam",
+    WG_TIP_LAYER: "Wg_tip",
+    SLAB_LAYER: "SLAB",
+    RF_BENDS_LAYER: "RFbends",
+    GLOBAL_MARKER_LAYER: "G-markers",
+    LOCAL_MARKER_LAYER: "L-markers",
+    FEEDLINE_LAYER: "Feedline",
 }
 
 SIMULATION_COMPONENT_KINDS = {
@@ -57,11 +138,18 @@ RF_COMPONENT_KINDS = {
     "CPW",
     "CPW open",
     "CPW short",
+    "modulator_RF2",
+    "modulator_RF2_bridge",
     "Tapered CPW",
     "Symmetric CPW taper",
     "CPW bend",
     "Segmented electrode",
     "RF test block",
+}
+
+MODULATOR_COMPONENT_KINDS = {
+    "MZI + CPW modulator",
+    "MZI + segmented-electrode modulator",
 }
 
 # These generators remain available so older JSON projects still load, but
@@ -85,6 +173,7 @@ MARKER_COMPONENT_KINDS = {
     "Cross mark",
     "Pointy cross mark",
     "Cross + squares mark",
+    "Four-corner cross + squares marks",
     "Vernier mark",
     "Text / Number",
     "Chip marker block",
@@ -112,6 +201,7 @@ GC_COMPOSITE_KINDS = {
     "Feedline",
     "Ring + feedline",
     "Racetrack + feedline",
+    VERTICAL_RACETRACK_FEEDLINE_KIND,
 }
 
 DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 1, 'datatype': 0},
@@ -408,8 +498,32 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                          'datatype': 0,
                          'oxide_layer': 4,
                          'oxide_datatype': 0},
- 'Chip outline': {'width': 14000.0, 'height': 12000.0, 'line_width': 10.0, 'show_dimensions': 1, 'dimension_offset': 150.0, 'dimension_text_scale': 1.0, 'layer': 100, 'datatype': 0, 'dimension_layer': 101},
- '4-inch wafer outline': {'diameter': 100000.0, 'primary_flat_length': 32500.0, 'line_width': 100.0, 'points': 720, 'filled': 0, 'layer': 100, 'datatype': 0},
+ 'Chip outline': {'width': 14000.0,
+                  'height': 12000.0,
+                  'line_width': 10.0,
+                  'ebeam_global_marker_size': 50.0,
+                  'ebeam_global_marker_edge_clearance': 0.0,
+                  'ebeam_global_marker_count': 3,
+                  'ebeam_global_marker_spacing': 200.0,
+                  'ebeam_global_marker_name': 'Ebeam global marker',
+                  'ebeam_global_marker_layer': GLOBAL_MARKER_LAYER,
+                  'ebeam_global_marker_datatype': DEFAULT_DATATYPE,
+                  'show_dimensions': 1,
+                  'dimension_offset': 150.0,
+                  'dimension_text_scale': 1.0,
+                  'layer': 100,
+                  'datatype': 0,
+                  'dimension_layer': 101},
+ '4-inch wafer outline': {'diameter': 100000.0,
+                          'primary_flat_length': 32500.0,
+                          'line_width': 100.0,
+                          'show_3_inch_boundary': True,
+                          'three_inch_boundary_diameter': 76200.0,
+                          'three_inch_boundary_line_width': 100.0,
+                          'points': 720,
+                          'filled': 0,
+                          'layer': 100,
+                          'datatype': 0},
  'E-beam multipass': {'field_size': 520.0,
                        'overlap_x_enabled': False,
                        'overlap_y_enabled': False,
@@ -440,6 +554,14 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
  'Cross mark': {'size': 100.0, 'line_width': 10.0, 'layer': 3, 'datatype': 0},
  'Pointy cross mark': {'size': 120.0, 'line_width': 10.0, 'tip_length': 18.0, 'layer': 3, 'datatype': 0},
  'Cross + squares mark': {'size': 140.0, 'bar_width': 10.0, 'square_size': 34.0, 'square_gap': 8.0, 'layer': 3, 'datatype': 0},
+ 'Four-corner cross + squares marks': {'size': 140.0,
+                                        'bar_width': 10.0,
+                                        'square_size': 34.0,
+                                        'square_gap': 8.0,
+                                        'x_spacing': 1000.0,
+                                        'y_spacing': 1000.0,
+                                        'layer': 3,
+                                        'datatype': 0},
  'Vernier mark': {'finger_count': 11, 'finger_width': 2.0, 'finger_length': 40.0, 'pitch': 10.0, 'pitch_delta': 0.2, 'row_gap': 8.0, 'base_thickness': 8.0, 'layer_a': 3, 'layer_b': 3, 'datatype': 0},
  'Chip marker block': {'chip_width': 14000.0,
                        'chip_height': 12000.0,
@@ -488,6 +610,26 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
  'Boolean geometry': {'polygons': [], 'operation': 'union', 'layer': 1, 'datatype': 0},
  'Elliptical ring': {'radius_x': 200.0, 'radius_y': 100.0, 'width': 1.2, 'points': 256, 'layer': 1, 'datatype': 0},
  'Racetrack': {'radius': 30.0, 'coupling_length': 100.0, 'width': 1.2, 'points': 128, 'layer': 1, 'datatype': 0},
+ 'Euler racetrack': {'racetrack_length': 5426.107837104072,
+                     'R_eff': 100.0,
+                     'width': 1.2,
+                     'points': 4001,
+                     'layer': 1,
+                     'datatype': 0},
+ 'modulator_RF2': {'length': 2000.0,
+                   'signal_width': 130.0,
+                   'ground_width': 130.0,
+                   'gap': 5.0,
+                   'layer': 4,
+                   'datatype': 0},
+ 'modulator_RF2_bridge': {'length': 2000.0,
+                          'signal_width': 130.0,
+                          'ground_width': 130.0,
+                          'gap': 5.0,
+                          'microstrip_separation': 100.0,
+                          'center_strip_width': 10.0,
+                          'layer': 4,
+                          'datatype': 0},
  'Ring + two feedlines': {'pitch': 0.75,
                           'fill_factor': 0.57,
                           'N': 30,
@@ -625,7 +767,43 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                                 'gc_layer': 2,
                                 'gc_datatype': 0},
  'Text / Number': {'text': 'TEXT', 'height': 50.0, 'layer': 3, 'datatype': 0},
- 'Edge coupler': {'tip_width': 0.2, 'wg_width': 1.2, 'taper_length': 200.0, 'wg_straight_length': 50.0, 'layer': 1, 'datatype': 0},
+ 'Exponential edge coupler': {'top_taper_length': 10.0,
+                              'top_start_offset': 10.0,
+                              'narrow_slab_straight_length': 100.0,
+                              'wide_slab_straight_length': 10.0,
+                              'slab_start_width': 0.5,
+                              'slab_end_width': 5.0,
+                              'top_tip_width': 0.2,
+                              'top_end_width': 1.2,
+                              'slab_exponential_factor': 1.3,
+                              'local_alignment_mark_size': 50.0,
+                              'local_alignment_mark_vertical_offset': 100.0,
+                              'points': 1001,
+                              'layer': WG_TIP_LAYER,
+                              'datatype': DEFAULT_DATATYPE,
+                              'slab_layer': edge_coupler_slab_layer(1),
+                              'slab_datatype': DEFAULT_DATATYPE,
+                              'local_alignment_mark_name': 'L1',
+                              'local_alignment_mark_layer': LOCAL_MARKER_LAYER,
+                              'local_alignment_mark_datatype': DEFAULT_DATATYPE},
+ 'Linear edge coupler': {'top_taper_length': 10.0,
+                         'top_start_offset': 10.0,
+                         'narrow_slab_straight_length': 100.0,
+                         'wide_slab_straight_length': 10.0,
+                         'slab_start_width': 0.5,
+                         'slab_end_width': 5.0,
+                         'top_tip_width': 0.2,
+                         'top_end_width': 1.2,
+                         'local_alignment_mark_size': 50.0,
+                         'local_alignment_mark_vertical_offset': 100.0,
+                         'points': 1001,
+                         'layer': WG_TIP_LAYER,
+                         'datatype': DEFAULT_DATATYPE,
+                         'slab_layer': edge_coupler_slab_layer(1),
+                         'slab_datatype': DEFAULT_DATATYPE,
+                         'local_alignment_mark_name': 'L1',
+                         'local_alignment_mark_layer': LOCAL_MARKER_LAYER,
+                         'local_alignment_mark_datatype': DEFAULT_DATATYPE},
  'Loopback mirror': {'Lc': 200.0, 'gap': 10.0, 's_bend_length': 80.0, 'arc_radius': 30.0, 'width': 1.2, 'layer': 1, 'datatype': 0, 'tolerance': 0.001},
  'Feedline': {'pitch': 0.75,
               'fill_factor': 0.57,
@@ -637,13 +815,15 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
               'input_straight_length': 50.0,
               's_bend_length': 80.0,
               'offset': 50.0,
+              'post_coupling_straight_length': 0.0,
               'Lc': 3000.0,
               'output_straight_length': 50.0,
-              'layer': 1,
+              'layer': FEEDLINE_LAYER,
               'datatype': 0,
               'tolerance': 0.001,
               'gc_tolerance': 0.0005,
               'add_grating_couplers': True,
+              'add_output_s_bend': False,
               'input_s_bend_direction': 'up',
               'output_s_bend_direction': 'down',
               'gc_layer': 2,
@@ -673,6 +853,7 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                      'tolerance': 0.001,
                      'gc_tolerance': 0.0005,
                      'add_grating_couplers': True,
+                     'add_output_s_bend': False,
                      'input_s_bend_direction': 'up',
                      'output_s_bend_direction': 'down',
                      'gc_layer': 2,
@@ -703,18 +884,50 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                           'tolerance': 0.001,
                           'gc_tolerance': 0.0005,
                           'add_grating_couplers': True,
+                          'add_output_s_bend': False,
                           'input_s_bend_direction': 'up',
                           'output_s_bend_direction': 'down',
                           'gc_layer': 2,
                           'gc_datatype': 0}}
 
+DEFAULT_COMPONENT_VALUES[VERTICAL_RACETRACK_FEEDLINE_KIND] = {
+    "racetrack_length": 5426.107837104072,
+    "R_eff": 100.0,
+    "racetrack_width": 1.2,
+    "coupling_gap": 0.5,
+    "coupling_side": "right",
+    "feedline_length": 2300.0,
+    "wg_width": 1.2,
+    "input_straight_length": 50.0,
+    # These are totals for the symmetric pair.  Each end uses half.
+    "s_bend_length": 200.0,
+    "offset": 200.0,
+    "Lc": 100.0,
+    "pitch": 0.83,
+    "fill_factor": 0.47,
+    "N": 30,
+    "alpha_t": 25.0,
+    "taper_L": 22.0,
+    "gc_wg_length": 20.0,
+    "points": 4001,
+    "layer": PHOTONIC_LAYER,
+    "datatype": DEFAULT_DATATYPE,
+    "tolerance": 0.001,
+    "gc_tolerance": 0.0005,
+    "add_grating_couplers": True,
+    "gc_layer": GC_LAYER,
+    "gc_datatype": DEFAULT_DATATYPE,
+}
+
 INTEGER_PARAMETERS = {"N", "gc_N", "mzi_count", "columns", "rows", "defect_rows", "layer", "datatype", "hole_layer", "hole_datatype", "gc_layer", "gc_datatype", "waveguide_layer", "waveguide_datatype", "taper_points", "points", "show_dimensions", "dimension_layer", "filled", "finger_count", "layer_a", "layer_b", "resonator_count", "resonator_layer", "resonator_datatype", "segment_count", "oxide_layer", "oxide_datatype", "rf_layer", "rf_datatype", "field_layer", "field_datatype", "beamer_region_layer"}
 
-BOOL_PARAMETERS = {"add_grating_couplers", "include_oxide_masks", "include_ebeam_fields", "include_symmetric_cpw", "gc_three_euler_inward", "gc_align_gc_to_mzi_center", "overlap_x_enabled", "overlap_y_enabled", "serpentine", "show_order"}
+BOOL_PARAMETERS = {"add_grating_couplers", "add_output_s_bend", "add_edge_coupler_tapers", "include_oxide_masks", "include_ebeam_fields", "include_symmetric_cpw", "gc_three_euler_inward", "gc_align_gc_to_mzi_center", "overlap_x_enabled", "overlap_y_enabled", "serpentine", "show_order"}
+
+BOOL_PARAMETERS.add("show_3_inch_boundary")
 
 DEFAULT_COMPONENT_VALUES["MZI vertical GC"] = dict(DEFAULT_COMPONENT_VALUES["MZI"])
 
-DEFAULT_COMPONENT_VALUES["MZI vertical GC"].update({"add_grating_couplers":True,"gc_three_euler_inward":True,"gc_prebend_straight":10.0,"gc_vertical_side":"up","gc_vertical_run":100.0,"gc_inward_run_fraction":0.25,"gc_align_gc_to_mzi_center":True,"gc_inward_run":300.0,"gc_euler_radius":100.0})
+DEFAULT_COMPONENT_VALUES["MZI vertical GC"].update({"add_grating_couplers":True,"gc_three_euler_inward":True,"gc_prebend_straight":10.0,"gc_vertical_side":"up","gc_vertical_run":100.0,"gc_inward_run_fraction":0.25,"gc_align_gc_to_mzi_center":True,"gc_horizontal_stagger":0.0,"gc_inward_run":300.0,"gc_euler_radius":100.0})
 
 DEFAULT_COMPONENT_VALUES["Vertical-GC MZI test block"] = dict(DEFAULT_COMPONENT_VALUES["MZI vertical GC"])
 
@@ -930,7 +1143,132 @@ DEFAULT_COMPONENT_VALUES.update(
     }
 )
 
+# Symmetric electro-optic blocks reconstructed from the two supplied project
+# layouts.  The insertion order is intentional: the parameters users change
+# most often appear first in the Properties panel.  ``arm_separation`` is not
+# independently editable because it is derived as signal_width + initial_gap.
+_MODULATOR_COMMON_DEFAULTS = {
+    "initial_gap": 5.0,
+    "final_gap": 14.5,
+    "signal_width": 130.0,
+    "taper_length": 500.0,
+    "profile": "klopfenstein",
+    "mzi_length": 12000.0,
+    "electrode_bend_overlap": 2.0,
+    "add_edge_coupler_tapers": False,
+    "edge_coupler_profile": "exponential",
+    "edge_coupler_tip_width": 0.3,
+    "left_edge_coupler_taper_length": 365.0,
+    "right_edge_coupler_taper_length": 365.0,
+    "edge_coupler_top_start_offset": 10.0,
+    "edge_coupler_narrow_slab_straight_length": 100.0,
+    "edge_coupler_wide_slab_straight_length": 10.0,
+    "edge_coupler_slab_start_width": 0.5,
+    "edge_coupler_slab_end_width": 5.0,
+    "edge_coupler_exponential_factor": 1.3,
+    "edge_coupler_local_marker_size": 50.0,
+    "edge_coupler_local_marker_vertical_offset": 100.0,
+    "ground_width": 130.0,
+    "bend_radius": 500.0,
+    "bend_angle_deg": 90.0,
+    "s_bend_length": 80.0,
+    "mmi_width": 6.0,
+    "mmi_length": 29.0,
+    "wg_width": 1.2,
+    "taper_width": 2.7,
+    "input_taper_length": 10.0,
+    "output_taper_length": 10.0,
+    "input_length": 500.0,
+    "output_length": 6.0,
+    "port_sep": 3.25,
+    "taper_power": 1.0,
+    "taper_points": 200,
+    "target_s11_db": 20.0,
+    "exponential_factor": 1.0,
+    "bend_points": 261,
+    "add_grating_couplers": False,
+    "gc_input_route": "straight",
+    "gc_output_route": "straight",
+    "gc_euler_radius": 200.0,
+    "gc_euler_fraction": 1.0,
+    "gc_pitch": 0.75,
+    "gc_fill_factor": 0.57,
+    "gc_N": 30,
+    "gc_alpha_t": 25.0,
+    "gc_taper_L": 22.0,
+    "gc_wg_length": 200.0,
+    "gc_tolerance": 0.0005,
+    "gc_euler_tolerance": 0.001,
+    "layer": PHOTONIC_LAYER,
+    "datatype": DEFAULT_DATATYPE,
+    "gc_layer": GC_LAYER,
+    "gc_datatype": DEFAULT_DATATYPE,
+    "rf_layer": RF_LAYER,
+    "rf_datatype": DEFAULT_DATATYPE,
+    "rf_bends_layer": RF_BENDS_LAYER,
+    "rf_bends_datatype": DEFAULT_DATATYPE,
+}
+
+DEFAULT_COMPONENT_VALUES["MZI + CPW modulator"] = dict(
+    _MODULATOR_COMMON_DEFAULTS,
+    electrode_length=11500.0,
+)
+
+DEFAULT_COMPONENT_VALUES["MZI + segmented-electrode modulator"] = dict(
+    _MODULATOR_COMMON_DEFAULTS,
+    transition_length=0.0,
+    end_flat_length=100.0,
+    inner_flat_length=0.0,
+    t_top_width=2.0,
+    t_top_length=45.0,
+    t_neck_width=4.0,
+    t_neck_length=18.0,
+    segment_spacing=3.0,
+    segment_count=235,
+    include_oxide_masks=False,
+    oxide_layer=RF_LAYER,
+    oxide_datatype=DEFAULT_DATATYPE,
+)
+
+DEFAULT_COMPONENT_VALUES["SLAB taper"] = {
+    "initial_width": 1.2,
+    "final_width": 0.3,
+    "length": 365.0,
+    "exponential_factor": 1.3,
+    "points": 1001,
+    "layer": SLAB_LAYER,
+    "datatype": DEFAULT_DATATYPE,
+}
+
+DEFAULT_COMPONENT_VALUES[EXPONENTIAL_EDGE_COUPLER_FEED_KIND] = {
+    "Feed_length": 2500.0,
+    **dict(DEFAULT_COMPONENT_VALUES["Exponential edge coupler"]),
+}
+
+DEFAULT_COMPONENT_VALUES[LINEAR_EDGE_COUPLER_FEED_KIND] = {
+    "Feed_length": 2500.0,
+    **dict(DEFAULT_COMPONENT_VALUES["Linear edge coupler"]),
+}
+
 INTEGER_PARAMETERS.add("order")
+
+INTEGER_PARAMETERS.add("bend_points")
+
+INTEGER_PARAMETERS.update({"rf_bends_layer", "rf_bends_datatype"})
+
+INTEGER_PARAMETERS.update({"slab_layer", "slab_datatype"})
+
+INTEGER_PARAMETERS.update(
+    {"local_alignment_mark_layer", "local_alignment_mark_datatype"}
+)
+
+INTEGER_PARAMETERS.update(
+    {
+        "ebeam_global_marker_count",
+        "ebeam_global_marker_layer",
+        "ebeam_global_marker_datatype",
+    }
+)
 
 INTEGER_PARAMETERS.add("waveguide_mode_search_count")
 
@@ -998,7 +1336,7 @@ DEFAULT_COMPONENT_VALUES["Photonic test block"] = {
     "datatype": DEFAULT_DATATYPE,
 }
 
-CHOICE_PARAMETERS = {"reference_branch": ["upper", "lower"], "profile": ["linear", "exponential", "klopfenstein"], "input_profile": ["linear", "exponential", "klopfenstein"], "output_profile": ["linear", "exponential", "klopfenstein"], "rf_input_taper_profile": ["linear", "exponential", "klopfenstein"], "rf_output_taper_profile": ["linear", "exponential", "klopfenstein"], "taper_test_center": ["CPW", "T electrode"], "resonator_side": ["upper", "lower"], "tooth_shape": ["curved", "rectangular"], "grating_route": ["straight", "up", "down"], "gc_input_route": ["straight", "up", "down"], "gc_output_route": ["straight", "up", "down"], "gc_upper_output_route": ["straight", "up", "down"], "gc_lower_output_route": ["straight", "up", "down"], "gc_vertical_side": ["up", "down"], "input_s_bend_direction": ["up", "down"], "output_s_bend_direction": ["up", "down"], "start_corner": ["top-left", "top-right", "bottom-left", "bottom-right"], "primary_axis": ["x", "y"], "primary_sweep_axis": ["x", "y"]}
+CHOICE_PARAMETERS = {"reference_branch": ["upper", "lower"], "profile": ["linear", "exponential", "klopfenstein"], "input_profile": ["linear", "exponential", "klopfenstein"], "output_profile": ["linear", "exponential", "klopfenstein"], "rf_input_taper_profile": ["linear", "exponential", "klopfenstein"], "rf_output_taper_profile": ["linear", "exponential", "klopfenstein"], "taper_test_center": ["CPW", "T electrode"], "resonator_side": ["upper", "lower"], "coupling_side": ["left", "right"], "tooth_shape": ["curved", "rectangular"], "grating_route": ["straight", "up", "down"], "gc_input_route": ["straight", "up", "down"], "gc_output_route": ["straight", "up", "down"], "gc_upper_output_route": ["straight", "up", "down"], "gc_lower_output_route": ["straight", "up", "down"], "gc_vertical_side": ["up", "down"], "input_s_bend_direction": ["up", "down"], "output_s_bend_direction": ["up", "down"], "start_corner": ["top-left", "top-right", "bottom-left", "bottom-right"], "primary_axis": ["x", "y"], "primary_sweep_axis": ["x", "y"]}
 
 CHOICE_PARAMETERS["cpw_profile"] = ["linear", "exponential", "klopfenstein"]
 
@@ -1019,7 +1357,15 @@ CHOICE_PARAMETERS.update({
     "rf role": ["Source", "Input reference", "Output"],
 })
 
+CHOICE_PARAMETERS["edge_coupler_profile"] = ["exponential", "linear"]
+
 COMPONENT_DISPLAY_NAMES={
+    VERTICAL_RACETRACK_FEEDLINE_KIND:"Euler racetrack with vertical feedline",
+    "Exponential edge coupler":"Exponential",
+    "Linear edge coupler":"Linear",
+    EXPONENTIAL_EDGE_COUPLER_FEED_KIND:"Exponential pair + straight feed",
+    LINEAR_EDGE_COUPLER_FEED_KIND:"Linear pair + straight feed",
+    "SLAB taper":"SLAB taper — exponential edge-coupler slab",
     "GC-SOI":"GC-SOI — official Ansys 3D SOI grating coupler",
     "1x2 MMI":"1×2 Multimode Interferometer (MMI)",
     "Cascaded MMI":"Cascaded 1×2 MMI splitter tree",
@@ -1028,6 +1374,8 @@ COMPONENT_DISPLAY_NAMES={
     "MMI split-combine cascade":"MMI splitter–combiner cascade",
     "MMI split-combine test block":"MMI splitter–combiner sweep block",
     "MZI vertical GC":"MZI with vertical grating couplers",
+    "MZI + CPW modulator":"Continuous-CPW MZI modulator",
+    "MZI + segmented-electrode modulator":"Segmented-electrode MZI modulator",
     "Vertical-GC MZI test block":"Vertical-grating-coupler MZI sweep block",
     "Straight-GC MZI + segmented RF bends test block":"Straight-grating MZI with segmented RF edge bends",
     "Straight-GC MZI + CPW RF bends test block":"Straight-grating MZI with continuous CPW edge bends",
@@ -1036,10 +1384,11 @@ COMPONENT_DISPLAY_NAMES={
     "Grating angle-taper test block":"Grating-coupler angle/taper sweep block",
     "Photonic test block":"Photonic component parameter-scan test block",
     "RF test block":"RF component parameter-scan test block",
-    "4-inch wafer outline":"4-inch (100 mm) wafer outline with primary flat",
+    "4-inch wafer outline":"4-inch (100 mm) wafer outline with primary flat and 3-inch boundary",
     "FDTD port":"Ansys standard FDTD port — waveguide",
     "Fiber-axis FDTD port":"Ansys standard FDTD port — fiber axis",
     "Gaussian source":"Gaussian excitation port (Lumerical beam source)",
+    "Four-corner cross + squares marks":"Four-corner Cross + Squares mark set",
     "Fiber geometry":"Ansys fiber geometry group — core + cladding",
     "Fiber port":"Legacy combined fiber object",
     "Power monitor":"Power monitor",
