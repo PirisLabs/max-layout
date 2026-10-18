@@ -354,6 +354,7 @@ class EdgeCouplerPropertyPanelTests(unittest.TestCase):
                 "Linear",
                 "Exponential pair + straight feed",
                 "Linear pair + straight feed",
+                "Linear Slab Etch",
             },
         )
         grating_names = {
