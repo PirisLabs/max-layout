@@ -29,6 +29,8 @@ from ..beamer import beamer_alignment_marks, beamer_cjob_template, beamer_edge_c
 from ..gds.build import _add_component_geometry_to_cell, _canonicalize_component_layers, component_geometry_arrays, library_bbox_and_center, recenter_components_at_origin, resolve_and_build, rotate_components_layout, test_block_device_placements
 from ..gds.ebeam import geometry_field_coverage, multipass_field_layout
 from ..geometry.edge_coupler import assign_edge_coupler_layers, edge_coupler_front_parameters, migrate_edge_coupler_parameters
+from ..geometry.linear_slab_etch import LINEAR_SLAB_ETCH_KIND
+from ..geometry.racetrack_electrode import RACETRACK_LUMPED_ELECTRODE_KIND
 from ..geometry.shapes import mmi_total_length
 from ..geometry.rf_taper import synchronize_rf_taper_points
 from ..geometry.transforms import scene_to_world_point, transform_points, transformed_local_points, world_to_scene_point
@@ -66,6 +68,31 @@ BOUNDARY_COMPONENT_KINDS = set(BOUNDARY_MARGINS_UM)
 MMI_STACK_PRESET = "TFLN MMI (3 um SiO2)"
 MMI_STACK_VERSION = 1
 GRATING_AUTO_MESH_VERSION = 1
+LINEAR_SLAB_ETCH_STACK_PRESET = "Linear Slab Etch TFLN"
+
+
+def linear_slab_etch_lumerical_export_settings(
+    saved: dict[str, Any] | None,
+    component: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    settings = copy.deepcopy(saved or {})
+    if not settings:
+        stack = default_stack(LINEAR_SLAB_ETCH_STACK_PRESET)
+        params = (component or {}).get("params", {})
+        slab_thickness = float(params.get("slab_tfln_thickness", 0.2))
+        rib_thickness = float(params.get("rib_tfln_thickness", 0.2))
+        cross_section = next(row for row in stack if row.get("role") == "geometry")
+        cross_section["thickness_um"] = slab_thickness + rib_thickness
+        cross_section["etch_depth_um"] = rib_thickness
+        settings.update({
+            "stack_preset": LINEAR_SLAB_ETCH_STACK_PRESET,
+            "material_stack": stack,
+            "wavelength_start_um": 1.26,
+            "wavelength_stop_um": 1.36,
+            "frequency_points": 31,
+            "dimension": "3D",
+        })
+    return settings
 
 
 def _material_stack_signature(stack: list[dict[str, Any]]) -> tuple[tuple[Any, ...], ...]:
@@ -86,6 +113,7 @@ def _material_stack_signature(stack: list[dict[str, Any]]) -> tuple[tuple[Any, .
                 float(row.get("sidewall_angle_deg", 90.0)),
                 role,
                 tuple(int(value) for value in raw_layers),
+                tuple(int(value) for value in row.get("slab_gds_layers", [])),
                 "geometry" if str(row.get("slab_extent", "full")).lower() == "geometry" else "full",
                 float(row.get("mesh_factor", 0.2)),
                 int(row.get("mesh_order", 3 if bool(row.get("conformal", False)) else 2)),
@@ -1406,7 +1434,7 @@ class NativeLayoutWindow(QMainWindow):
                 elif "mzi" in lower:group="MZI"
                 elif "mmi" in lower:group="MMI"
                 elif any(token in lower for token in ("ring", "racetrack", "resonator", "loopback")):group="Resonators"
-                elif kind in EDGE_COUPLER_COMPONENT_KINDS:group="Edge couplers"
+                elif kind in EDGE_COUPLER_COMPONENT_KINDS or kind == LINEAR_SLAB_ETCH_KIND:group="Edge couplers"
                 elif kind == "GC-SOI" or "grating" in lower:group="Grating couplers"
                 elif any(token in lower for token in ("straight", "taper", "bend", "feedline", "waveguide")):group="Waveguides & bends"
                 else:group="Other photonic"
@@ -2266,6 +2294,7 @@ class NativeLayoutWindow(QMainWindow):
             "MZI + segmented-electrode modulator": ["optical_left", "optical_right"],
             "Grating coupler": ["waveguide_point"],
             "GC-SOI": ["waveguide_point"],
+            LINEAR_SLAB_ETCH_KIND: ["input_fiber", "waveguide_point"],
         }.get(kind)
         if not requested_ports:
             return []
@@ -3366,6 +3395,7 @@ class NativeLayoutWindow(QMainWindow):
             "Ring + two feedlines":["ring_radius","ring_width","coupling_gap","feedline_width","feedline_length","grating_coupler_separation"],
             "Exponential edge coupler":["top_taper_length","top_start_offset","narrow_slab_straight_length","wide_slab_straight_length","slab_start_width","slab_end_width","top_tip_width","top_end_width","slab_exponential_factor","local_alignment_mark_size","local_alignment_mark_vertical_offset"],
             "Linear edge coupler":["top_taper_length","top_start_offset","narrow_slab_straight_length","wide_slab_straight_length","slab_start_width","slab_end_width","top_tip_width","top_end_width","local_alignment_mark_size","local_alignment_mark_vertical_offset"],
+            LINEAR_SLAB_ETCH_KIND:["slab_tip_width","slab_tip_taper_length","slab_tip_length","slab_wg_width","slab_wg_length","rib_tip_width","rib_taper_length","rib_wg_width","rib_wg_length"],
             "Loopback mirror":["Lc","gap","s_bend_length","arc_radius","width"],
             "Feedline":["wg_width","Lc","offset","s_bend_length","pitch","fill_factor"],
             "Ring + feedline":["ring_radius","ring_width","coupling_gap","resonator_count","resonator_spacing","wg_width","Lc"],
@@ -3828,7 +3858,11 @@ class NativeLayoutWindow(QMainWindow):
         # Modulators and composite edge couplers lead with their main design
         # controls. Position and expert parameters remain visible below them.
         front_loaded_parameters = (
-            is_modulator or is_edge_coupler or is_vertical_racetrack_feedline
+            is_modulator
+            or is_edge_coupler
+            or is_vertical_racetrack_feedline
+            or component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND
+            or component.get("kind") == LINEAR_SLAB_ETCH_KIND
         )
         if not front_loaded_parameters:
             add_transform_controls()
@@ -3867,8 +3901,20 @@ class NativeLayoutWindow(QMainWindow):
             "edge_coupler_local_marker_size",
             "edge_coupler_local_marker_vertical_offset",
         )
+        racetrack_electrode_keys = (
+            "racetrack_length", "R_eff", "racetrack_width",
+            "electrode_length_mode", "electrode_end_clearance", "electrode_length",
+            "interaction_gap", "signal_width", "ground_width",
+            "center_connection", "center_bus_width",
+            "target_frequency_ghz", "optical_group_index",
+        )
         front_parameter_keys = (
-            major_modulator_keys
+            ("slab_tip_width", "slab_tip_taper_length", "slab_tip_length", "slab_wg_width", "slab_wg_length", "rib_tip_width", "rib_taper_length", "rib_wg_width", "rib_wg_length", "slab_tfln_thickness", "rib_tfln_thickness", "input_port_offset")
+            if component.get("kind") == LINEAR_SLAB_ETCH_KIND
+            else
+            racetrack_electrode_keys
+            if component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND
+            else major_modulator_keys
             if is_modulator
             else edge_coupler_front_parameters(str(component.get("kind", "")))
             if is_edge_coupler
@@ -3959,6 +4005,17 @@ class NativeLayoutWindow(QMainWindow):
                 )
             parameter_label = (
                 "Racetrack round-trip length (µm)" if is_vertical_racetrack_feedline and key == "racetrack_length"
+                else "Racetrack round-trip length (µm)" if component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND and key == "racetrack_length"
+                else "Euler bend R_eff (µm)" if component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND and key == "R_eff"
+                else "Racetrack waveguide width (µm)" if component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND and key == "racetrack_width"
+                else "Electrode length control" if component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND and key == "electrode_length_mode"
+                else "Manual electrode length (µm)" if component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND and key == "electrode_length"
+                else "Electrode clearance from each bend (µm)" if component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND and key == "electrode_end_clearance"
+                else "Optical interaction gap (µm)" if component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND and key == "interaction_gap"
+                else "RF center connection" if component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND and key == "center_connection"
+                else "RF center bus width (µm)" if component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND and key == "center_bus_width"
+                else "Design frequency (GHz, informational)" if component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND and key == "target_frequency_ghz"
+                else "Optical group index (informational)" if component.get("kind") == RACETRACK_LUMPED_ELECTRODE_KIND and key == "optical_group_index"
                 else "Euler bend R_eff (µm)" if is_vertical_racetrack_feedline and key == "R_eff"
                 else "Point-coupling gap (µm)" if is_vertical_racetrack_feedline and key == "coupling_gap"
                 else "Vertical feedline side" if is_vertical_racetrack_feedline and key == "coupling_side"
@@ -3989,6 +4046,18 @@ class NativeLayoutWindow(QMainWindow):
                 else "Edge-coupler LOCAL square size (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "edge_coupler_local_marker_size"
                 else "Edge-coupler LOCAL marker offset (µm)" if component.get("kind") in MODULATOR_COMPONENT_KINDS and key == "edge_coupler_local_marker_vertical_offset"
                 else "Feed length (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "Feed_length"
+                else "Slab tip width (µm)" if component.get("kind") == LINEAR_SLAB_ETCH_KIND and key == "slab_tip_width"
+                else "Slab tip taper length (µm)" if component.get("kind") == LINEAR_SLAB_ETCH_KIND and key == "slab_tip_taper_length"
+                else "Slab tip length (µm)" if component.get("kind") == LINEAR_SLAB_ETCH_KIND and key == "slab_tip_length"
+                else "Slab WG width (µm)" if component.get("kind") == LINEAR_SLAB_ETCH_KIND and key == "slab_wg_width"
+                else "Slab WG length (µm)" if component.get("kind") == LINEAR_SLAB_ETCH_KIND and key == "slab_wg_length"
+                else "Rib tip width (µm)" if component.get("kind") == LINEAR_SLAB_ETCH_KIND and key == "rib_tip_width"
+                else "Rib taper length (µm)" if component.get("kind") == LINEAR_SLAB_ETCH_KIND and key == "rib_taper_length"
+                else "Rib WG width (µm)" if component.get("kind") == LINEAR_SLAB_ETCH_KIND and key == "rib_wg_width"
+                else "Rib WG length (µm)" if component.get("kind") == LINEAR_SLAB_ETCH_KIND and key == "rib_wg_length"
+                else "Slab TFLN thickness (µm)" if component.get("kind") == LINEAR_SLAB_ETCH_KIND and key == "slab_tfln_thickness"
+                else "Rib TFLN thickness (µm)" if component.get("kind") == LINEAR_SLAB_ETCH_KIND and key == "rib_tfln_thickness"
+                else "Input port distance from slab tip (µm)" if component.get("kind") == LINEAR_SLAB_ETCH_KIND and key == "input_port_offset"
                 else "Top WG taper length (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "top_taper_length"
                 else "Top WG start offset from SLAB taper start (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "top_start_offset"
                 else "Narrow-side SLAB straight length (µm)" if component.get("kind") in EDGE_COUPLER_COMPONENT_KINDS and key == "narrow_slab_straight_length"
@@ -6751,6 +6820,8 @@ class NativeLayoutWindow(QMainWindow):
             saved = mmi_lumerical_export_settings(saved)
         if settings_component and settings_component.get("kind") == "Grating coupler":
             saved = grating_lumerical_export_settings(saved)
+        if settings_component and settings_component.get("kind") == LINEAR_SLAB_ETCH_KIND:
+            saved = linear_slab_etch_lumerical_export_settings(saved, settings_component)
         if settings_component and settings_component.get("kind") == "GC-SOI" and saved:
             saved = copy.deepcopy(saved)
             # Migrate the first compact-domain preset, which cropped the

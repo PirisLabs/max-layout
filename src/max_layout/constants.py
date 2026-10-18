@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from .geometry.vertical_racetrack_feedline import VERTICAL_RACETRACK_FEEDLINE_KIND
+from .geometry.racetrack_electrode import RACETRACK_LUMPED_ELECTRODE_KIND
+from .geometry.linear_slab_etch import LINEAR_SLAB_ETCH_KIND
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -136,6 +138,7 @@ SIMULATION_COMPONENT_KINDS = {
 
 RF_COMPONENT_KINDS = {
     "CPW",
+    "comb_RF_IDE",
     "CPW open",
     "CPW short",
     "modulator_RF2",
@@ -453,6 +456,16 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                       'rf_layer': 4,
                       'rf_datatype': 0},
  'CPW': {'length': 500.0, 'signal_width': 130.0, 'gap': 3.0, 'ground_width': 130.0, 'layer': 4, 'datatype': 0},
+ 'comb_RF_IDE': {'length': 500.0,
+                 'signal_width': 130.0,
+                 'gap': 3.0,
+                 'ground_width': 130.0,
+                 'finger_width': 3.0,
+                 'finger_length': 33.5,
+                 'finger_gap': 2.0,
+                 'IDE_Offset': 400.0,
+                 'layer': 4,
+                 'datatype': 0},
  'CPW open': {'length': 150.0, 'signal_width': 130.0, 'gap': 3.0, 'ground_width': 130.0, 'signal_recess': 20.0, 'layer': 4, 'datatype': 0},
  'CPW short': {'length': 150.0, 'signal_width': 130.0, 'gap': 3.0, 'ground_width': 130.0, 'bridge_length': 20.0, 'layer': 4, 'datatype': 0},
  'Tapered CPW': {'length': 500.0,
@@ -616,6 +629,25 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                      'points': 4001,
                      'layer': 1,
                      'datatype': 0},
+ RACETRACK_LUMPED_ELECTRODE_KIND: {
+                     'racetrack_length': 5652.195663650075,
+                     'R_eff': 100.0,
+                     'racetrack_width': 1.2,
+                     'electrode_length_mode': 'fit straight',
+                     'electrode_length': 2000.0,
+                     'electrode_end_clearance': 100.0,
+                     'signal_width': 130.0,
+                     'ground_width': 130.0,
+                     'interaction_gap': 5.0,
+                     'center_connection': 'inner join',
+                     'center_bus_width': 70.0,
+                     'target_frequency_ghz': 30.925,
+                     'optical_group_index': 2.21,
+                     'points': 4001,
+                     'layer': 1,
+                     'datatype': 0,
+                     'rf_layer': 4,
+                     'rf_datatype': 0},
  'modulator_RF2': {'length': 2000.0,
                    'signal_width': 130.0,
                    'ground_width': 130.0,
@@ -628,6 +660,7 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                           'gap': 5.0,
                           'microstrip_separation': 100.0,
                           'center_strip_width': 10.0,
+                          'outer_gnd_pad_width': 130.0,
                           'layer': 4,
                           'datatype': 0},
  'Ring + two feedlines': {'pitch': 0.75,
@@ -804,6 +837,25 @@ DEFAULT_COMPONENT_VALUES = {'Straight': {'length': 50.0, 'width': 1.2, 'layer': 
                          'local_alignment_mark_name': 'L1',
                          'local_alignment_mark_layer': LOCAL_MARKER_LAYER,
                          'local_alignment_mark_datatype': DEFAULT_DATATYPE},
+ LINEAR_SLAB_ETCH_KIND: {'slab_tip_width': 0.2,
+                         'slab_tip_taper_length': 100.0,
+                         'slab_tip_length': 6.0,
+                         'slab_wg_width': 32.0,
+                         'slab_wg_length': 11.0,
+                         'rib_tip_width': 0.3,
+                         'rib_taper_length': 60.0,
+                         'rib_wg_width': 1.2,
+                         'rib_wg_length': 11.0,
+                         'slab_tfln_thickness': 0.2,
+                         'rib_tfln_thickness': 0.2,
+                         'input_port_offset': 1.0,
+                         'waveguide_neff_tolerance': 0.3,
+                         'waveguide_mode_search_count': 20,
+                         'waveguide_port_span_um': 3.0,
+                         'layer': PHOTONIC_LAYER,
+                         'datatype': DEFAULT_DATATYPE,
+                         'slab_layer': SLAB_LAYER,
+                         'slab_datatype': DEFAULT_DATATYPE},
  'Loopback mirror': {'Lc': 200.0, 'gap': 10.0, 's_bend_length': 80.0, 'arc_radius': 30.0, 'width': 1.2, 'layer': 1, 'datatype': 0, 'tolerance': 0.001},
  'Feedline': {'pitch': 0.75,
               'fill_factor': 0.57,
@@ -1338,6 +1390,9 @@ DEFAULT_COMPONENT_VALUES["Photonic test block"] = {
 
 CHOICE_PARAMETERS = {"reference_branch": ["upper", "lower"], "profile": ["linear", "exponential", "klopfenstein"], "input_profile": ["linear", "exponential", "klopfenstein"], "output_profile": ["linear", "exponential", "klopfenstein"], "rf_input_taper_profile": ["linear", "exponential", "klopfenstein"], "rf_output_taper_profile": ["linear", "exponential", "klopfenstein"], "taper_test_center": ["CPW", "T electrode"], "resonator_side": ["upper", "lower"], "coupling_side": ["left", "right"], "tooth_shape": ["curved", "rectangular"], "grating_route": ["straight", "up", "down"], "gc_input_route": ["straight", "up", "down"], "gc_output_route": ["straight", "up", "down"], "gc_upper_output_route": ["straight", "up", "down"], "gc_lower_output_route": ["straight", "up", "down"], "gc_vertical_side": ["up", "down"], "input_s_bend_direction": ["up", "down"], "output_s_bend_direction": ["up", "down"], "start_corner": ["top-left", "top-right", "bottom-left", "bottom-right"], "primary_axis": ["x", "y"], "primary_sweep_axis": ["x", "y"]}
 
+CHOICE_PARAMETERS["electrode_length_mode"] = ["fit straight", "manual"]
+CHOICE_PARAMETERS["center_connection"] = ["inner join", "none"]
+
 CHOICE_PARAMETERS["cpw_profile"] = ["linear", "exponential", "klopfenstein"]
 
 CHOICE_PARAMETERS.update({"lattice":["triangular","square"],"hole_shape":["circular","elliptical"]})
@@ -1361,8 +1416,10 @@ CHOICE_PARAMETERS["edge_coupler_profile"] = ["exponential", "linear"]
 
 COMPONENT_DISPLAY_NAMES={
     VERTICAL_RACETRACK_FEEDLINE_KIND:"Euler racetrack with vertical feedline",
+    RACETRACK_LUMPED_ELECTRODE_KIND:"Euler racetrack with dual-slot RF electrode",
     "Exponential edge coupler":"Exponential",
     "Linear edge coupler":"Linear",
+    LINEAR_SLAB_ETCH_KIND:"Linear Slab Etch",
     EXPONENTIAL_EDGE_COUPLER_FEED_KIND:"Exponential pair + straight feed",
     LINEAR_EDGE_COUPLER_FEED_KIND:"Linear pair + straight feed",
     "SLAB taper":"SLAB taper — exponential edge-coupler slab",
