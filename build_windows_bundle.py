@@ -48,18 +48,17 @@ def bundle_payload(source: Path, archive_name: str) -> bytes:
     return normalized
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
-    args = parser.parse_args()
-
+def write_bundle(output: Path = DEFAULT_OUTPUT) -> None:
+    """Write the Windows ZIP from the current sources (including the .pyz)."""
     missing = [str(source) for source, _name in BUNDLE_FILES if not source.is_file()]
     if missing:
-        parser.error("missing required bundle file(s): " + ", ".join(missing))
+        raise FileNotFoundError(
+            "missing required bundle file(s): " + ", ".join(missing)
+        )
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(
-        args.output,
+        output,
         mode="w",
         compression=zipfile.ZIP_DEFLATED,
         compresslevel=9,
@@ -67,9 +66,20 @@ def main() -> int:
         for source, archive_name in BUNDLE_FILES:
             archive.writestr(archive_name, bundle_payload(source, archive_name))
 
-    size_kb = args.output.stat().st_size / 1024.0
-    print(f'wrote "{args.output}" ({size_kb:.0f} KB)')
+    size_kb = output.stat().st_size / 1024.0
+    print(f'wrote "{output}" ({size_kb:.0f} KB)')
     print('Windows: extract the ZIP, then double-click "Max Layout Windows.cmd"')
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
+    args = parser.parse_args()
+
+    try:
+        write_bundle(args.output)
+    except FileNotFoundError as error:
+        parser.error(str(error))
     return 0
 
 

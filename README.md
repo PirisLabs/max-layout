@@ -494,18 +494,21 @@ folder for you to review.
 python3 build.py
 ```
 
-That byte-compiles every module, then writes `Max Layout.pyz` as a zipapp with
-`src/__main__.py` as the entry point.
+That byte-compiles every module, writes `Max Layout.pyz` as a zipapp with
+`src/__main__.py` as the entry point, and then rebuilds the
+extract-and-double-click `Max Layout Windows.zip` so it always embeds the
+current `.pyz`. Commit both files together. (Pass `--no-windows-bundle` to skip
+the ZIP; it is also skipped when `-o` points somewhere other than the default.)
 
-After rebuilding the `.pyz`, create the extract-and-double-click Windows
-distribution with:
+To rebuild only the Windows ZIP, for example after editing a file under
+`windows/`:
 
 ```bash
 python3 build_windows_bundle.py
 ```
 
-That writes `Max Layout Windows.zip` from an explicit public-file allowlist.
-The bundle contains Max Layout and its Windows bootstrap files only.
+The ZIP is written from an explicit public-file allowlist and contains Max
+Layout and its Windows bootstrap files only.
 
 To run straight from source without building:
 

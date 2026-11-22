@@ -3,6 +3,9 @@
 
     python3 build.py
 
+Building the default "Max Layout.pyz" also rebuilds "Max Layout Windows.zip",
+which embeds it, so the two tracked artifacts can never drift apart.
+
 The archive is a standard zipapp: src/__main__.py becomes the entry point and
 the max_layout package rides along beside it.  Run the result with
 
@@ -36,6 +39,11 @@ def main() -> int:
         action="store_true",
         help="skip byte-compiling the package before building",
     )
+    parser.add_argument(
+        "--no-windows-bundle",
+        action="store_true",
+        help='do not rebuild "Max Layout Windows.zip" after the .pyz',
+    )
     args = parser.parse_args()
 
     if not (SOURCE / "__main__.py").exists():
@@ -56,6 +64,12 @@ def main() -> int:
     modules = sum(1 for _ in SOURCE.rglob("*.py"))
     print(f"wrote {args.output.name}  ({size_kb:.0f} KB, {modules} modules)")
     print(f'run it with:  python3 "{args.output}"')
+
+    # The Windows ZIP embeds the tracked .pyz; keep it in sync automatically.
+    if not args.no_windows_bundle and args.output.resolve() == DEFAULT_OUTPUT:
+        from build_windows_bundle import write_bundle
+
+        write_bundle()
     return 0
 
 
