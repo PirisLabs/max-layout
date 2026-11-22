@@ -151,6 +151,11 @@ Raise the thread count at **Layout → Performance / CPU Threads…**, or set
   0.3 µm default facet width, and a unique numbered SLAB/L-marker pair for
   each end.
 - MMI, MZI, grating coupler, ring, racetrack, CPW, and segmented-electrode tools.
+  The RF library includes `comb_RF_IDE`, a CPW with a capacitive break in its
+  signal trace and alternating interdigitated fingers packed from the top of
+  the signal toward the bottom. Finger width, length, transverse gap, and IDE
+  offset are editable; the CPW gap also sets finger-tip clearance to the
+  opposing signal bus.
   The resonator library includes an **Euler racetrack** whose exposed
   `racetrack_length` is the complete round-trip centerline length and whose
   exposed `R_eff` sets the minimum centerline radius of each full-Euler bend.
@@ -169,6 +174,19 @@ Raise the thread count at **Layout → Performance / CPU Threads…**, or set
   editable separation spaces the two pairs, and a narrow centered bridge joins
   the adjacent inner conductors. The bridge terminates exactly at their facing
   edges, so the GDS polygons touch without an overlapping double-exposure area.
+  Centered outer ground pads use the same x-length as the bridge. The upper
+  pad attaches to the highest-y electrode and extends upward, while the lower
+  pad attaches to the lowest-y electrode and extends downward, each by the
+  editable `outer_gnd_pad_width`.
+  The resonator library also includes an **Euler racetrack with dual-slot RF
+  electrode** for lumped-electrode EO-comb layouts. It preserves the existing
+  Euler-racetrack round-trip-length model and derives both electrode-gap
+  centerlines from the actual optical straights. In **fit straight** mode the
+  active electrode length is the straight length minus the same user-controlled
+  clearance at both bends. Manual mode rejects electrodes that enter the Euler
+  bends. Optical geometry is canonicalized to WG layer 1 and electrode geometry
+  to RF layer 4. The paper-reference frequency and optical group index are
+  informational and never silently resize an existing racetrack.
 - One consolidated Photonic crystal component with selectable rectangle,
   ellipse, or hexagon slab; square or triangular hole lattice; circular or
   elliptical holes; crystal size; bulk or line-defect-waveguide mode; and

@@ -252,6 +252,13 @@ def apply_lumerical_sweep_values(
 
 
 STACK_PRESETS: dict[str, list[dict[str, Any]]] = {
+    "Linear Slab Etch TFLN": [
+        {"name": "Si substrate", "material": "Si (Silicon) - Palik", "thickness_um": 2.0, "role": "background", "gds_layer": 0},
+        {"name": "SiO2 BOX", "material": "SiO2 (Glass) - Palik", "thickness_um": 12.0, "role": "background", "gds_layer": 0},
+        {"name": "Exported TFLN cross-section", "material": "LiNbO3", "thickness_um": 0.4, "etch_depth_um": 0.2, "sidewall_angle_deg": 90.0, "role": "geometry", "gds_layers": [1], "slab_gds_layers": [8], "slab_extent": "geometry"},
+        {"name": "SiO2 cladding", "material": "SiO2 (Glass) - Palik", "thickness_um": 5.0, "role": "background", "gds_layer": 0, "conformal": True},
+        {"name": "Top air", "material": "Air", "thickness_um": 1.0, "role": "background", "gds_layer": 0},
+    ],
     "TFLN on SiO2": [
         {"name": "Si substrate", "material": "Si (Silicon) - Palik", "thickness_um": 2.0, "role": "background", "gds_layer": 0},
         {"name": "SiO2 BOX", "material": "SiO2 (Glass) - Palik", "thickness_um": 5.0, "role": "background", "gds_layer": 0},
@@ -2173,17 +2180,17 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
             )
         )
 
-    def matching_geometry_keys(row):
-        target_layers = {int(value) for value in row.get("gds_layers", [row.get("gds_layer", 1)])}
+    def matching_geometry_keys(row, layer_field="gds_layers"):
+        target_layers = {int(value) for value in row.get(layer_field, row.get("gds_layers", [row.get("gds_layer", 1)]))}
         return [
             key for key in geometry_by_layer
             if int(key.split(":", 1)[0]) in target_layers
         ]
 
-    def add_patterned_layers(name_prefix, row, z_min_um, z_max_um, sidewall_angle_deg):
+    def add_patterned_layers(name_prefix, row, z_min_um, z_max_um, sidewall_angle_deg, layer_field="gds_layers"):
         if z_max_um <= z_min_um:
             return 0
-        matching_keys = matching_geometry_keys(row)
+        matching_keys = matching_geometry_keys(row, layer_field)
         for key_index, layer_key in enumerate(matching_keys, start=1):
             process_name = f"{name_prefix} {key_index} ({layer_key})"
             fdtd.addlayer(process_name)
@@ -2241,6 +2248,7 @@ def _add_material_stack(fdtd, z_ranges, bounds, simulation_z_min_um, simulation_
                     z0,
                     z1 - etch_depth_um,
                     90.0,
+                    "slab_gds_layers" if "slab_gds_layers" in row else "gds_layers",
                 )
                 if slab_count:
                     print("Limited unetched slab %s to the exported geometry footprint." % row["name"])

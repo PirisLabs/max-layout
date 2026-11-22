@@ -54,6 +54,7 @@ class ModulatorRF2Tests(unittest.TestCase):
                 "gap": 5.0,
                 "microstrip_separation": 100.0,
                 "center_strip_width": 10.0,
+                "outer_gnd_pad_width": 130.0,
                 "layer": 4,
                 "datatype": 0,
             },
@@ -81,7 +82,7 @@ class ModulatorRF2Tests(unittest.TestCase):
     def test_bridge_variant_has_two_microstrip_pairs_and_joins_inner_conductors(self) -> None:
         polygons, labels = component_geometry_arrays(component(kind=BRIDGE_KIND))
         self.assertEqual(labels, [])
-        self.assertEqual(len(polygons), 5)
+        self.assertEqual(len(polygons), 7)
         self.assertEqual({(layer, datatype) for _, layer, datatype in polygons}, {(4, 0)})
 
         bounds = []
@@ -97,6 +98,8 @@ class ModulatorRF2Tests(unittest.TestCase):
                 (0.0, -180.0, 2000.0, -50.0),
                 (0.0, -315.0, 2000.0, -185.0),
                 (995.0, -50.0, 1005.0, 50.0),
+                (995.0, 315.0, 1005.0, 445.0),
+                (995.0, -445.0, 1005.0, -315.0),
             ],
         )
 
@@ -106,6 +109,43 @@ class ModulatorRF2Tests(unittest.TestCase):
         top_inner_minimum = np.min(polygons[1][0], axis=0)
         self.assertEqual(float(bridge_minimum[1]), float(bottom_inner_maximum[1]))
         self.assertEqual(float(bridge_maximum[1]), float(top_inner_minimum[1]))
+        top_outer_maximum = np.max(polygons[0][0], axis=0)
+        top_pad_minimum = np.min(polygons[5][0], axis=0)
+        bottom_outer_minimum = np.min(polygons[3][0], axis=0)
+        bottom_pad_maximum = np.max(polygons[6][0], axis=0)
+        self.assertEqual(float(top_pad_minimum[1]), float(top_outer_maximum[1]))
+        self.assertEqual(float(bottom_pad_maximum[1]), float(bottom_outer_minimum[1]))
+
+    def test_bridge_variant_crosses_saved_signal_and_ground_widths_for_geometry(self) -> None:
+        parameters = safe_json_copy(DEFAULT_COMPONENT_VALUES[BRIDGE_KIND])
+        parameters.update({"signal_width": 80.0, "ground_width": 140.0})
+        polygons, _labels = component_geometry_arrays(component(parameters, BRIDGE_KIND))
+
+        bounds = []
+        for points, _layer, _datatype in polygons:
+            minimum = np.min(points, axis=0)
+            maximum = np.max(points, axis=0)
+            bounds.append(tuple(float(value) for value in (*minimum, *maximum)))
+        self.assertEqual(
+            bounds,
+            [
+                (0.0, 135.0, 2000.0, 275.0),
+                (0.0, 50.0, 2000.0, 130.0),
+                (0.0, -190.0, 2000.0, -50.0),
+                (0.0, -275.0, 2000.0, -195.0),
+                (995.0, -50.0, 1005.0, 50.0),
+                (995.0, 275.0, 1005.0, 405.0),
+                (995.0, -405.0, 1005.0, -275.0),
+            ],
+        )
+
+        ports = component_local_ports(component(parameters, BRIDGE_KIND))
+        self.assertEqual(ports["top_signal_left"]["center"], (0.0, 205.0))
+        self.assertEqual(ports["top_ground_left"]["center"], (0.0, 90.0))
+        self.assertEqual(ports["bottom_signal_left"]["center"], (0.0, -120.0))
+        self.assertEqual(ports["bottom_ground_left"]["center"], (0.0, -235.0))
+        self.assertEqual(ports["top_gap_left"]["center"], (0.0, 132.5))
+        self.assertEqual(ports["bottom_gap_left"]["center"], (0.0, -192.5))
 
     def test_rf_and_alignment_ports_describe_both_separate_strips(self) -> None:
         ports = component_local_ports(component())
@@ -126,6 +166,8 @@ class ModulatorRF2Tests(unittest.TestCase):
         self.assertEqual(bridge_ports["top_gap_left"]["center"], (0.0, 182.5))
         self.assertEqual(bridge_ports["bottom_gap_left"]["center"], (0.0, -182.5))
         self.assertEqual(bridge_ports["bridge_center"]["center"], (1000.0, 0.0))
+        self.assertEqual(bridge_ports["top_outer_gnd_pad_center"]["center"], (1000.0, 380.0))
+        self.assertEqual(bridge_ports["bottom_outer_gnd_pad_center"]["center"], (1000.0, -380.0))
         self.assertEqual(bridge_ports["center"]["center"], (1000.0, 0.0))
 
     def test_invalid_dimensions_are_rejected(self) -> None:
@@ -143,6 +185,7 @@ class ModulatorRF2Tests(unittest.TestCase):
         for update in (
             {"center_strip_width": 0.0},
             {"center_strip_width": 2001.0},
+            {"outer_gnd_pad_width": 0.0},
             {"microstrip_separation": -0.1},
         ):
             parameters = safe_json_copy(DEFAULT_COMPONENT_VALUES[BRIDGE_KIND])
@@ -171,6 +214,7 @@ class ModulatorRF2Tests(unittest.TestCase):
         self.assertEqual(bridge_resized["ground_width"], 65.0)
         self.assertEqual(bridge_resized["gap"], 2.5)
         self.assertEqual(bridge_resized["microstrip_separation"], 50.0)
+        self.assertEqual(bridge_resized["outer_gnd_pad_width"], 65.0)
 
 
 if __name__ == "__main__":

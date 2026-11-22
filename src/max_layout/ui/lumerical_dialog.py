@@ -673,22 +673,40 @@ class ThreeDModelPreview(QWidget):
         all_points = [raw((x, y, z)) for x in (fit_x0, fit_x1) for y in (fit_y0, fit_y1) for z in (fit_z0, fit_z1)]
         polygon_rows = []
         for points, layer in state["polygons"]:
-            matching = [entry for entry in state["stack_ranges"] if str(entry[0].get("role")) == "geometry" and int(layer) in {int(v) for v in entry[0].get("gds_layers", [])}]
+            matching = [
+                entry for entry in state["stack_ranges"]
+                if str(entry[0].get("role")) == "geometry"
+                and int(layer) in {
+                    int(v) for v in [
+                        *entry[0].get("gds_layers", []),
+                        *entry[0].get("slab_gds_layers", []),
+                    ]
+                }
+            ]
             if not matching:
                 continue
             for row, row_z0, row_z1 in matching:
                 etch_depth = min(row_z1 - row_z0, max(0.0, float(row.get("etch_depth_um", row_z1 - row_z0))))
                 film_top = row_z1 - etch_depth
+                is_slab_polygon = int(layer) in {
+                    int(value) for value in row.get(
+                        "slab_gds_layers", row.get("gds_layers", [])
+                    )
+                }
+                is_upper_polygon = int(layer) in {
+                    int(value) for value in row.get("gds_layers", [])
+                }
                 if (
                     str(row.get("slab_extent", "full")).strip().lower() == "geometry"
                     and film_top > row_z0
+                    and is_slab_polygon
                 ):
                     projected_slab_top = [raw((float(point[0]), float(point[1]), film_top)) for point in points]
                     projected_slab_bottom = [raw((float(point[0]), float(point[1]), row_z0)) for point in points]
                     all_points.extend(projected_slab_top)
                     all_points.extend(projected_slab_bottom)
                     polygon_rows.append((projected_slab_top, projected_slab_bottom, row))
-                if etch_depth <= 0.0:
+                if etch_depth <= 0.0 or not is_upper_polygon:
                     continue
                 patterned_z0 = row_z1 - etch_depth
                 top_points, bottom_points = _sidewall_face_points(
@@ -1970,6 +1988,11 @@ class LumericalExportDialog(QDialog):
             else "Full film / background"
         )
         role.setMinimumSize(190, 38)
+        if "slab_gds_layers" in data:
+            role.setProperty(
+                "slab_gds_layers",
+                [int(value) for value in data.get("slab_gds_layers", [])],
+            )
         self.stack_table.setCellWidget(row, 5, role)
         layers = data.get("gds_layers", [data.get("gds_layer", 0)])
         if isinstance(layers, (str, int, float)):
@@ -2147,8 +2170,7 @@ class LumericalExportDialog(QDialog):
                 if strict:
                     raise ValueError(f"Material row {row + 1} contains an invalid GDS layer list.") from exc
                 gds_layers = [0]
-            stack.append(
-                {
+            material_row = {
                     "name": self.stack_table.item(row, 0).text().strip() or f"Layer {row + 1}",
                     "material": self.stack_table.cellWidget(row, 1).currentText().strip(),
                     "thickness_um": float(self.stack_table.cellWidget(row, 2).value()),
@@ -2163,7 +2185,10 @@ class LumericalExportDialog(QDialog):
                     "mesh_order": int(self.stack_table.cellWidget(row, 9).value()),
                     "conformal": self.stack_table.item(row, 10).checkState() == Qt.CheckState.Checked,
                 }
-            )
+            slab_gds_layers = self.stack_table.cellWidget(row, 5).property("slab_gds_layers")
+            if slab_gds_layers:
+                material_row["slab_gds_layers"] = [int(value) for value in slab_gds_layers]
+            stack.append(material_row)
         return stack
 
     def _preview_components(self) -> list[dict[str, Any]]:
