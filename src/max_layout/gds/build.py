@@ -489,6 +489,9 @@ def _add_component_geometry_to_cell(component: dict[str, Any], top: gdstk.Cell) 
     elif kind == "Grating coupler":
         layer = GC_LAYER
         datatype = DEFAULT_DATATYPE
+    elif kind == "Boolean geometry":
+        layer = int(p.get("layer", PHOTONIC_LAYER))
+        datatype = int(p.get("datatype", DEFAULT_DATATYPE))
     elif kind in {"Chip outline", "4-inch wafer outline"}:
         layer = int(p.get("layer", 100))
         datatype = int(p.get("datatype", 0))
@@ -2225,7 +2228,7 @@ def _canonicalize_component_layers(component: dict[str, Any]) -> None:
         params["rf_layer"] = RF_LAYER
         params["rf_datatype"] = DEFAULT_DATATYPE
     elif kind not in {
-        "Chip outline", "4-inch wafer outline", "E-beam multipass",
+        "Chip outline", "4-inch wafer outline", "E-beam multipass", "Boolean geometry",
     }:
         params["layer"] = PHOTONIC_LAYER
         params["datatype"] = DEFAULT_DATATYPE

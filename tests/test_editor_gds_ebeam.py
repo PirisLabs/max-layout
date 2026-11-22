@@ -45,6 +45,35 @@ def layer_polygons(library, layer: int) -> list[np.ndarray]:
 
 
 class EditorGdsParityTests(unittest.TestCase):
+    def test_boolean_geometry_preserves_saved_layer_in_preview_and_export(self) -> None:
+        boolean = component("Boolean geometry", 1, x=10.0, y=20.0)
+        boolean["params"].update(
+            {
+                "layer": 2,
+                "datatype": 7,
+                "polygons": [
+                    [[0.0, 0.0], [50.0, 0.0], [50.0, 50.0], [0.0, 50.0]]
+                ],
+            }
+        )
+
+        canonical = deepcopy(boolean)
+        _canonicalize_component_layers(canonical)
+        self.assertEqual(canonical["params"]["layer"], 2)
+        self.assertEqual(canonical["params"]["datatype"], 7)
+
+        preview = canvas_items.component_local_polygons(boolean)
+        self.assertEqual([(layer, datatype) for _points, layer, datatype in preview], [(2, 7)])
+
+        library = resolve_and_build([boolean])
+        exported = library.cells[0].get_polygons(
+            apply_repetitions=True, include_paths=True
+        )
+        self.assertEqual(
+            [(int(polygon.layer), int(polygon.datatype)) for polygon in exported],
+            [(2, 7)],
+        )
+
     def test_dense_photonic_test_block_preview_uses_every_export_polygon(self) -> None:
         block = component("Photonic test block", 1, x=123.0, y=-47.0)
         block["orientation_deg"] = 31.0
